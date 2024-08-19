@@ -3,7 +3,6 @@ from coremltools.converters.mil import mil
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
-from coremltools.converters.mil.input_types import TensorType
 from .utils import index_by_slices, update_tensor_by_slice
 
 from jaxlib.mlir import ir
@@ -15,7 +14,6 @@ import numpy as np
 
 from typing import Dict, List, Optional
 import inspect
-from dataclasses import dataclass
 from functools import partial, reduce
 import operator
 import itertools
@@ -114,13 +112,6 @@ class StableHloOpsRegistry(type):
         instance = super().__call__(*args, **kwargs)
         setattr(instance, 'dispatch_op', cls._dispatch_op)
         return instance
-
-@dataclass
-class ConvDimensions:
-    in_dim: List
-    weights_dim: List
-    out_dim: List
-
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 

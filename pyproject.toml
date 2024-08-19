@@ -30,7 +30,10 @@ dependencies = [
     "numpy~=2.0",
 ]
 
-[tool.hatch.envs.hatch-test]
+[tool.hatch.envs.test]
+randomize = true
+parallel = true
+
 extra-dependencies = [
     "pytest",
     "jax",
@@ -40,8 +43,8 @@ extra-dependencies = [
     "pillow",
 ]
 
-[[tool.hatch.envs.hatch-test.matrix]]
-python = [ "3.9" ]
+[[tool.hatch.envs.test.matrix]]
+python = [ "3.11" ]
 
 [project.urls]
 Homepage = "https://github.com/kasper0406/stablehlo-coreml"
