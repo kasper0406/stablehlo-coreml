@@ -1,6 +1,6 @@
 # Convert StableHLO models into Apple Core ML format
 
-* This repo is currently experimental! *
+**This repo is currently experimental!**
 
 ## Converting a model
 
