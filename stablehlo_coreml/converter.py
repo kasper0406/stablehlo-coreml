@@ -7,7 +7,12 @@ from .utils import index_by_slices, update_tensor_by_slice
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
-from jaxlib.mlir.dialects.stablehlo import AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp, TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+from jaxlib.mlir.dialects.stablehlo import (
+    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
+    ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
+    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
+    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+)
 from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
@@ -18,6 +23,7 @@ from functools import partial, reduce
 import operator
 import itertools
 
+
 def convert(module, minimum_deployment_target: AvailableTarget):
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
@@ -25,11 +31,12 @@ def convert(module, minimum_deployment_target: AvailableTarget):
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)
 
+
 class TranscriptionContext:
     def __init__(self):
         self._path = []
         self.seen_paths = set()
-        self.variables = {} # Nested map: path -> variable -> mil var
+        self.variables = {}  # Nested map: path -> variable -> mil var
 
     def push_function(self, name: str):
         counter = 0
@@ -45,16 +52,16 @@ class TranscriptionContext:
                 self._path.append(ctx_name)
                 self.seen_paths.add(self.path())
                 return ctx_name
-    
+
     def pop_function(self):
         self.variables.pop(self.path())
         self._path.pop()
-    
+
     def add_variable(self, name: str, mil_var):
         path = self.path()
         if path not in self.variables:
             self.variables[path] = {}
-        
+
         if name in self.variables[path]:
             raise ValueError(f"Variable {name} is already defined in path {path}")
         self.variables[path][name] = mil_var
@@ -69,6 +76,7 @@ class TranscriptionContext:
     def path(self) -> str:
         return "/".join(self._path)
 
+
 def register_stablehlo_op(func):
     # Check the signature
     sig = inspect.signature(func)
@@ -77,16 +85,18 @@ def register_stablehlo_op(func):
     # Exclude 'self' from the parameters
     params = params[1:]
 
-    error_msg = "HLO op implementations should take parameters of exactly (context: TranscriptionContext, op: <HLO_OP_TYPE>)"
+    error_msg = "HLO op implementations should take parameters of exactly " \
+                "(context: TranscriptionContext, op: <HLO_OP_TYPE>)"
     if len(params) != 2:
         raise TypeError(error_msg)
-    
+
     if not issubclass(params[0].annotation, TranscriptionContext):
         raise TypeError(error_msg)
 
     # We identify the function by the type of operation it implements
     func._implements_hlo_op = params[1].annotation
     return func
+
 
 class StableHloOpsRegistry(type):
     def __init__(cls, name, bases, clsdict):
@@ -99,11 +109,11 @@ class StableHloOpsRegistry(type):
                 if op_type in cls._stablehlo_ops_registry:
                     raise TypeError(f"StableHLO op {op_type} has been registered more than once!")
                 cls._stablehlo_ops_registry[op_type] = method
-    
+
     def _dispatch_op(cls, self, context: TranscriptionContext, op):
         if type(op) not in self._stablehlo_ops_registry:
             raise TypeError(f"The StableHLO op {type(op)} has not been implemented!")
-        
+
         op_method = self._stablehlo_ops_registry[type(op)]
         return op_method(self, context, op)
 
@@ -112,6 +122,7 @@ class StableHloOpsRegistry(type):
         instance = super().__call__(*args, **kwargs)
         setattr(instance, 'dispatch_op', cls._dispatch_op)
         return instance
+
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 
@@ -134,7 +145,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         return self.prog
 
     def build_func(self, hlo_func: FuncOp):
-        context = TranscriptionContext() # Map from results to created variables
+        context = TranscriptionContext()  # Map from results to created variables
 
         func_inputs = {}
         for arg in hlo_func.arguments:
@@ -186,7 +197,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_return(self, context: TranscriptionContext, op: ReturnOp):
-        return [ context[result.get_name()] for result in op.operands ]
+        return [context[result.get_name()] for result in op.operands]
 
     @register_stablehlo_op
     def op_func_return(self, context: TranscriptionContext, op: FuncReturnOp):
@@ -315,15 +326,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # TODO: Figure out if we need to special case broadcasting dims
             return mb.matmul(x=lhs, y=rhs, transpose_y=True)
 
-        lhs_result_dim = [ dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim  ]
-        rhs_result_dim = [ dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim  ]
+        lhs_result_dim = [dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim]
+        rhs_result_dim = [dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim]
 
         # For both the lhs and rhs, put the dimensions being contracted last
         transposed_lhs = mb.transpose(x=lhs, perm=lhs_batching_dim + lhs_result_dim + lhs_contracting_dim)
         transposed_rhs = mb.transpose(x=rhs, perm=rhs_batching_dim + rhs_result_dim + rhs_contracting_dim)
 
         # Calculate the result by looping over the contracting dims in order
-        result_shape = [ lhs.shape[dim] for dim in lhs_batching_dim ] + [ lhs.shape[dim] for dim in lhs_result_dim ] + [ rhs.shape[dim] for dim in rhs_result_dim ]
+        result_shape = [lhs.shape[dim] for dim in lhs_batching_dim]
+        result_shape.append([lhs.shape[dim] for dim in lhs_result_dim])
+        result_shape.append([rhs.shape[dim] for dim in rhs_result_dim])
         if len(result_shape) == 0:
             # Special case for scalar result
             result_shape = [1]
@@ -332,8 +345,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # We can utilize that we have a full matrix multiply primitive available, compared to having only
         # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
         # the lhs and rhs tensors
-        lhs_result_indices = itertools.product(*[ range(lhs.shape[dim]) for dim in lhs_result_dim[:-1] ])
-        rhs_result_indices = itertools.product(*[ range(rhs.shape[dim]) for dim in rhs_result_dim[:-1] ])
+        lhs_result_indices = itertools.product(*[range(lhs.shape[dim]) for dim in lhs_result_dim[:-1]])
+        rhs_result_indices = itertools.product(*[range(rhs.shape[dim]) for dim in rhs_result_dim[:-1]])
         for lhs_idx, rhs_idx in itertools.product(lhs_result_indices, rhs_result_indices):
             # We may have to add an extra slice for the skipped dimension
             result_idx = ()
@@ -345,22 +358,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 result_idx += (slice(None), )
             # print(f"Calculating result for index {result_idx}, lhs = {lhs_idx}, rhs = {rhs_idx}")
 
-            contracted_element_count = multiply([ lhs.shape[dim] for dim in lhs_contracting_dim ])
+            contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
             # print(f"contracted_element_count = {contracted_element_count}")
-            batch_selector = tuple([ slice(None) for _i in range(len(lhs_batching_dim)) ])
-            batch_shape = tuple([ lhs.shape[dim] for dim in lhs_batching_dim ])
+            batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
+            batch_shape = tuple([lhs.shape[dim] for dim in lhs_batching_dim])
 
             # Reshape the lhs and rhs to have all the contracting dimensions in the end.
             # We will always make them have the shape `(batch_shape, last_dim_shape, contraction_count)``
             # where we may have to set `last_dim_shape` to 1, if the dimension does not exist.
-            lhs_for_result_idx = index_by_slices(transposed_lhs, batch_selector + lhs_idx + ( ..., ))
+            lhs_for_result_idx = index_by_slices(transposed_lhs, batch_selector + lhs_idx + (...,))
             if len(lhs_result_dim) > 0:
                 lhs_reshape_shape = batch_shape + (lhs.shape[lhs_result_dim[-1]],) + (contracted_element_count, )
             else:
                 lhs_reshape_shape = batch_shape + (1, contracted_element_count)
             contracted_lhs = mb.reshape(x=lhs_for_result_idx, shape=lhs_reshape_shape)
 
-            rhs_for_result_idx = index_by_slices(transposed_rhs, batch_selector + rhs_idx + ( ..., ))
+            rhs_for_result_idx = index_by_slices(transposed_rhs, batch_selector + rhs_idx + (...,))
             if len(rhs_result_dim) > 0:
                 rhs_reshape_shape = batch_shape + (rhs.shape[rhs_result_dim[-1]],) + (contracted_element_count, )
             else:
@@ -384,7 +397,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result = update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
 
         context.add_variable(op.result.get_name(), result)
-
 
     @register_stablehlo_op
     def op_reshape(self, context: TranscriptionContext, op: ReshapeOp):
@@ -417,19 +429,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_while(self, context: TranscriptionContext, op: WhileOp):
         def cond(*loop_args):
-            params = [ param for param in op.cond.blocks[0].arguments ]
+            params = [param for param in op.cond.blocks[0].arguments]
             outputs = self.__invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
             if len(outputs) != 1:
                 raise ValueError("The output of while_cond should always be a single boolean!")
             # TODO(knielsen): Add a check that the output is in fact a single boolean value
 
             return outputs[0]
-        
+
         def body(*body_args):
-            params = [ param for param in op.body.blocks[0].arguments ]
+            params = [param for param in op.body.blocks[0].arguments]
             return self.__invoke_hlo_function(context, "while_body", params, op.body, body_args)
 
-        loop_vars = [ context[arg.get_name()] for arg in op.operands ]
+        loop_vars = [context[arg.get_name()] for arg in op.operands]
         while_results = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
 
         for result_var, while_result in zip(op.results, while_results):
@@ -473,7 +485,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # The HLO DynamicSliceOp gives the start indices as seperate 0-dimensional integer variables
         # We need to convert them to a tensor to be compatible with mb.slice_by_size
-        start_idx_variables = [ context[i.get_name()] for i in op.start_indices ]
+        start_idx_variables = [context[i.get_name()] for i in op.start_indices]
         begin = mb.concat(values=start_idx_variables, axis=0)
 
         # The slice sizes in HLO are given by a signed integer with 64 bits
@@ -505,7 +517,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         x = context[op.operand.get_name()]
         updates = context[op.update.get_name()]
 
-        start_indices = [ context[i.get_name()] for i in op.start_indices ]
+        start_indices = [context[i.get_name()] for i in op.start_indices]
         start_indices = mb.concat(values=start_indices, axis=0)
         end_indices = mb.add(x=start_indices, y=op.update.type.shape)
 
@@ -533,7 +545,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # The op.lhs has dimension [batch, d_in*, channels]
         # MIL expects it on the form [batch, channels, d_in*]
-        x = context[op.lhs.get_name()] # The inputs comes from vars
+        x = context[op.lhs.get_name()]  # The inputs comes from vars
         perm = list(range(x.rank))
         # Move the second axis to the end
         perm.append(perm.pop(1))
@@ -567,12 +579,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if np.any(lhs_dilations > 1):
                 # This is a transpoed convolution
                 if strides is not None:
-                    raise ValueError("For a conv with lhs dilation we expect the stride to be not set! Because convolution with input dilation d is equivalent to transposed convolution with stride d.")
+                    raise ValueError("For a conv with lhs dilation we expect the stride to be not set! "
+                                     "Because convolution with input dilation d is equivalent to transposed "
+                                     "convolution with stride d.")
                 # Convolution with input dilation d is equivalent to transposed convolution with stride d
                 strides = lhs_dilations
 
                 output_shape = op.result.type.shape
-                output_shape.append(output_shape.pop(1)) # Match the format of MIL
+                output_shape.append(output_shape.pop(1))  # Match the format of MIL
 
                 conv_type = partial(
                     mb.conv_transpose,
@@ -582,13 +596,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 # We need to subtract 1 from the padding to make the dimensions line up
                 pad -= 1
                 if np.any(pad < 0):
-                    raise ValueError("The case where the padding turns negative when translating to a transposed convolution is not supported.")
+                    raise ValueError("The case where the padding turns negative when translating to a "
+                                     "transposed convolution is not supported.")
 
         # The MIL weights should be on form:
         #  - normal convolutions: [C_out, C_in / groups, Kernel*]
         #  - transposed convolutions: [C_in, C_out / groups, Kernel*]
         # HLO has the form [Kernel*, C_in / groups, C_out]
-        weight = context[op.rhs.get_name()] # The weights are numpy arrays
+        weight = context[op.rhs.get_name()]  # The weights are numpy arrays
         perm = []
         # Move the channel dims
         if conv_type == mb.conv:
@@ -606,7 +621,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # It is executed for conv transpose
         if conv_type != mb.conv:
             # MIL expects the weights to be reversed along the kernel dimensions
-            kernel_dimensions = [ i + 2 for i in range(len(weight.shape) - 2) ]
+            kernel_dimensions = [i + 2 for i in range(len(weight.shape) - 2)]
             weight = mb.reverse(x=weight, axes=kernel_dimensions)
 
         cml_conv = conv_type(
@@ -650,7 +665,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_concatenate(self, context: TranscriptionContext, op: ConcatenateOp):
-        values = [ context[input.get_name()] for input in op.inputs ]
+        values = [context[input.get_name()] for input in op.inputs]
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
 
@@ -661,7 +676,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Setup arguments for the function
         for hlo_func_param, actual_arg in zip(hlo_params, cml_args):
             context.add_variable(hlo_func_param.get_name(), actual_arg)
-        
+
         # Process the function
         if len(hlo_func_body.blocks) != 1:
             raise ValueError(f"Unsupported function with {len(hlo_func_body.blocks)} blocks")

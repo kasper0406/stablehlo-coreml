@@ -5,6 +5,7 @@ from typing import List
 
 from .flax_xlstm import xLSTM
 
+
 class ResidualConv(nnx.Module):
     scale_conv: nnx.Conv
     conv: nnx.Conv
@@ -56,6 +57,7 @@ class ResidualConv(nnx.Module):
 
         return out
 
+
 class Encoder(nnx.Module):
     cnn_layers: List[ResidualConv]
     normalization: nnx.Module
@@ -87,6 +89,7 @@ class Encoder(nnx.Module):
         out = nnx.tanh(out)
 
         return out, skip_connections
+
 
 class Decoder(nnx.Module):
     cnn_layers: List[ResidualConv]
@@ -130,6 +133,7 @@ class Decoder(nnx.Module):
         out = self.output_polling(out)
         return out
 
+
 class UNet(nnx.Module):
     encoder: Encoder
     decoder: Decoder
@@ -148,6 +152,7 @@ class UNet(nnx.Module):
         out = self.audio_decoding(hidden, skip_connections)
 
         return out
+
 
 class UNetWithXlstm(nnx.Module):
     encoder: Encoder
