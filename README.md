@@ -8,6 +8,8 @@ Due to the current _dot_general_ op implementation, it is only possible to targe
 
 Look in the `tests` directory, to see what has currently been tested.
 
+The package is published to PyPi as `stablehlo-coreml-experimental`.
+
 ## Converting a model
 
 To convert a StableHLO module, do the following:

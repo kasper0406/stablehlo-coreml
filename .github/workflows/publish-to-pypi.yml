@@ -24,7 +24,12 @@ jobs:
         pip install build
     - name: Install Hatch
       uses: pypa/hatch@install
-    - name: Publish to PyPi
+    - name: Update version
       run: |
         hatch version $(git describe --tags)
+    - name: Build
+      run: |
+        hatch build
+    - name: Publish to PyPi
+      run: |
         hatch publish -n -u __token__ -a ${{ secrets.PYPI_API_TOKEN }}
