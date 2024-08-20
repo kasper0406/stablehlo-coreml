@@ -41,6 +41,9 @@ path = "stablehlo_coreml/__init__.py"
 # This setting is needed as long as we publish with the `_experimental` suffix
 packages = ["stablehlo_coreml"]
 
+[[tool.hatch.envs.test.matrix]]
+python = ["3.10", "3.11"]
+
 [tool.hatch.envs.test]
 randomize = true
 parallel = true
