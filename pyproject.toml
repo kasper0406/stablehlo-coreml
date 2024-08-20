@@ -2,12 +2,9 @@
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [project]
 name = "stablehlo-coreml-experimental"
-version = "0.0.1"
+dynamic = ["version"]
 authors = [
     { name="Kasper Nielsen", email="kasper0406@gmail.com" },
 ]
@@ -37,6 +34,9 @@ dependencies = [
     "jax",
 ]
 
+[tool.hatch.version]
+path = "stablehlo_coreml/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 # This setting is needed as long as we publish with the `_experimental` suffix
 packages = ["stablehlo_coreml"]
@@ -53,9 +53,6 @@ extra-dependencies = [
     "einops",
     "pillow",
 ]
-
-[[tool.hatch.envs.test.matrix]]
-python = [ "3.11" ]
 
 [project.urls]
 Homepage = "https://github.com/kasper0406/stablehlo-coreml"
