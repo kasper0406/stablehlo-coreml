@@ -12,7 +12,7 @@ from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 import inspect
 from functools import partial, reduce
 import operator
@@ -29,7 +29,7 @@ class TranscriptionContext:
     def __init__(self):
         self._path = []
         self.seen_paths = set()
-        self.variables = {} # Nest map: path -> variable -> mil var
+        self.variables = {} # Nested map: path -> variable -> mil var
 
     def push_function(self, name: str):
         counter = 0
@@ -114,8 +114,6 @@ class StableHloOpsRegistry(type):
         return instance
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
-
-    func_indx: Dict[str, FuncOp]
 
     def __init__(self, opset_version: Optional[int] = None):
         self.opset_version = AvailableTarget(opset_version) if opset_version is not None else None
