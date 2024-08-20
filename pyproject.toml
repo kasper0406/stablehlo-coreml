@@ -24,6 +24,7 @@ classifiers = [
     "Topic :: Software Development"
 ]
 keywords=[ "stablehlo", "hlo", "xla", "coreml", "machinelearning", "ml", "coremltools", "converter", "neural" ]
+requires-python = ">=3.9"
 
 dependencies = [
     'coremltools>=8.0b2; python_version >= "3.9" and python_version <= "3.11"',

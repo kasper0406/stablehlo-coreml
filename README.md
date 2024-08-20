@@ -4,6 +4,8 @@
 
 Only a subset of the StableHLO operations have been implemented, and some of them may have restrictions.
 
+Due to the current _dot_general_ op implementation, it is only possible to target iOS >= 18.
+
 Look in the `tests` directory, to see what has currently been tested.
 
 ## Converting a model
