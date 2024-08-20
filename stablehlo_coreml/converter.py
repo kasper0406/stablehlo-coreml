@@ -11,7 +11,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
     ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
-    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, ReduceOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -668,6 +668,54 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values = [context[input.get_name()] for input in op.inputs]
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
+        inputs = [context[input.get_name()] for input in op.inputs]
+        # All inputs have the same shape, so we pick the first to get the rank
+        result_shape = [1 if dim in op.dimensions else inputs[0].shape[dim] for dim in range(inputs[0].rank)]
+        shape_elements = reduce(lambda a, b: a * b, result_shape, 1)
+
+        mil_result = mb.fill(shape=result_shape)
+
+        def suffix_product(lst):
+            res = []
+            acc = 1
+            for i in reversed(lst):
+                res.append(acc)
+                acc *= i
+            return list(reversed(res))
+        result_strides = suffix_product(result_shape)
+
+        # Attempt at looping over result indexes without fully unrolling
+        def cond(i, _result):
+            return mb.less(x=i, y=shape_elements)
+
+        def body(i, result):
+            reshaped_update = [1 for _dim in range(len(result_shape))]
+            single_reduce_result = np.ones(reshaped_update)  # TODO: Calculate this!
+
+            # Compute the current result index from the variable i. We unroll the rank of the tensor which is <= 5
+            result_idx = mb.concat(values=[mb.mod(x=mb.floor_div(x=i, y=stride), y=shape) for stride, shape in zip(result_strides, result_shape)], axis=0)
+
+            begin = result_idx
+            end = mb.add(x=begin, y=1)
+
+            result = mb.slice_update(
+                x=result,
+                update=single_reduce_result,
+                begin=begin,
+                end=end,
+            )
+
+            return mb.add(x=i, y=1), result
+
+        _counter, mil_result = mb.while_loop(_cond=cond, _body=body, loop_vars=(0, mil_result))
+
+        context.add_variable(op.result.get_name(), mil_result)
+
+        # for result_idx in itertools.product(*result_shape):
+        #     print(f"Computing result for {result_idx}")
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call

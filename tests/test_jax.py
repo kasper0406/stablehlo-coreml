@@ -66,6 +66,17 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
 
 
+def test_reduction():
+    def max_reduce_keep_dims(a):
+        return jnp.max(a, axis=1, keepdims=True)
+
+    def max_reduce_discard_dims(a):
+        return jnp.max(a, axis=1, keepdims=True)
+
+    run_and_compare(max_reduce_keep_dims, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(max_reduce_discard_dims, (jnp.zeros((2, 3, 4)),))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []
