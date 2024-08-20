@@ -335,8 +335,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Calculate the result by looping over the contracting dims in order
         result_shape = [lhs.shape[dim] for dim in lhs_batching_dim]
-        result_shape.append([lhs.shape[dim] for dim in lhs_result_dim])
-        result_shape.append([rhs.shape[dim] for dim in rhs_result_dim])
+        result_shape += [lhs.shape[dim] for dim in lhs_result_dim]
+        result_shape += [rhs.shape[dim] for dim in rhs_result_dim]
         if len(result_shape) == 0:
             # Special case for scalar result
             result_shape = [1]
