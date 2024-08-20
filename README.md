@@ -26,13 +26,20 @@ For a Jax project, the `hlo_module` can be obtained the following way:
 import jax
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
-from jax.experimental import export
+from jax.export import export
+
+import jax.numpy as jnp
+
+def jax_function(a, b):
+    return jnp.einsum("ij,jk -> ik", a, b)
 
 context = jax_mlir.make_ir_context()
-input_shapes = jnp.zeros((1, 2, 3), dtype=jnp.float16)
-jax_exported = export.export(jax.jit(model))(*input_shapes)
+input_shapes = (jnp.zeros((2, 4)), jnp.zeros((4, 3)))
+jax_exported = export(jax.jit(jax_function))(*input_shapes)
 hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 ```
+
+For the Jax example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
 For additional examples see the `tests` directory.
 
