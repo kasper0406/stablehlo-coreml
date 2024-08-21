@@ -3,7 +3,7 @@ from coremltools.converters.mil import mil
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
-from .utils import index_by_slices, update_tensor_by_slice
+from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -21,7 +21,6 @@ from typing import List, Optional
 import inspect
 from functools import partial, reduce
 import operator
-import itertools
 
 
 def convert(module, minimum_deployment_target: AvailableTarget):
@@ -326,6 +325,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # TODO: Figure out if we need to special case broadcasting dims
             return mb.matmul(x=lhs, y=rhs, transpose_y=True)
 
+        # Remark: There is a potential performance optimization here:
+        #         If we move the largest result dimensions of the tensor towards
+        #         the end of the array, we may save a lot of work when iterating
+        #         over the result indexes later, as the last dims will be handled
+        #         by matrix multiplication
         lhs_result_dim = [dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim]
         rhs_result_dim = [dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim]
 
@@ -342,22 +346,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
         result = mb.fill(shape=result_shape)
 
-        # We can utilize that we have a full matrix multiply primitive available, compared to having only
-        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
-        # the lhs and rhs tensors
-        lhs_result_indices = itertools.product(*[range(lhs.shape[dim]) for dim in lhs_result_dim[:-1]])
-        rhs_result_indices = itertools.product(*[range(rhs.shape[dim]) for dim in rhs_result_dim[:-1]])
-        for lhs_idx, rhs_idx in itertools.product(lhs_result_indices, rhs_result_indices):
-            # We may have to add an extra slice for the skipped dimension
-            result_idx = ()
-            result_idx += lhs_idx
-            if len(lhs_result_dim) > 0:
-                result_idx += (slice(None), )
-            result_idx += rhs_idx
-            if len(rhs_result_dim) > 0:
-                result_idx += (slice(None), )
-            # print(f"Calculating result for index {result_idx}, lhs = {lhs_idx}, rhs = {rhs_idx}")
-
+        def calculate_result_index(acc, lhs_idx, rhs_idx):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
             # print(f"contracted_element_count = {contracted_element_count}")
             batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
@@ -366,14 +355,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # Reshape the lhs and rhs to have all the contracting dimensions in the end.
             # We will always make them have the shape `(batch_shape, last_dim_shape, contraction_count)``
             # where we may have to set `last_dim_shape` to 1, if the dimension does not exist.
-            lhs_for_result_idx = index_by_slices(transposed_lhs, batch_selector + lhs_idx + (...,))
+            lhs_for_result_idx = index_by_slices(transposed_lhs, list(batch_selector) + [lhs_idx, ...])
             if len(lhs_result_dim) > 0:
                 lhs_reshape_shape = batch_shape + (lhs.shape[lhs_result_dim[-1]],) + (contracted_element_count, )
             else:
                 lhs_reshape_shape = batch_shape + (1, contracted_element_count)
             contracted_lhs = mb.reshape(x=lhs_for_result_idx, shape=lhs_reshape_shape)
 
-            rhs_for_result_idx = index_by_slices(transposed_rhs, batch_selector + rhs_idx + (...,))
+            rhs_for_result_idx = index_by_slices(transposed_rhs, list(batch_selector) + [rhs_idx, ...])
             if len(rhs_result_dim) > 0:
                 rhs_reshape_shape = batch_shape + (rhs.shape[rhs_result_dim[-1]],) + (contracted_element_count, )
             else:
@@ -394,7 +383,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 idx_result = mb.squeeze(x=idx_result, axes=(-1,))
 
             # TODO: Consider making this work on iOS<18 by using concatenation
-            result = update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
+            # We may have to add an extra slice for the skipped dimension
+            result_idx = []
+            result_idx.append(lhs_idx)
+            if len(lhs_result_dim) > 0:
+                result_idx.append(slice(None))
+            result_idx.append(rhs_idx)
+            if len(rhs_result_dim) > 0:
+                result_idx.append(slice(None))
+
+            return update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)
+
+        # We can utilize that we have a full matrix multiply primitive available, compared to having only
+        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
+        # the lhs and rhs tensors
+        lhs_shape = [lhs.shape[dim] for dim in lhs_result_dim[:-1]]
+        rhs_shape = [rhs.shape[dim] for dim in rhs_result_dim[:-1]]
+        # In principle all of the matrix multiplications generated here, could be done in parallel.
+        # MIL does not seem to support this.
+        # We could try to combine the matrix multiplications when the shapes allow it, but for now
+        # we will just loop through them sequentially.
+        result = iterate_indexes_in_shapes(calculate_result_index, result, [lhs_shape, rhs_shape])
 
         context.add_variable(op.result.get_name(), result)
 

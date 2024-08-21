@@ -9,6 +9,7 @@ import numpy as np
 from stablehlo_coreml.converter import convert
 import coremltools as ct
 from coremltools.converters.mil.testing_utils import compare_backend
+from coremltools.converters.mil.mil import Program, Block
 
 
 def test_addition():
@@ -53,6 +54,15 @@ def test_tensor_multiplication():
     def full_tensor_product(lhs, rhs):
         return jnp.einsum("ab,ihj->abihj", lhs, rhs)
 
+    def full_tensor_product_1_4(lhs, rhs):
+        return jnp.einsum("a,ihjk->aihjk", lhs, rhs)
+
+    def full_tensor_product_3_2(lhs, rhs):
+        return jnp.einsum("abc,ih->abcih", lhs, rhs)
+
+    def full_tensor_product_4_1(lhs, rhs):
+        return jnp.einsum("abcd,i->abcdi", lhs, rhs)
+
     run_and_compare(scalar_product, (jnp.zeros((1)), jnp.zeros((1))))
     run_and_compare(scalar_with_vector, (jnp.zeros((1)), jnp.zeros((5))))
     run_and_compare(scalar_with_matrix, (jnp.zeros((1)), jnp.zeros((5, 3))))
@@ -64,6 +74,15 @@ def test_tensor_multiplication():
     run_and_compare(three_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
     run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
+
+    # Test the full tensor product with a big dimensions, and ensure that the program gets handled by a dynamic loop
+    run_and_compare(full_tensor_product, (jnp.zeros((10, 3)), jnp.zeros((15, 20, 3))))
+    run_and_compare(full_tensor_product_1_4, (jnp.zeros((10,)), jnp.zeros((15, 20, 5, 3))))
+    run_and_compare(full_tensor_product_1_4, (jnp.zeros((2,)), jnp.zeros((2, 2, 2, 3))))
+    run_and_compare(full_tensor_product_3_2, (jnp.zeros((20, 10, 3)), jnp.zeros((15, 3))))
+    run_and_compare(full_tensor_product_3_2, (jnp.zeros((2, 2, 3)), jnp.zeros((2, 3))))
+    run_and_compare(full_tensor_product_4_1, (jnp.zeros(((15, 20, 5, 3))), jnp.zeros((10,))))
+    run_and_compare(full_tensor_product_4_1, (jnp.zeros(((2, 2, 2, 3))), jnp.zeros((2,))))
 
 
 def jax_export(jax_func, input_spec):
@@ -125,7 +144,26 @@ def __nest_flat_jax_input_to_input_spec(input_spec, flat_input):
     return structured_input
 
 
-def run_and_compare(jax_func, input_spec):
+def _count_program_complexity(mil_program: Program):
+    """
+    Counts the number of instructions in the given `mil_program`
+    This is used to ensure we don't generate crazy big programs
+    """
+    def count_block(block: Block):
+        complexity = 0
+        for op in block.operations:
+            for child_block in op.blocks:
+                complexity += count_block(child_block)
+            complexity += 1
+        return complexity
+
+    total_complexity = 0
+    for func in mil_program.functions.values():
+        total_complexity += count_block(func)
+    return total_complexity
+
+
+def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
     jax_func = jax.jit(jax_func)
     exported = jax_export(jax_func, input_spec)
     context = jax_mlir.make_ir_context()
@@ -133,6 +171,13 @@ def run_and_compare(jax_func, input_spec):
     # print(f"HLO module: {hlo_module}")
 
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
+    program_complexity = _count_program_complexity(mil_program)
+    if program_complexity > max_complexity:
+        raise ValueError(
+            f"Generated a MIL program with complexity {program_complexity}, "
+            "max allowed complexity is {max_complexity}"
+        )
+
     cml_model = ct.convert(mil_program, source="milinternal", minimum_deployment_target=ct.target.iOS18)
 
     # Generate random inputs that matches cml_model input spec
