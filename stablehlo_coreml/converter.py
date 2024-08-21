@@ -3,7 +3,7 @@ from coremltools.converters.mil import mil
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
-from .utils import index_by_slices, update_tensor_by_slice
+from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -11,7 +11,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
     ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
-    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, ReduceOp
+    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -21,7 +21,6 @@ from typing import List, Optional
 import inspect
 from functools import partial, reduce
 import operator
-import itertools
 
 
 def convert(module, minimum_deployment_target: AvailableTarget):
@@ -326,6 +325,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # TODO: Figure out if we need to special case broadcasting dims
             return mb.matmul(x=lhs, y=rhs, transpose_y=True)
 
+        # Remark: There is a potential performance optimization here:
+        #         If we move the largest result dimensions of the tensor towards
+        #         the end of the array, we may save a lot of work when iterating
+        #         over the result indexes later, as the last dims will be handled
+        #         by matrix multiplication
         lhs_result_dim = [dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim]
         rhs_result_dim = [dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim]
 
@@ -342,22 +346,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
         result = mb.fill(shape=result_shape)
 
-        # We can utilize that we have a full matrix multiply primitive available, compared to having only
-        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
-        # the lhs and rhs tensors
-        lhs_result_indices = itertools.product(*[range(lhs.shape[dim]) for dim in lhs_result_dim[:-1]])
-        rhs_result_indices = itertools.product(*[range(rhs.shape[dim]) for dim in rhs_result_dim[:-1]])
-        for lhs_idx, rhs_idx in itertools.product(lhs_result_indices, rhs_result_indices):
-            # We may have to add an extra slice for the skipped dimension
-            result_idx = ()
-            result_idx += lhs_idx
-            if len(lhs_result_dim) > 0:
-                result_idx += (slice(None), )
-            result_idx += rhs_idx
-            if len(rhs_result_dim) > 0:
-                result_idx += (slice(None), )
-            # print(f"Calculating result for index {result_idx}, lhs = {lhs_idx}, rhs = {rhs_idx}")
-
+        def calculate_result_index(acc, lhs_idx, rhs_idx):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
             # print(f"contracted_element_count = {contracted_element_count}")
             batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
@@ -366,14 +355,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # Reshape the lhs and rhs to have all the contracting dimensions in the end.
             # We will always make them have the shape `(batch_shape, last_dim_shape, contraction_count)``
             # where we may have to set `last_dim_shape` to 1, if the dimension does not exist.
-            lhs_for_result_idx = index_by_slices(transposed_lhs, batch_selector + lhs_idx + (...,))
+            lhs_for_result_idx = index_by_slices(transposed_lhs, list(batch_selector) + [lhs_idx, ...])
             if len(lhs_result_dim) > 0:
                 lhs_reshape_shape = batch_shape + (lhs.shape[lhs_result_dim[-1]],) + (contracted_element_count, )
             else:
                 lhs_reshape_shape = batch_shape + (1, contracted_element_count)
             contracted_lhs = mb.reshape(x=lhs_for_result_idx, shape=lhs_reshape_shape)
 
-            rhs_for_result_idx = index_by_slices(transposed_rhs, batch_selector + rhs_idx + (...,))
+            rhs_for_result_idx = index_by_slices(transposed_rhs, list(batch_selector) + [rhs_idx, ...])
             if len(rhs_result_dim) > 0:
                 rhs_reshape_shape = batch_shape + (rhs.shape[rhs_result_dim[-1]],) + (contracted_element_count, )
             else:
@@ -394,7 +383,23 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 idx_result = mb.squeeze(x=idx_result, axes=(-1,))
 
             # TODO: Consider making this work on iOS<18 by using concatenation
-            result = update_tensor_by_slice(result, batch_selector + result_idx, idx_result)
+            # We may have to add an extra slice for the skipped dimension
+            result_idx = []
+            result_idx.append(lhs_idx)
+            if len(lhs_result_dim) > 0:
+                result_idx.append(slice(None))
+            result_idx.append(rhs_idx)
+            if len(rhs_result_dim) > 0:
+                result_idx.append(slice(None))
+
+            return update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)
+
+        # We can utilize that we have a full matrix multiply primitive available, compared to having only
+        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
+        # the lhs and rhs tensors
+        lhs_shape = [lhs.shape[dim] for dim in lhs_result_dim[:-1]]
+        rhs_shape = [rhs.shape[dim] for dim in rhs_result_dim[:-1]]
+        result = iterate_indexes_in_shapes(calculate_result_index, result, [lhs_shape, rhs_shape])
 
         context.add_variable(op.result.get_name(), result)
 
@@ -668,54 +673,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values = [context[input.get_name()] for input in op.inputs]
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
-
-    @register_stablehlo_op
-    def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
-        inputs = [context[input.get_name()] for input in op.inputs]
-        # All inputs have the same shape, so we pick the first to get the rank
-        result_shape = [1 if dim in op.dimensions else inputs[0].shape[dim] for dim in range(inputs[0].rank)]
-        shape_elements = reduce(lambda a, b: a * b, result_shape, 1)
-
-        mil_result = mb.fill(shape=result_shape)
-
-        def suffix_product(lst):
-            res = []
-            acc = 1
-            for i in reversed(lst):
-                res.append(acc)
-                acc *= i
-            return list(reversed(res))
-        result_strides = suffix_product(result_shape)
-
-        # Attempt at looping over result indexes without fully unrolling
-        def cond(i, _result):
-            return mb.less(x=i, y=shape_elements)
-
-        def body(i, result):
-            reshaped_update = [1 for _dim in range(len(result_shape))]
-            single_reduce_result = np.ones(reshaped_update)  # TODO: Calculate this!
-
-            # Compute the current result index from the variable i. We unroll the rank of the tensor which is <= 5
-            result_idx = mb.concat(values=[mb.mod(x=mb.floor_div(x=i, y=stride), y=shape) for stride, shape in zip(result_strides, result_shape)], axis=0)
-
-            begin = result_idx
-            end = mb.add(x=begin, y=1)
-
-            result = mb.slice_update(
-                x=result,
-                update=single_reduce_result,
-                begin=begin,
-                end=end,
-            )
-
-            return mb.add(x=i, y=1), result
-
-        _counter, mil_result = mb.while_loop(_cond=cond, _body=body, loop_vars=(0, mil_result))
-
-        context.add_variable(op.result.get_name(), mil_result)
-
-        # for result_idx in itertools.product(*result_shape):
-        #     print(f"Computing result for {result_idx}")
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
