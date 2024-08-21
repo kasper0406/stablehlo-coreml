@@ -11,6 +11,7 @@ import coremltools as ct
 from coremltools.converters.mil.testing_utils import compare_backend
 from coremltools.converters.mil.mil import Program, Block
 
+from functools import partial
 
 def test_addition():
     def plus(x, y):
@@ -83,6 +84,30 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product_3_2, (jnp.zeros((2, 2, 3)), jnp.zeros((2, 3))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros(((15, 20, 5, 3))), jnp.zeros((10,))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros(((2, 2, 2, 3))), jnp.zeros((2,))))
+
+
+def test_reduction():
+    def max_reduce_keep_dims(a):
+        return jnp.max(a, axis=1, keepdims=True)
+
+    def max_reduce_discard_dims(a):
+        return jnp.max(a, axis=1, keepdims=True)
+
+    run_and_compare(max_reduce_keep_dims, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(max_reduce_discard_dims, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.sum, axis=0), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.sum, axis=1), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.sum, axis=2), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.sum, axis=(0, 2)), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.sum, axis=(0, 1, 2)), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.min, axis=0), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.min, axis=(1, 2)), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.mean, axis=0), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.prod, axis=1), (jnp.zeros((2, 3, 4)),))
+
+    # TODO: These are much harder matching on
+    # run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 4)),))
+    # run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 4)),))
 
 
 def jax_export(jax_func, input_spec):

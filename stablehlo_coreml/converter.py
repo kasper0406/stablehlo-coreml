@@ -10,8 +10,9 @@ from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
-    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
-    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, MaxOp, RsqrtOp,
+    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, ReduceOp,
+    IotaOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -21,6 +22,7 @@ from typing import List, Optional
 import inspect
 from functools import partial, reduce
 import operator
+import itertools
 
 
 def convert(module, minimum_deployment_target: AvailableTarget):
@@ -661,6 +663,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_res)
 
     @register_stablehlo_op
+    def op_min(self, context: TranscriptionContext, op: MinOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_res = mb.minimum(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_res)
+
+    @register_stablehlo_op
     def op_rsqrt(self, context: TranscriptionContext, op: RsqrtOp):
         x = context[op.operand.get_name()]
         mil_res = mb.rsqrt(x=x)
@@ -677,6 +686,56 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values = [context[input.get_name()] for input in op.inputs]
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
+        # In principle we could calculate all HLO reductions by using a MIL while loop
+        # However, there would be no acceleration for this, and the computation is likely
+        # to take much longer than the user expected.
+        # Therefore wes will restrict the supported reductions to what is supported through
+        # native MIL instructions
+
+        def match_reduction_type(hlo_body):
+            if len(hlo_body.blocks) != 1:
+                return None
+            args = list(hlo_body.blocks[0].arguments)
+            ops = list(hlo_body.blocks[0].operations)
+
+            # Simple matches are where the `hlo_body` is on the form
+            #   return _generic_reduction_op_type_(`args`)
+            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
+            simple_matches = {
+                MaxOp: mb.reduce_max,
+                MinOp: mb.reduce_min,
+                AddOp: mb.reduce_sum,
+                MulOp: mb.reduce_prod,
+            }
+
+            for generic_reduce_op_type, mil_equivalent in simple_matches.items():
+                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
+                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
+                        return mil_equivalent
+
+            return None
+
+        if len(op.inputs) > 1:
+            raise ValueError("Only reductions with one input dimension is supported")
+        input = context[op.inputs[0].get_name()]
+
+        reduction_type = match_reduction_type(op.body)
+        if reduction_type is None:
+            raise ValueError("The reduction was not recognized")
+
+        res = reduction_type(x=input, axes=np.array(op.dimensions, dtype=np.int32))
+        context.add_variable(op.result.get_name(), res)
+
+    @register_stablehlo_op
+    def op_iota(self, context: TranscriptionContext, op: IotaOp):
+        iota_dim = int(op.iota_dimension)
+        tensor_shape = op.result.type.shape
+        vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
+        res = np.reshape(np.arange(tensor_shape[iota_dim]), vec_shape) * np.ones(tensor_shape)
+        context.add_variable(op.result.get_name(), res)
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
