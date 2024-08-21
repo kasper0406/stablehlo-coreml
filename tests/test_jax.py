@@ -76,7 +76,6 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
 
     # Test the full tensor product with a big dimensions, and ensure that the program gets handled by a dynamic loop
-    # TODO: Check this size of the program!
     run_and_compare(full_tensor_product, (jnp.zeros((10, 3)), jnp.zeros((15, 20, 3))))
     run_and_compare(full_tensor_product_1_4, (jnp.zeros((10,)), jnp.zeros((15, 20, 5, 3))))
     run_and_compare(full_tensor_product_1_4, (jnp.zeros((2,)), jnp.zeros((2, 2, 2, 3))))

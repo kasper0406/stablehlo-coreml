@@ -399,6 +399,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # the lhs and rhs tensors
         lhs_shape = [lhs.shape[dim] for dim in lhs_result_dim[:-1]]
         rhs_shape = [rhs.shape[dim] for dim in rhs_result_dim[:-1]]
+        # In principle all of the matrix multiplications generated here, could be done in parallel.
+        # MIL does not seem to support this.
+        # We could try to combine the matrix multiplications when the shapes allow it, but for now
+        # we will just loop through them sequentially.
         result = iterate_indexes_in_shapes(calculate_result_index, result, [lhs_shape, rhs_shape])
 
         context.add_variable(op.result.get_name(), result)
