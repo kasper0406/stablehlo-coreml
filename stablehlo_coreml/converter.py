@@ -22,7 +22,6 @@ from typing import List, Optional
 import inspect
 from functools import partial, reduce
 import operator
-import itertools
 
 
 def convert(module, minimum_deployment_target: AvailableTarget):
@@ -692,7 +691,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # In principle we could calculate all HLO reductions by using a MIL while loop
         # However, there would be no acceleration for this, and the computation is likely
         # to take much longer than the user expected.
-        # Therefore wes will restrict the supported reductions to what is supported through
+        # Therefore we will restrict the supported reductions to what is supported through
         # native MIL instructions
 
         def match_reduction_type(hlo_body):
