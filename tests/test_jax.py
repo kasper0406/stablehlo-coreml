@@ -15,11 +15,8 @@ from functools import partial
 
 
 def test_addition():
-    def plus(x, y):
-        return jnp.add(x, y)
-
-    run_and_compare(plus, (jnp.float32(1), jnp.float32(1)))
-    run_and_compare(plus, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
+    run_and_compare(jnp.add, (jnp.float32(1), jnp.float32(1)))
+    run_and_compare(jnp.add, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
 
 def test_tensor_multiplication():
@@ -88,14 +85,8 @@ def test_tensor_multiplication():
 
 
 def test_reduction():
-    def max_reduce_keep_dims(a):
-        return jnp.max(a, axis=1, keepdims=True)
-
-    def max_reduce_discard_dims(a):
-        return jnp.max(a, axis=1, keepdims=True)
-
-    run_and_compare(max_reduce_keep_dims, (jnp.zeros((2, 3, 4)),))
-    run_and_compare(max_reduce_discard_dims, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.max, axis=1), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.max, axis=1, keepdims=True), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.sum, axis=0), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.sum, axis=1), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.sum, axis=2), (jnp.zeros((2, 3, 4)),))
