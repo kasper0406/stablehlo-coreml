@@ -94,6 +94,48 @@ def test_flax_convolution():
     run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, 2)), ))
 
 
+def test_flax_grouped_convolution():
+    class TestConvolution(nnx.Module):
+        def __init__(self, in_features: int, feature_groups: int, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(
+                in_features=in_features,
+                out_features=2 * feature_groups,
+                kernel_size=3,
+                feature_group_count=feature_groups,
+                rngs=rngs
+            )
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    run_and_compare(nnx.jit(TestConvolution(4, 2, nnx.Rngs(0))), (jnp.zeros((2, 8, 4)), ))
+    run_and_compare(nnx.jit(TestConvolution(9, 3, nnx.Rngs(0))), (jnp.zeros((2, 8, 9)), ))
+
+
+def test_flax_2d_convolution():
+    class TestConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=3, out_features=1, kernel_size=(3, 3), rngs=rngs)
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    model = TestConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, 8, 3)), ))
+
+
+def test_flax_3d_convolution():
+    class TestConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=3, out_features=1, kernel_size=(3, 3, 3), rngs=rngs)
+
+        def __call__(self, x):
+            return self.conv(x)
+
+    model = TestConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((2, 8, 8, 8, 3)), ))
+
+
 def test_flax_stacked_convolution():
     class TestStackedConvolution(nnx.Module):
         def __init__(self, rngs=nnx.Rngs):
@@ -130,6 +172,36 @@ def test_flax_transposed_convolution():
 
     model = TestTransposedConvolution(nnx.Rngs(0))
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 2)), ))
+
+
+def test_flax_transposed_2d_convolution():
+    class TestTransposedConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=2, out_features=3, kernel_size=(4, 4), rngs=rngs)
+            self.conv_transpose = nnx.ConvTranspose(in_features=3, out_features=2, kernel_size=(3, 4), rngs=rngs)
+
+        def __call__(self, x):
+            x = self.conv(x)
+            x = self.conv_transpose(x)
+            return x
+
+    model = TestTransposedConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 10, 8, 2)), ))
+
+
+def test_flax_transposed_3d_convolution():
+    class TestTransposedConvolution(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.conv = nnx.Conv(in_features=2, out_features=3, kernel_size=(4, 4, 4), rngs=rngs)
+            self.conv_transpose = nnx.ConvTranspose(in_features=3, out_features=2, kernel_size=(3, 4, 2), rngs=rngs)
+
+        def __call__(self, x):
+            x = self.conv(x)
+            x = self.conv_transpose(x)
+            return x
+
+    model = TestTransposedConvolution(nnx.Rngs(0))
+    run_and_compare(nnx.jit(model), (jnp.zeros((4, 10, 8, 7, 2)), ))
 
 
 def test_kernel_dilated_conv():

@@ -544,10 +544,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
         if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
             raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
-        if dim_spec.input_feature_dimension != 2:
-            raise ValueError("Only dimension 2 is currently supported as input feature dimension")
-        if dim_spec.output_feature_dimension != 2:
-            raise ValueError("Only dimension 2 is currently supported as output feature dimension")
+        if dim_spec.input_feature_dimension != len(dim_spec.input_spatial_dimensions) + 1:
+            raise ValueError("The input feature dimension is currently only supported to be the last dimension")
+        if dim_spec.output_feature_dimension != len(dim_spec.output_spatial_dimensions) + 1:
+            raise ValueError("The output feature dimension is currently only supported to be the last dimension")
+        if len(dim_spec.input_spatial_dimensions) > 3 or len(dim_spec.output_spatial_dimensions) > 3:
+            raise ValueError("MIL only supports convolutions with dim <= 3")
 
         if op.batch_group_count.value != 1:
             raise ValueError(f"Only a batch group count of 1 is supported. Got {op.batch_group_count.value}")
@@ -556,8 +558,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # MIL expects it on the form [batch, channels, d_in*]
         x = context[op.lhs.get_name()]  # The inputs comes from vars
         perm = list(range(x.rank))
-        # Move the second axis to the end
-        perm.append(perm.pop(1))
+        # Move the last axis to the second position
+        perm.insert(1, perm.pop())
         x = mb.transpose(x=x, perm=perm)
 
         strides = None
