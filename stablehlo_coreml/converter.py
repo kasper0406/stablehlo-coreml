@@ -11,9 +11,10 @@ from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
     ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
-    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp
+    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp
 )
-from jax._src.lib.mlir.dialects import hlo
+from jaxlib.mlir.dialects.mhlo import (TopKOp)
+from jax._src.lib.mlir.dialects import hlo, mhlo
 
 import numpy as np
 
@@ -317,9 +318,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[op.rhs.get_name()]
 
         def multiply(lst: List):
-            if len(lst) == 0:
-                return 1
-            return reduce(lambda a, b: int(a) * int(b), lst)
+            return reduce(lambda a, b: int(a) * int(b), lst, 1)
 
         def last_column_dot(lhs, rhs):
             # TODO: Figure out if we need to special case broadcasting dims
@@ -679,6 +678,44 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values = [context[input.get_name()] for input in op.inputs]
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_custom_call(self, context: TranscriptionContext, op: CustomCallOp):
+        if op.call_target_name.value.startswith("mhlo."):
+            mapped_op = None
+            op_impl = None
+            match op.call_target_name.value:
+                case "mhlo.topk":
+                    mapped_op = TopKOp
+                    op_impl = self._op_mhlo_topk
+
+            if not mapped_op:
+                raise ValueError(f"mhlo op '{op.call_target_name.value}' is not implemented")
+            if not op_impl:
+                raise ValueError(f"mhlo op '{op.call_target_name.value}' does not have an implementation")
+
+            mhlo_attributes = {attr.name: attr.attr for attr in list(op.attributes["mhlo.attributes"])}
+            delegate_op = partial(mapped_op, **mhlo_attributes, loc=op.location)(*op.operands)
+
+            # We manually have to handle the results, as the current API does not allow naming
+            # the `delegate_op` results according to the custom call results
+            mil_results = op_impl(context, delegate_op)
+            for (custom_call_result, mil_result) in zip(op.results, mil_results):
+                context.add_variable(custom_call_result.get_name(), mil_result)
+
+            return
+
+        raise ValueError(f"Custom call is not supported: {op.call_target_name}")
+
+    def _op_mhlo_topk(self, context: TranscriptionContext, op: TopKOp):
+        """
+        This is a MHLO op, and follows a slightly different pattern, since it is unvoked by a
+        custom call. It will return the results, as we currently can not rename the results
+        in the TopKOp
+        """
+        x = context[op.operand.get_name()]
+        mil_res = mb.topk(x=x, k=op.k.value, ascending=not op.largest.value)
+        return mil_res
 
     def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
