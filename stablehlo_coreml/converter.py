@@ -363,7 +363,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
         result = mb.fill(shape=result_shape)
 
-        def calculate_result_index(acc, lhs_idx, rhs_idx):
+        def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
             # print(f"contracted_element_count = {contracted_element_count}")
             batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
@@ -409,7 +409,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if len(rhs_result_dim) > 0:
                 result_idx.append(slice(None))
 
-            return update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)
+            return [update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)]
 
         # We can utilize that we have a full matrix multiply primitive available, compared to having only
         # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
@@ -420,7 +420,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # MIL does not seem to support this.
         # We could try to combine the matrix multiplications when the shapes allow it, but for now
         # we will just loop through them sequentially.
-        result = iterate_indexes_in_shapes(calculate_result_index, result, [lhs_shape, rhs_shape])
+        result, = iterate_indexes_in_shapes(calculate_result_index, [result], [lhs_shape, rhs_shape])
 
         context.add_variable(op.result.get_name(), result)
 
@@ -748,12 +748,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [inputs[0].shape[dim] if dim not in op.dimensions else 1 for dim in range(input_rank)]
             init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
-            def compute_reduction(accs, result_idx):
-                def compute_inner(acc, element_idx):
+            def compute_reduction(result_idx, *partial_results):
+                def compute_inner(element_idx, *acc):
                     element_idx = mb.add(x=result_idx, y=element_idx)
                     elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
 
-                    args = acc + elements
+                    args = list(acc) + elements
                     hlo_params = list(op.body.blocks[0].arguments)
                     outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, op.body, args)
 
@@ -766,10 +766,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     result_idx = [mb.gather(x=result_idx, indices=result_indices)]
                 else:
                     result_idx = []
-                return [update_tensor_by_slice(acc, result_idx, result) for acc, result in zip(accs, reduction_results)]
+                return [update_tensor_by_slice(acc, result_idx, result) for acc, result in zip(partial_results, reduction_results)]
 
             mil_results = [np.zeros(result.type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result.type.element_type))) for result in op.results]
-            mil_results = iterate_indexes_in_shapes(compute_reduction, mil_results, [result_shape])
+            mil_results = iterate_indexes_in_shapes(compute_reduction, mil_results, [result_shape], unroll_limit=5)
             for (res, mil_res) in zip(op.results, mil_results):
                 context.add_variable(res.get_name(), mil_res)
 

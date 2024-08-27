@@ -103,14 +103,15 @@ def test_complex_reductions():
     """
     These reductions are complicated, and will be handled using while loops (potentially unrolled)
     """
-    run_and_compare(jnp.argmax, (jnp.zeros((2, 3, 4)),))
-    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 4)),))
-    run_and_compare(partial(jnp.argmax, axis=0), (jnp.zeros((2, 3, 4)),))
-    run_and_compare(partial(jnp.argmax, axis=2), (jnp.zeros((2, 3, 4)),))
-    # run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((20, 30, 40)),))
+    run_and_compare(jnp.argmax, (jnp.zeros((2, 3, 3)),))
+    run_and_compare(jnp.argmax, (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=0), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=2), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((20, 30, 40)),))
 
-    run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 4)),))
-    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 3)),))
 
 
 def test_topk():
