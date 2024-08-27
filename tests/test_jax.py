@@ -102,12 +102,18 @@ def test_reduction():
     # run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 4)),))
 
 
+def test_topk():
+    input_shape = (3, 5, 10)
+    run_and_compare(partial(jax.lax.top_k, k=3), (jnp.zeros(input_shape),))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []
         for input_spec in input_specs:
             if isinstance(input_spec, (list, tuple)):
-                shapes.append(compute_input_shapes(input_spec))
+                # We only unwrap the shapes for one level
+                shapes.append(input_spec)
             else:
                 shapes.append(jax.ShapeDtypeStruct(input_spec.shape, input_spec.dtype))
         return shapes
@@ -195,7 +201,19 @@ def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
             "max allowed complexity is {max_complexity}"
         )
 
-    cml_model = ct.convert(mil_program, source="milinternal", minimum_deployment_target=ct.target.iOS18)
+    pipeline = ct.PassPipeline.DEFAULT
+    # We temporarily avoid fp16 conversions in tests because of https://github.com/apple/coremltools/issues/2324
+    passes_to_remove = [
+         'common::add_fp16_cast'
+    ]
+    pipeline.remove_passes(passes_to_remove)
+
+    cml_model = ct.convert(
+        mil_program,
+        source="milinternal",
+        minimum_deployment_target=ct.target.iOS18,
+        pass_pipeline=pipeline,
+    )
 
     # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
