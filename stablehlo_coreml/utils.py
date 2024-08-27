@@ -27,6 +27,9 @@ def index_by_slices(tensor, slice_spec):
 
 
 def update_tensor_by_slice(tensor, slice_spec, value):
+    if len(tensor.shape) == 0:
+        tensor = mb.reshape(x=tensor, shape=(1,))
+
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)
 
     value = mb.reshape(x=value, shape=resolved_slices.shape)

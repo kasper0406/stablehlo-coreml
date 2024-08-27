@@ -84,7 +84,8 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product_4_1, (jnp.zeros(((2, 2, 2, 3))), jnp.zeros((2,))))
 
 
-def test_reduction():
+def test_simple_reductions():
+    # TODO: Test that these reductions are not computed using a while loop
     run_and_compare(partial(jnp.max, axis=1), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.max, axis=1, keepdims=True), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.sum, axis=0), (jnp.zeros((2, 3, 4)),))
@@ -97,9 +98,19 @@ def test_reduction():
     run_and_compare(partial(jnp.mean, axis=0), (jnp.zeros((2, 3, 4)),))
     run_and_compare(partial(jnp.prod, axis=1), (jnp.zeros((2, 3, 4)),))
 
-    # TODO: These are much harder matching on
-    # run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 4)),))
-    # run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 4)),))
+
+def test_complex_reductions():
+    """
+    These reductions are complicated, and will be handled using while loops (potentially unrolled)
+    """
+    run_and_compare(jnp.argmax, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.argmax, axis=0), (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.argmax, axis=2), (jnp.zeros((2, 3, 4)),))
+    # run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((20, 30, 40)),))
+
+    run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 4)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 4)),))
 
 
 def test_topk():
