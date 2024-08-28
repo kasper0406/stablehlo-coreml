@@ -16,6 +16,7 @@ class ResolvedSliceSpec:
 
 
 def index_by_slices(tensor, slice_spec):
+    tensor = fix_scalar_tensor(tensor)
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)
 
     return mb.slice_by_index(
@@ -27,9 +28,7 @@ def index_by_slices(tensor, slice_spec):
 
 
 def update_tensor_by_slice(tensor, slice_spec, value):
-    if len(tensor.shape) == 0:
-        tensor = mb.reshape(x=tensor, shape=(1,))
-
+    tensor = fix_scalar_tensor(tensor)
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)
 
     value = mb.reshape(x=value, shape=resolved_slices.shape)
@@ -40,6 +39,17 @@ def update_tensor_by_slice(tensor, slice_spec, value):
         end=resolved_slices.end_indices,
         stride=resolved_slices.strides
     )
+
+
+def fix_scalar_tensor(tensor):
+    """
+    From a numpy scalar type, CoreML will create a rank 0 tensor, which it will
+    later struggle to do operations on. We will re-shape it to a rank 1 tensor
+    with dimension 1.
+    """
+    if len(tensor.shape) == 0:
+        tensor = mb.reshape(x=tensor, shape=(1,))
+    return tensor
 
 
 def _flatten_list(lst):
@@ -164,13 +174,15 @@ def _resolve_slice_spec(tensor, slice_spec) -> ResolvedSliceSpec:
     )
 
 
-def iterate_indexes_in_shapes(func, init_values, shapes, unroll_limit: int = 25):
+def iterate_indexes_in_shapes(func, shapes: List, init_values: List, unroll_limit: int = 25):
     """
     Given a list of `shapes`, fx [(3, 2, 3), (5, 2, 3)] this method will iterate
     the product of all valid indexes into the given shapes.
-    The function `func: Acc, Idx1, Idx2, ..., Idxn -> Res` is expected to given the
+    The function `func: Idx1, Idx2, ..., Idxn, Acc1, ..., Acck -> Res1, ..., Resk` is expected to given the
     list of indexes and the accumulated result so far, to update the result based
     on the index.
+    The init_values is a list of [InitVal1, ..., InitValk], and the function `func`
+    must return a list of `k` values [Res1, ..., Resk].
     The indexes, Idx1, ..., Idn, may be either a mil mb.Var type of a python
     tuple depending on if the loop is unrolled or not. `func` is expected to be
     able to handle this.

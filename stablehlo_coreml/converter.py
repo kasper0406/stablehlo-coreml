@@ -420,7 +420,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # MIL does not seem to support this.
         # We could try to combine the matrix multiplications when the shapes allow it, but for now
         # we will just loop through them sequentially.
-        result, = iterate_indexes_in_shapes(calculate_result_index, [result], [lhs_shape, rhs_shape])
+        result, = iterate_indexes_in_shapes(calculate_result_index, [lhs_shape, rhs_shape], [result])
 
         context.add_variable(op.result.get_name(), result)
 
@@ -705,11 +705,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
-        # In principle we could calculate all HLO reductions by using a MIL while loop
-        # However, there would be no acceleration for this, and the computation is likely
-        # to take much longer than the user expected.
-        # Therefore we will restrict the supported reductions to what is supported through
-        # native MIL instructions
+        # HLO reductions can be arbitrarily complex and defines a custom function
+        # specifying the reduction.
+        # Unforunately this level of granularity is not supported through MIL.
+        # We try to detect some simple cases for reductions mapping to native MIL
+        # instructions, and otherwise fall back to a MIL while-loop based implementation.
 
         def match_reduction_type(hlo_body):
             if len(hlo_body.blocks) != 1:
@@ -744,6 +744,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
             input_rank = len(op.inputs[0].type.shape)
             inputs = [context[input.get_name()] for input in op.inputs]
+            # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
+            # of the input rank. This is to make computing element indexes easier.
+            # When updating the result, we later pick out just the result indices
+            # we care about in the actual result.
             reduce_shape = [inputs[0].shape[dim] if dim in op.dimensions else 1 for dim in range(input_rank)]
             result_shape = [inputs[0].shape[dim] if dim not in op.dimensions else 1 for dim in range(input_rank)]
             init_values = [context[init_value.get_name()] for init_value in op.init_values]
@@ -759,20 +763,28 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
                     return outputs
 
-                reduction_results = iterate_indexes_in_shapes(compute_inner, init_values, [reduce_shape])
+                reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
 
+                # The result rank is likely less than the input shape.
+                # We need to pick the indexes in the result shape we want to update
                 result_indices = [dim for dim in range(input_rank) if dim not in op.dimensions]
                 if len(result_indices) != 0:
                     result_idx = [mb.gather(x=result_idx, indices=result_indices)]
                 else:
                     result_idx = []
-                return [update_tensor_by_slice(acc, result_idx, result) for acc, result in zip(partial_results, reduction_results)]
 
-            mil_results = [np.zeros(result.type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result.type.element_type))) for result in op.results]
-            mil_results = iterate_indexes_in_shapes(compute_reduction, mil_results, [result_shape], unroll_limit=5)
+                return [
+                    update_tensor_by_slice(acc, result_idx, result)
+                    for acc, result in zip(partial_results, reduction_results)
+                ]
+
+            mil_results = [
+                np.zeros(result.type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result.type.element_type)))
+                for result in op.results
+            ]
+            mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
             for (res, mil_res) in zip(op.results, mil_results):
                 context.add_variable(res.get_name(), mil_res)
-
 
     @register_stablehlo_op
     def op_iota(self, context: TranscriptionContext, op: IotaOp):
