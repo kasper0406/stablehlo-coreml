@@ -4,10 +4,10 @@ import jax.numpy as jnp
 
 from functools import partial
 
-from .test_jax import run_and_compare
+from tests.test_jax import run_and_compare
 
-from .flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
-from .flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
+from tests.flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
+from tests.flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
 
 
 def test_flax_nnx_linear():

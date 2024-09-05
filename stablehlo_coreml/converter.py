@@ -7,6 +7,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
 from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes
+# from .passes.utils import register_optimizations
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -30,6 +31,8 @@ from functools import partial, reduce
 def convert(module, minimum_deployment_target: AvailableTarget):
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
+
+    # register_optimizations()
 
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)

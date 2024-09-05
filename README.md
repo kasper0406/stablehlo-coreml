@@ -17,9 +17,15 @@ To convert a StableHLO module, do the following:
 ```python
 import coremltools as ct
 from stablehlo_coreml.converter import convert
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 
 mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
-cml_model = ct.convert(mil_program, source="milinternal", minimum_deployment_target=ct.target.iOS18)
+cml_model = ct.convert(
+    mil_program,
+    source="milinternal",
+    minimum_deployment_target=ct.target.iOS18,
+    pass_pipeline=DEFAULT_HLO_PIPELINE,
+)
 ```
 
 For a Jax project, the `hlo_module` can be obtained the following way:
