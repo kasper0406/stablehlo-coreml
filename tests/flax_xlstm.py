@@ -155,7 +155,8 @@ class sLSTMBlock(nnx.Module):
     down_proj: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
+        @nnx.split_rngs(splits=num_heads)
+        @nnx.vmap(axis_size=num_heads)
         def create_heads(rngs: nnx.Rngs):
             return sLSTMCell(hidden_size, rngs)
         self.heads = create_heads(rngs)
@@ -202,7 +203,8 @@ class sLSTMBlock(nnx.Module):
 
     @classmethod
     def init_carry(cls, batch_size: int, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
+        @nnx.split_rngs(splits=num_heads)
+        @nnx.vmap(axis_size=num_heads)
         def create_carry(rngs: nnx.Rngs):
             return sLSTMCell.init_carry(batch_size, hidden_size, rngs)
         return create_carry(rngs)
@@ -332,7 +334,8 @@ class mLSTMBlock(nnx.Module):
     head_polling: nnx.Linear
 
     def __init__(self, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
+        @nnx.split_rngs(splits=num_heads)
+        @nnx.vmap(axis_size=num_heads)
         def create_heads(rngs: nnx.Rngs):
             return mLSTMCell(2 * hidden_size, rngs)
         self.heads = create_heads(rngs)
@@ -388,7 +391,8 @@ class mLSTMBlock(nnx.Module):
 
     @classmethod
     def init_carry(cls, batch_size: int, hidden_size: int, num_heads: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=num_heads)
+        @nnx.split_rngs(splits=num_heads)
+        @nnx.vmap(axis_size=num_heads)
         def create_carry(rngs: nnx.Rngs):
             return mLSTMCell.init_carry(batch_size, 2 * hidden_size, rngs)
         return create_carry(rngs)
@@ -439,11 +443,13 @@ class xLSTMModule(nnx.Module):
         return (mlstm_carry, slstm_carry), out
 
     def init_carry(self, batch_size: int, rngs: nnx.Rngs):
-        @partial(nnx.vmap, axis_size=self.num_mlstm)
+        @nnx.split_rngs(splits=self.num_mlstm)
+        @nnx.vmap(axis_size=self.num_mlstm)
         def create_mlstm_carry(rngs: nnx.Rngs):
             return mLSTMBlock.init_carry(batch_size, self.hidden_size, self.num_heads, rngs)
 
-        @partial(nnx.vmap, axis_size=self.num_slstm)
+        @nnx.split_rngs(splits=self.num_slstm)
+        @nnx.vmap(axis_size=self.num_slstm)
         def create_slstm_carry(rngs: nnx.Rngs):
             return sLSTMBlock.init_carry(batch_size, self.hidden_size, self.num_heads, rngs)
 
