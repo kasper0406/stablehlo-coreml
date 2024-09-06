@@ -11,25 +11,21 @@ def _match_pattern(op):
 
         x_and_update_shape_matches = op.x.shape == op.update.shape
 
-        expected_start_indices = np.array([0] * x_rank, dtype=np.int32)
-        start_values_all_zero = np.array_equal(op.begin.val, expected_start_indices)
+        all_zeros_start_indices_array = np.array([0] * x_rank, dtype=np.int32)
+        start_values_all_zero = np.array_equal(op.begin.val, all_zeros_start_indices_array)
 
-        end_value_matches_x_shape = np.array_equal(op.end.val, op.x.shape)
+        end_values_matches_x_shape = np.array_equal(op.end.val, op.x.shape)
 
-        expected_strides = np.array([1] * x_rank, dtype=np.int32)
-        strides_all_1 = not op.stride or np.array_equal(op.stride.val, expected_strides)
-        no_extra_options = strides_all_1 and not op.begin_mask and not op.end_mask
+        all_one_strides_array = np.array([1] * x_rank, dtype=np.int32)
+        strides_all_one = not op.stride or np.array_equal(op.stride.val, all_one_strides_array)
+        no_extra_options = strides_all_one and not op.begin_mask and not op.end_mask
 
-        return x_and_update_shape_matches and start_values_all_zero and end_value_matches_x_shape and no_extra_options
+        return x_and_update_shape_matches and start_values_all_zero and end_values_matches_x_shape and no_extra_options
 
     return False
 
 
 def _try_to_transform(slice_update_op):
-    # Rename the slice_update_op to the `slice_update_op.update` variable name, to make sure
-    # naming remains sane once we delete `slice_update_op`
-    slice_update_op.outputs[0].name = slice_update_op.update.name
-
     # Replace occurences of the `slice_update_op` output with the `slice_update_op.update` variable
     slice_update_op.enclosing_block.replace_uses_of_var_after_op(
         anchor_op=slice_update_op, old_var=slice_update_op.outputs[0], new_var=slice_update_op.update
@@ -61,10 +57,11 @@ def _remove_noop_slice_update(block):
 @register_pass(namespace="common")
 class remove_noop_slice_update(AbstractGraphPass):
     """
-    If a slice_update is called on the full tensor with an update of the same size,
-    just use the update tensor going forward.
+    If a slice_update is called on the full tensor with an update of the same shape,
+    simply use the update tensor going forward.
 
-    This optimization is very useful for the way the HLO DotGeneralOp and ReduceOp are implemented.
+    This optimization is very useful for the way the HLO DotGeneralOp is implemented,
+    in case the DotGeneralOp reduces to a single matrix multiplication.
 
     Given:
         %1 = <buffer tensor of shape S>
