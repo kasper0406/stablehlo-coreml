@@ -7,6 +7,7 @@ from jax._src.interpreters import mlir as jax_mlir
 import numpy as np
 
 from stablehlo_coreml.converter import convert
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 import coremltools as ct
 from coremltools.converters.mil.testing_utils import compare_backend
 from coremltools.converters.mil.mil import Program, Block
@@ -183,7 +184,7 @@ def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
             "max allowed complexity is {max_complexity}"
         )
 
-    pipeline = ct.PassPipeline.DEFAULT
+    pipeline = DEFAULT_HLO_PIPELINE
     # We temporarily avoid fp16 conversions in tests because of https://github.com/apple/coremltools/issues/2324
     passes_to_remove = [
          'common::add_fp16_cast'

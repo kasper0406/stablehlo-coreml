@@ -2,12 +2,10 @@ import jax
 from flax import nnx
 import jax.numpy as jnp
 
-from functools import partial
+from tests.test_jax import run_and_compare
 
-from .test_jax import run_and_compare
-
-from .flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
-from .flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
+from tests.flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
+from tests.flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
 
 
 def test_flax_nnx_linear():
@@ -56,7 +54,8 @@ def test_flax_stacked_linear():
 def test_flax_stacked_lax_scan():
     class TestStackedLaxScanLinear(nnx.Module):
         def __init__(self, rngs=nnx.Rngs):
-            @partial(nnx.vmap, axis_size=3)  # 3 hidden layers
+            @nnx.split_rngs(splits=3)  # 3 hidden layers
+            @nnx.vmap(axis_size=3)
             def create_hidden_layers(rngs: nnx.Rngs):
                 return nnx.Linear(in_features=4, out_features=4, bias_init=nnx.initializers.ones, rngs=rngs)
             self.hidden_layers = create_hidden_layers(rngs)
@@ -139,7 +138,8 @@ def test_flax_3d_convolution():
 def test_flax_stacked_convolution():
     class TestStackedConvolution(nnx.Module):
         def __init__(self, rngs=nnx.Rngs):
-            @partial(nnx.vmap, axis_size=3)  # 3 hidden layers
+            @nnx.split_rngs(splits=3)  # 3 hidden layers
+            @nnx.vmap(axis_size=3)
             def create_convs(rngs: nnx.Rngs):
                 return nnx.Conv(in_features=2, out_features=2, kernel_size=3, rngs=rngs)
             self.conv_layers = create_convs(rngs)
