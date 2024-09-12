@@ -16,6 +16,7 @@ class ResolvedSliceSpec:
 
 
 def index_by_slices(tensor, slice_spec):
+    tensor = fix_scalar_tensor(tensor)
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)
 
     return mb.slice_by_index(
@@ -27,6 +28,7 @@ def index_by_slices(tensor, slice_spec):
 
 
 def update_tensor_by_slice(tensor, slice_spec, value):
+    tensor = fix_scalar_tensor(tensor)
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)
 
     value = mb.reshape(x=value, shape=resolved_slices.shape)
@@ -37,6 +39,17 @@ def update_tensor_by_slice(tensor, slice_spec, value):
         end=resolved_slices.end_indices,
         stride=resolved_slices.strides
     )
+
+
+def fix_scalar_tensor(tensor):
+    """
+    From a numpy scalar type, CoreML will create a rank 0 tensor, which it will
+    later struggle to do operations on. We will re-shape it to a rank 1 tensor
+    with dimension 1.
+    """
+    if len(tensor.shape) == 0:
+        tensor = mb.reshape(x=tensor, shape=(1,))
+    return tensor
 
 
 def _flatten_list(lst):
@@ -161,13 +174,15 @@ def _resolve_slice_spec(tensor, slice_spec) -> ResolvedSliceSpec:
     )
 
 
-def iterate_indexes_in_shapes(func, init_value, shapes, unroll_limit: int = 25):
+def iterate_indexes_in_shapes(func, shapes: List, init_values: List, unroll_limit: int = 25):
     """
     Given a list of `shapes`, fx [(3, 2, 3), (5, 2, 3)] this method will iterate
     the product of all valid indexes into the given shapes.
-    The function `func: Acc, Idx1, Idx2, ..., Idxn -> Res` is expected to given the
+    The function `func: Idx1, Idx2, ..., Idxn, Acc1, ..., Acck -> Res1, ..., Resk` is expected to given the
     list of indexes and the accumulated result so far, to update the result based
     on the index.
+    The init_values is a list of [InitVal1, ..., InitValk], and the function `func`
+    must return a list of `k` values [Res1, ..., Resk].
     The indexes, Idx1, ..., Idn, may be either a mil mb.Var type of a python
     tuple depending on if the loop is unrolled or not. `func` is expected to be
     able to handle this.
@@ -179,12 +194,12 @@ def iterate_indexes_in_shapes(func, init_value, shapes, unroll_limit: int = 25):
     shapes_elements = [reduce(lambda a, b: a * b, shape, 1) for shape in shapes]
     total_iterations = reduce(lambda a, b: a * b, shapes_elements, 1)
 
-    result = init_value
+    results = init_values
     if total_iterations <= unroll_limit:
         # Fully unroll the loop
         ranges = [itertools.product(*[range(dim) for dim in shape]) for shape in shapes]
         for indexes in itertools.product(*ranges):
-            result = func(result, *indexes)
+            results = func(*indexes, *results)
     else:
         # Dynamically compute the loop
         def suffix_product(lst):
@@ -198,10 +213,10 @@ def iterate_indexes_in_shapes(func, init_value, shapes, unroll_limit: int = 25):
         index_strides = [suffix_product(shape) for shape in shapes]
 
         # Attempt at looping over result indexes without fully unrolling
-        def cond(i, _result):
+        def cond(i, *acc):
             return mb.less(x=i, y=total_iterations)
 
-        def body(i, acc):
+        def body(i, *acc):
             # Split out the index i to an integer index into the individual shapes.
             integer_indexes = [
                 mb.mod(x=mb.floor_div(x=i, y=stride), y=elements)
@@ -216,9 +231,17 @@ def iterate_indexes_in_shapes(func, init_value, shapes, unroll_limit: int = 25):
                 for idx, strides, shape in zip(integer_indexes, index_strides, shapes)
             ]
 
-            result = func(acc, *indexes)
-            return mb.add(x=i, y=1), result
+            results = func(*indexes, *acc)
+            return [mb.add(x=i, y=1)] + results
 
-        _counter, result = mb.while_loop(_cond=cond, _body=body, loop_vars=(0, init_value))
+        # TODO: Fix this in a nicer way!!!
+        fixed_init_values = []
+        for init_value in init_values:
+            if len(init_value.shape) == 0:
+                fixed_init_values.append(mb.reshape(x=init_value, shape=(1,)))
+            else:
+                fixed_init_values.append(init_value)
 
-    return result
+        results = mb.while_loop(_cond=cond, _body=body, loop_vars=[0] + fixed_init_values)[1:]  # Skip the counter
+
+    return results

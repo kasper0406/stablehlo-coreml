@@ -14,9 +14,9 @@ from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
-    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MaxOp, RsqrtOp,
+    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, MaxOp, RsqrtOp,
     TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp,
-    IotaOp
+    IotaOp, ReduceOp, OrOp, AndOp
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -220,6 +220,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
+    def op_or(self, context: TranscriptionContext, op: OrOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = mb.logical_or(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_and(self, context: TranscriptionContext, op: AndOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_op = mb.logical_and(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
     def op_subtract(self, context: TranscriptionContext, op: SubtractOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
@@ -352,7 +366,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
         result = mb.fill(shape=result_shape)
 
-        def calculate_result_index(acc, lhs_idx, rhs_idx):
+        def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
             # print(f"contracted_element_count = {contracted_element_count}")
             batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
@@ -398,7 +412,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if len(rhs_result_dim) > 0:
                 result_idx.append(slice(None))
 
-            return update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)
+            return [update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)]
 
         # We can utilize that we have a full matrix multiply primitive available, compared to having only
         # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
@@ -409,7 +423,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # MIL does not seem to support this.
         # We could try to combine the matrix multiplications when the shapes allow it, but for now
         # we will just loop through them sequentially.
-        result = iterate_indexes_in_shapes(calculate_result_index, result, [lhs_shape, rhs_shape])
+        result, = iterate_indexes_in_shapes(calculate_result_index, [lhs_shape, rhs_shape], [result])
 
         context.add_variable(op.result.get_name(), result)
 
@@ -667,6 +681,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_res)
 
     @register_stablehlo_op
+    def op_min(self, context: TranscriptionContext, op: MinOp):
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+        cml_res = mb.minimum(x=lhs, y=rhs)
+        context.add_variable(op.result.get_name(), cml_res)
+
+    @register_stablehlo_op
     def op_rsqrt(self, context: TranscriptionContext, op: RsqrtOp):
         x = context[op.operand.get_name()]
         mil_res = mb.rsqrt(x=x)
@@ -686,11 +707,95 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), mil_res)
 
     @register_stablehlo_op
+    def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
+        # HLO reductions can be arbitrarily complex and defines a custom function
+        # specifying the reduction.
+        # Unforunately this level of granularity is not supported through MIL.
+        # We try to detect some simple cases for reductions mapping to native MIL
+        # instructions, and otherwise fall back to a MIL while-loop based implementation.
+
+        def match_reduction_type(hlo_body):
+            if len(hlo_body.blocks) != 1:
+                return None
+            args = list(hlo_body.blocks[0].arguments)
+            ops = list(hlo_body.blocks[0].operations)
+
+            # Simple matches are where the `hlo_body` is on the form
+            #   return _generic_reduction_op_type_(`args`)
+            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
+            simple_matches = {
+                MaxOp: mb.reduce_max,
+                MinOp: mb.reduce_min,
+                AddOp: mb.reduce_sum,
+                MulOp: mb.reduce_prod,
+            }
+
+            for generic_reduce_op_type, mil_equivalent in simple_matches.items():
+                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
+                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
+                        return mil_equivalent
+
+            return None
+
+        reduction_type = match_reduction_type(op.body)
+        if reduction_type and len(op.inputs) == 1:
+            input = context[op.inputs[0].get_name()]
+            res = reduction_type(x=input, axes=np.array(op.dimensions, dtype=np.int32))
+            context.add_variable(op.result.get_name(), res)
+        else:
+            logger.warn("Falling back to while-loop implementation for reduction. This may be slower than expected!")
+
+            input_rank = len(op.inputs[0].type.shape)
+            inputs = [context[input.get_name()] for input in op.inputs]
+            # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
+            # of the input rank. This is to make computing element indexes easier.
+            # When updating the result, we later pick out just the result indices
+            # we care about in the actual result.
+            reduce_shape = [inputs[0].shape[dim] if dim in op.dimensions else 1 for dim in range(input_rank)]
+            result_shape = [inputs[0].shape[dim] if dim not in op.dimensions else 1 for dim in range(input_rank)]
+            init_values = [context[init_value.get_name()] for init_value in op.init_values]
+
+            def compute_reduction(result_idx, *partial_results):
+                def compute_inner(element_idx, *acc):
+                    element_idx = mb.add(x=result_idx, y=element_idx)
+                    elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
+
+                    args = list(acc) + elements
+                    hlo_params = list(op.body.blocks[0].arguments)
+                    outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, op.body, args)
+
+                    return outputs
+
+                reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
+
+                # The result rank is likely less than the input shape.
+                # We need to pick the indexes in the result shape we want to update
+                result_indices = [dim for dim in range(input_rank) if dim not in op.dimensions]
+                if len(result_indices) != 0:
+                    result_idx = [mb.gather(x=result_idx, indices=result_indices)]
+                else:
+                    result_idx = []
+
+                return [
+                    update_tensor_by_slice(acc, result_idx, result)
+                    for acc, result in zip(partial_results, reduction_results)
+                ]
+
+            mil_results = [
+                np.zeros(result.type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result.type.element_type)))
+                for result in op.results
+            ]
+            mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
+            for (res, mil_res) in zip(op.results, mil_results):
+                context.add_variable(res.get_name(), mil_res)
+
+    @register_stablehlo_op
     def op_iota(self, context: TranscriptionContext, op: IotaOp):
         iota_dim = int(op.iota_dimension)
         tensor_shape = op.result.type.shape
         vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
-        res = np.reshape(np.arange(tensor_shape[iota_dim]), vec_shape) * np.ones(tensor_shape)
+        dtype = types.nptype_from_builtin(self.__get_dtype(op.result.type.element_type))
+        res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
         context.add_variable(op.result.get_name(), res)
 
     @register_stablehlo_op

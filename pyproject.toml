@@ -50,8 +50,8 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "jax",
-    "flax",
+    "jax>=0.4.32",
+    "flax>=0.9.0",
     "flatbuffers",
     "einops",
     "pillow",

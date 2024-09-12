@@ -13,6 +13,7 @@ from coremltools.converters.mil.testing_utils import compare_backend
 from coremltools.converters.mil.mil import Program, Block
 
 from functools import partial
+from typing import List
 
 
 def test_addition():
@@ -83,6 +84,43 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product_3_2, (jnp.zeros((2, 2, 3)), jnp.zeros((2, 3))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros(((15, 20, 5, 3))), jnp.zeros((10,))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros(((2, 2, 2, 3))), jnp.zeros((2,))))
+
+
+def test_simple_reductions():
+    def compare_and_ensure_no_loops(jax_func, input_spec):
+        cml_model = run_and_compare(jax_func, input_spec)
+        assert "while_loop" not in get_model_instruction_types(cml_model)
+
+    compare_and_ensure_no_loops(partial(jnp.max, axis=1), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.max, axis=1, keepdims=True), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.sum, axis=0), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.sum, axis=1), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.sum, axis=2), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.sum, axis=(0, 2)), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.sum, axis=(0, 1, 2)), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.min, axis=0), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.min, axis=(1, 2)), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.mean, axis=0), (jnp.zeros((2, 3, 4)),))
+    compare_and_ensure_no_loops(partial(jnp.prod, axis=1), (jnp.zeros((2, 3, 4)),))
+
+
+def test_complex_reductions():
+    """
+    These reductions are complicated, and will be handled using while loops (potentially unrolled)
+    """
+    run_and_compare(jnp.argmax, (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, keepdims=True), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(jnp.argmax, (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmax, keepdims=True), (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=0, keepdims=True), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=2), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmax, axis=1), (jnp.zeros((20, 30, 40)),))
+
+    run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 3)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmin, axis=1, keepdims=True), (jnp.zeros((20, 30, 40)),))
 
 
 def test_topk():
@@ -170,6 +208,13 @@ def _count_program_complexity(mil_program: Program):
 
 
 def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
+    """
+    Converts the given `jax_func` to a CoreML model.
+    Both models will be run on random input data with shapes specified by `input_spec`.
+    If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
+    The resulting CoreML model will be returned.
+    """
+
     jax_func = jax.jit(jax_func)
     exported = jax_export(jax_func, input_spec)
     context = jax_mlir.make_ir_context()
@@ -222,3 +267,22 @@ def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
     compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
+
+    return cml_model
+
+
+def get_model_instruction_types(cml_model) -> List[str]:
+    def collect_ops(ops: List) -> List[str]:
+        collected_ops = []
+        for op in ops:
+            collected_ops.append(op.op_type)
+            for block in op.blocks:
+                collected_ops += collect_ops(block.operations)
+
+        return collected_ops
+
+    mil_program = cml_model._mil_program
+    all_ops = []
+    for func in mil_program.functions.values():
+        all_ops += collect_ops(func.operations)
+    return all_ops
