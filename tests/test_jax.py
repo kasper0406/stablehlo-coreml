@@ -128,6 +128,13 @@ def test_topk():
     run_and_compare(partial(jax.lax.top_k, k=3), (jnp.zeros(input_shape),))
 
 
+def test_reverse():
+    run_and_compare(partial(jnp.flip), (jnp.zeros((5,)),))
+    run_and_compare(partial(jnp.flip), (jnp.zeros((5, 5, 5)),))
+    run_and_compare(partial(jnp.flip, axis=(0, 2)), (jnp.zeros((5, 5, 5)),))
+    run_and_compare(partial(jnp.flip, axis=(1,)), (jnp.zeros((5, 5, 5)),))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []

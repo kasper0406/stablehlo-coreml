@@ -16,7 +16,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
     ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, MaxOp, RsqrtOp,
     TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp,
-    IotaOp, ReduceOp, OrOp, AndOp
+    IotaOp, ReduceOp, OrOp, AndOp, ReverseOp
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -704,6 +704,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values = [context[input.get_name()] for input in op.inputs]
         values = promote_input_dtypes(values)
         mil_res = mb.concat(values=values, axis=op.dimension.value)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_reverse(self, context: TranscriptionContext, op: ReverseOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.reverse(x=x, axes=np.array(op.dimensions, dtype=np.int32))
         context.add_variable(op.result.get_name(), mil_res)
 
     @register_stablehlo_op
