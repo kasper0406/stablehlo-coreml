@@ -73,11 +73,15 @@ class TranscriptionContext:
         self.variables[path][name] = mil_var
 
     def __getitem__(self, name: str):
-        path = self.path()
-        ctx = self.variables[path]
-        if name not in ctx:
-            raise ValueError(f"Variable with name {name} is not defined in path {path}")
-        return ctx[name]
+        # Walk up along the path list to find the first correctly named variable in scope
+        path = self._path.copy()
+        while True:
+            ctx = self.variables["/".join(path)]
+            if name in ctx:
+                return ctx[name]
+            if len(path) == 0:
+                raise ValueError(f"Variable with name {name} is not defined in path {path}")
+            path.pop()
 
     def path(self) -> str:
         return "/".join(self._path)
