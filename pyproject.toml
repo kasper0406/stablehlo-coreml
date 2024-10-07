@@ -24,14 +24,14 @@ keywords=[ "stablehlo", "hlo", "xla", "coreml", "machinelearning", "ml", "coreml
 requires-python = ">=3.9"
 
 dependencies = [
-    'coremltools>=8.0b2; python_version >= "3.9" and python_version <= "3.11"',
+    'coremltools>=8.0; python_version >= "3.9" and python_version <= "3.11"',
     "numpy~=2.0",
 
     # Jax is not actually a strict requirement for the main library.
     # However, the code relies on the mlir StableHLO python bindings, and currently they are not published to pip
     # and the only pre-built stand-alone library is only built for linux.
     # Onces https://github.com/openxla/stablehlo/issues/2346 is resolved, this dependency can be switch to stablehlo instead.
-    "jax",
+    "jax>=0.4.32",
 ]
 
 [tool.hatch.version]
@@ -50,7 +50,7 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "jax>=0.4.32",
+    "jax",
     "flax>=0.9.0",
     "flatbuffers",
     "einops",
