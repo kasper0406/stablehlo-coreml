@@ -129,10 +129,30 @@ def test_topk():
 
 
 def test_reverse():
-    run_and_compare(partial(jnp.flip), (jnp.zeros((5,)),))
-    run_and_compare(partial(jnp.flip), (jnp.zeros((5, 5, 5)),))
+    run_and_compare(jnp.flip, (jnp.zeros((5,)),))
+    run_and_compare(jnp.flip, (jnp.zeros((5, 5, 5)),))
     run_and_compare(partial(jnp.flip, axis=(0, 2)), (jnp.zeros((5, 5, 5)),))
     run_and_compare(partial(jnp.flip, axis=(1,)), (jnp.zeros((5, 5, 5)),))
+
+
+def test_trigonmetry():
+    run_and_compare(jnp.sin, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.cos, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.tan, (jnp.zeros((5, 6)),))
+
+    run_and_compare(jnp.arcsin, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.arccos, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.arctan, (jnp.zeros((5, 6)),))
+
+    run_and_compare(jnp.sinh, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.cosh, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.tanh, (jnp.zeros((5, 6)),))
+
+    run_and_compare(jnp.arcsinh, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.arccosh, (jnp.zeros((5, 6)),))
+    run_and_compare(jnp.arctanh, (jnp.zeros((5, 6)),))
+
+    run_and_compare(jnp.atan2, (jnp.zeros((50, 20)), jnp.zeros((50, 20)),))
 
 
 def jax_export(jax_func, input_spec):

@@ -12,11 +12,11 @@ from .passes.utils import register_optimizations
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Log1pOp, SqrtOp,
-    ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp, CompareOp,
-    ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, MaxOp, RsqrtOp,
-    TanhOp, ConcatenateOp, TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp,
-    IotaOp, ReduceOp, OrOp, AndOp, ReverseOp
+    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
+    Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
+    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
+    MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
+    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, OrOp, AndOp, ReverseOp
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -294,6 +294,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
+    def op_log(self, context: TranscriptionContext, op: LogOp):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.log(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
     def op_log1p(self, context: TranscriptionContext, op: Log1pOp):
         operand = context[op.operand.get_name()]
         one = np.array([1], dtype=types.nptype_from_builtin(self.__resolve_type(operand)))
@@ -305,6 +311,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_exp(self, context: TranscriptionContext, op: ExpOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.exp(x=operand)
+        context.add_variable(op.result.get_name(), cml_op)
+
+    @register_stablehlo_op
+    def op_expm1(self, context: TranscriptionContext, op: Expm1Op):
+        operand = context[op.operand.get_name()]
+        cml_op = mb.add(x=mb.exp(x=operand), y=-1.0)
         context.add_variable(op.result.get_name(), cml_op)
 
     @register_stablehlo_op
@@ -702,6 +714,40 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         x = context[op.operand.get_name()]
         mil_res = mb.tanh(x=x)
         context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_sine(self, context: TranscriptionContext, op: SineOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.sin(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_cosine(self, context: TranscriptionContext, op: CosineOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.cos(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_tan(self, context: TranscriptionContext, op: TanOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.tan(x=x)
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_atan2(self, context: TranscriptionContext, op: Atan2Op):
+        y = context[op.lhs.get_name()]
+        x = context[op.rhs.get_name()]
+        # Notice the fraction may be +-inf
+        fraction = mb.real_div(x=y, y=x)
+        atan2_res = mb.atan(x=fraction)
+        # We need to adjust for negative x, based on the sign of y
+        atan2_res_adjusted = mb.add(x=atan2_res, y=mb.mul(x=mb.sign(x=y), y=np.pi))
+        atan2_res = mb.select(
+            cond=mb.less(x=x, y=0.0),
+            a=atan2_res_adjusted,
+            b=atan2_res,
+        )
+        context.add_variable(op.result.get_name(), atan2_res)
 
     @register_stablehlo_op
     def op_concatenate(self, context: TranscriptionContext, op: ConcatenateOp):
