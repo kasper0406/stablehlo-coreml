@@ -245,3 +245,13 @@ def iterate_indexes_in_shapes(func, shapes: List, init_values: List, unroll_limi
         results = mb.while_loop(_cond=cond, _body=body, loop_vars=[0] + fixed_init_values)[1:]  # Skip the counter
 
     return results
+
+
+def inverse_permutation(perm):
+    """
+    Given a permutation `perm`, compute the inverse of the permutation
+    """
+    inv = [0] * len(perm)
+    for i, j in enumerate(perm):
+        inv[j] = i
+    return inv
