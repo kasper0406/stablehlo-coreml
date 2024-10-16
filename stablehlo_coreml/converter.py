@@ -6,7 +6,7 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes
+from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
 from .passes.utils import register_optimizations
 
 from jaxlib.mlir import ir
@@ -574,27 +574,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_convolution(self, context: TranscriptionContext, op: ConvolutionOp):
-        # TODO(knielsen): Support additional dimension specifications
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
+        # TODO(knielsen): It should be possible to remove this batch dimension check, but
+        #                 there should be a unit test testing it.
         if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
             raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
-        if dim_spec.input_feature_dimension != len(dim_spec.input_spatial_dimensions) + 1:
-            raise ValueError("The input feature dimension is currently only supported to be the last dimension")
-        if dim_spec.output_feature_dimension != len(dim_spec.output_spatial_dimensions) + 1:
-            raise ValueError("The output feature dimension is currently only supported to be the last dimension")
         if len(dim_spec.input_spatial_dimensions) > 3 or len(dim_spec.output_spatial_dimensions) > 3:
             raise ValueError("MIL only supports convolutions with dim <= 3")
 
         if op.batch_group_count.value != 1:
             raise ValueError(f"Only a batch group count of 1 is supported. Got {op.batch_group_count.value}")
 
-        # The op.lhs has dimension [batch, d_in*, channels]
-        # MIL expects it on the form [batch, channels, d_in*]
+        # MIL expects it on the form [input_batch_dimension, input_feature_dimension, spatial_dimensions*]
+        input_permutation = [
+            dim_spec.input_batch_dimension,
+            dim_spec.input_feature_dimension,
+            *dim_spec.input_spatial_dimensions
+        ]
         x = context[op.lhs.get_name()]  # The inputs comes from vars
-        perm = list(range(x.rank))
-        # Move the last axis to the second position
-        perm.insert(1, perm.pop())
-        x = mb.transpose(x=x, perm=perm)
+        x = mb.transpose(x=x, perm=input_permutation)
 
         strides = None
         if op.window_strides is not None:
@@ -645,22 +643,23 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                                      "transposed convolution is not supported.")
 
         # The MIL weights should be on form:
-        #  - normal convolutions: [C_out, C_in / groups, Kernel*]
-        #  - transposed convolutions: [C_in, C_out / groups, Kernel*]
-        # HLO has the form [Kernel*, C_in / groups, C_out]
+        #  - normal convolutions: [output_features, input_features / groups, spatial kernels*]
+        #  - transposed convolutions: [input_features, output_features / groups, spatial kernels*]
         weight = context[op.rhs.get_name()]  # The weights are numpy arrays
-        perm = []
-        # Move the channel dims
+        weight_permutation = []
         if conv_type == mb.conv:
-            perm.append(len(weight.shape) - 1)
-            perm.append(len(weight.shape) - 2)
+            weight_permutation = [
+                dim_spec.kernel_output_feature_dimension,
+                dim_spec.kernel_input_feature_dimension,
+                *dim_spec.kernel_spatial_dimensions
+            ]
         else:
-            perm.append(len(weight.shape) - 2)
-            perm.append(len(weight.shape) - 1)
-        for i in range(len(weight.shape) - 2):
-            # Kernel perms moved to after the channels
-            perm.append(i)
-        weight = mb.transpose(x=weight, perm=perm)
+            weight_permutation = [
+                dim_spec.kernel_input_feature_dimension,
+                dim_spec.kernel_output_feature_dimension,
+                *dim_spec.kernel_spatial_dimensions
+            ]
+        weight = mb.transpose(x=weight, perm=weight_permutation)
 
         # TODO(knielsen): Make this check more readable!
         # It is executed for conv transpose
@@ -680,12 +679,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         )
 
         # Re-arrange output dimensions to match expectation
-        # MIL outputs on the form [batch, channels, d_in*]
-        # In the HLO program we expect [batch, d_in*, channels]
-        perm = list(range(x.rank))
-        # Move the second axis to the end
-        perm.append(perm.pop(1))
-        cml_conv = mb.transpose(x=cml_conv, perm=perm)
+        # MIL outputs on the form [batch, features, spatial dims*]
+        output_permutation = inverse_permutation([
+            dim_spec.output_batch_dimension,
+            dim_spec.output_feature_dimension,
+            *dim_spec.output_spatial_dimensions
+        ])
+        cml_conv = mb.transpose(x=cml_conv, perm=output_permutation)
 
         context.add_variable(op.result.get_name(), cml_conv)
 

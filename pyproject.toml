@@ -55,6 +55,7 @@ extra-dependencies = [
     "flatbuffers",
     "einops",
     "pillow",
+    "equinox",
 ]
 
 [project.urls]
