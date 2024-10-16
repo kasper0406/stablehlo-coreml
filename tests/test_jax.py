@@ -1,7 +1,6 @@
 import jax
-import jax.export
+from jax.export import export as _jax_export
 import jax.numpy as jnp
-from jax.experimental import export
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 import numpy as np
@@ -166,7 +165,7 @@ def jax_export(jax_func, input_spec):
                 shapes.append(jax.ShapeDtypeStruct(input_spec.shape, input_spec.dtype))
         return shapes
     input_shapes = compute_input_shapes(input_spec)
-    jax_exported = export.export(jax.jit(jax_func))(*input_shapes)
+    jax_exported = _jax_export(jax.jit(jax_func))(*input_shapes)
     return jax_exported
 
 
