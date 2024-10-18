@@ -154,6 +154,13 @@ def test_trigonmetry():
     run_and_compare(jnp.atan2, (jnp.zeros((50, 20)), jnp.zeros((50, 20)),))
 
 
+def test_is_finite():
+    input = (jnp.array([20.0, -12.23, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float16), )
+    run_and_compare_specific_input(jnp.isfinite, input)
+    run_and_compare_specific_input(jnp.isinf, input)
+    run_and_compare_specific_input(jnp.isnan, input)
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []
@@ -233,16 +240,15 @@ def _count_program_complexity(mil_program: Program):
     return total_complexity
 
 
-def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
+def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_000):
     """
     Converts the given `jax_func` to a CoreML model.
-    Both models will be run on random input data with shapes specified by `input_spec`.
     If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
     The resulting CoreML model will be returned.
     """
 
     jax_func = jax.jit(jax_func)
-    exported = jax_export(jax_func, input_spec)
+    exported = jax_export(jax_func, inputs)
     context = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
     # print(f"HLO module: {hlo_module}")
@@ -272,15 +278,12 @@ def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
     # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
     jax_input_values = []
-    key = jax.random.PRNGKey(0)
-    for input_name, input_shape in zip(cml_model.input_description, exported.in_avals):
-        key, value_key = jax.random.split(key, num=2)
-        input_value = generate_random_from_shape(input_shape, value_key)
+    for input_name, input_value in zip(cml_model.input_description, inputs):
         cml_input_key_values[input_name] = input_value
         jax_input_values.append(input_value)
 
     # Transfor the input to match the Jax model, and call it
-    jax_input_values = __nest_flat_jax_input_to_input_spec(input_spec, jax_input_values)
+    jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, jax_input_values)
     expected_output = jax_func(*jax_input_values)
 
     # TODO(knielsen): Is there a nicer way of doing this?
@@ -295,6 +298,23 @@ def run_and_compare(jax_func, input_spec, max_complexity: int = 10_000):
     compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
 
     return cml_model
+
+
+def run_and_compare(jax_func, input_specification, max_complexity: int = 10_000):
+    """
+    Converts the given `jax_func` to a CoreML model.
+    The model will be tested with randomly generated data with the shapes of `input_specification`.
+    If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
+    The resulting CoreML model will be returned.
+    """
+    inputs = []
+    key = jax.random.PRNGKey(0)
+    for input_shape in input_specification:
+        key, value_key = jax.random.split(key, num=2)
+        input_value = generate_random_from_shape(input_shape, value_key)
+        inputs.append(input_value)
+
+    run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity)
 
 
 def get_model_instruction_types(cml_model) -> List[str]:
