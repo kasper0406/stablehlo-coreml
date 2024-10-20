@@ -278,7 +278,7 @@ def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_00
     # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
     jax_input_values = []
-    for input_name, input_value in zip(cml_model.input_description, inputs):
+    for input_name, input_value in zip(cml_model.input_description, flatten(inputs)):
         cml_input_key_values[input_name] = input_value
         jax_input_values.append(input_value)
 
@@ -307,14 +307,15 @@ def run_and_compare(jax_func, input_specification, max_complexity: int = 10_000)
     If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
     The resulting CoreML model will be returned.
     """
-    inputs = []
+    flat_inputs = []
     key = jax.random.PRNGKey(0)
-    for input_shape in input_specification:
+    for input_spec in flatten(input_specification):
         key, value_key = jax.random.split(key, num=2)
-        input_value = generate_random_from_shape(input_shape, value_key)
-        inputs.append(input_value)
+        input_value = generate_random_from_shape(input_spec, value_key)
+        flat_inputs.append(input_value)
 
-    run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity)
+    inputs = __nest_flat_jax_input_to_input_spec(input_specification, flat_inputs)
+    return run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity)
 
 
 def get_model_instruction_types(cml_model) -> List[str]:

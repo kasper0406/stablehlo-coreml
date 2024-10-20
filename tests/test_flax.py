@@ -444,7 +444,42 @@ def test_attantion():
     run_and_compare(create_masks, (jnp.zeros((5, 20)), ))
 
 
-def test_embed():
-    model = nnx.Embed(num_embeddings=10, features=5, rngs=nnx.Rngs(0))
-    example_input = (jnp.array([[1, 5, 3], [9, 3, 0]], dtype=jnp.int32), )
-    run_and_compare_specific_input(nnx.jit(model), example_input)
+# This test currently makes Python crash due to https://github.com/llvm/llvm-project/pull/113064
+# def test_embed():
+#     model = nnx.Embed(num_embeddings=10, features=5, rngs=nnx.Rngs(0))
+#     example_input = (jnp.array([[1, 5, 3], [9, 3, 0]], dtype=jnp.int32), )
+#     run_and_compare_specific_input(nnx.jit(model), example_input)
+
+
+def test_nnx_einsum():
+    layer = nnx.Einsum('nta,hab->nthb', (8, 2, 4), (8, 4), rngs=nnx.Rngs(0))
+    example_input = (jnp.zeros((16, 11, 2)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_batch_norm_infer():
+    layer = nnx.BatchNorm(num_features=10, momentum=0.9, epsilon=1e-5, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_layer_norm_infer():
+    layer = nnx.LayerNorm(num_features=10, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_rms_norm_infer():
+    layer = nnx.RMSNorm(num_features=10, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_group_norm_infer():
+    layer = nnx.GroupNorm(num_features=10, num_groups=2, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
