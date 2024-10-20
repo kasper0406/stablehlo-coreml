@@ -16,7 +16,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
-    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, OrOp, AndOp, ReverseOp
+    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, OrOp, AndOp, ReverseOp,
+    IsFiniteOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -760,6 +761,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_reverse(self, context: TranscriptionContext, op: ReverseOp):
         x = context[op.operand.get_name()]
         mil_res = mb.reverse(x=x, axes=np.array(op.dimensions, dtype=np.int32))
+        context.add_variable(op.result.get_name(), mil_res)
+
+    @register_stablehlo_op
+    def op_isfinite(self, context: TranscriptionContext, op: IsFiniteOp):
+        x = context[op.x.get_name()]
+        # All finite numbers will have abs(x) < inf
+        infinity = np.array(np.inf, dtype=types.nptype_from_builtin(self.__resolve_type(x)))
+        mil_res = mb.less(x=mb.abs(x=x), y=infinity)
         context.add_variable(op.result.get_name(), mil_res)
 
     @register_stablehlo_op

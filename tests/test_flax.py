@@ -2,10 +2,12 @@ import jax
 from flax import nnx
 import jax.numpy as jnp
 
-from tests.test_jax import run_and_compare
+from tests.test_jax import run_and_compare, run_and_compare_specific_input
 
 from tests.flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
 from tests.flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
+
+from functools import partial
 
 
 def test_flax_nnx_linear():
@@ -384,3 +386,100 @@ def test_unet_with_xlstm():
     model.eval()
 
     run_and_compare(nnx.jit(model), (carry, x, ))
+
+
+def test_activations():
+    example_input = (jnp.zeros((20,)),)
+    run_and_compare(nnx.celu, example_input)
+    run_and_compare(nnx.elu, example_input)
+    run_and_compare(nnx.gelu, example_input)
+    run_and_compare(nnx.glu, example_input)
+    run_and_compare(nnx.hard_sigmoid, example_input)
+    run_and_compare(nnx.hard_silu, example_input)
+    run_and_compare(nnx.hard_swish, example_input)
+    run_and_compare(nnx.hard_tanh, example_input)
+    run_and_compare(nnx.leaky_relu, example_input)
+    run_and_compare(nnx.log_sigmoid, example_input)
+    run_and_compare(nnx.log_softmax, example_input)
+    run_and_compare(nnx.logsumexp, example_input)
+    run_and_compare(nnx.relu, example_input)
+    run_and_compare(nnx.selu, example_input)
+    run_and_compare(nnx.sigmoid, example_input)
+    run_and_compare(nnx.silu, example_input)
+    run_and_compare(nnx.soft_sign, example_input)
+    run_and_compare(nnx.softmax, example_input)
+    run_and_compare(nnx.softplus, example_input)
+    run_and_compare(nnx.standardize, example_input)
+    run_and_compare(nnx.swish, example_input)
+    run_and_compare(nnx.tanh, example_input)
+
+    run_and_compare_specific_input(partial(nnx.one_hot, num_classes=3), (jnp.array([0, 1, 2]), ))
+    run_and_compare_specific_input(partial(nnx.one_hot, num_classes=5), (jnp.array([4, 0, 1, 0]), ))
+
+
+def test_attantion():
+    class TestAttention(nnx.Module):
+        def __init__(self, rngs=nnx.Rngs):
+            self.layer = nnx.MultiHeadAttention(
+                num_heads=4,
+                in_features=5,
+                qkv_features=16,
+                decode=False,
+                rngs=rngs,
+            )
+
+        def __call__(self, q, k, v):
+            return self.layer(q, k, v)
+
+    shape = (4, 3, 2, 5)
+    input_spec = (jnp.zeros(shape), jnp.zeros(shape), jnp.zeros(shape))
+    run_and_compare(nnx.jit(TestAttention(nnx.Rngs(0))), input_spec)
+
+    @nnx.jit
+    def create_masks(length):
+        attention_mask = nnx.make_attention_mask(length, length)
+        causal_mask = nnx.make_causal_mask(length)
+        return nnx.combine_masks(attention_mask, causal_mask)
+
+    run_and_compare(create_masks, (jnp.zeros((5, 20)), ))
+
+
+# This test currently makes Python crash due to https://github.com/llvm/llvm-project/pull/113064
+# def test_embed():
+#     model = nnx.Embed(num_embeddings=10, features=5, rngs=nnx.Rngs(0))
+#     example_input = (jnp.array([[1, 5, 3], [9, 3, 0]], dtype=jnp.int32), )
+#     run_and_compare_specific_input(nnx.jit(model), example_input)
+
+
+def test_nnx_einsum():
+    layer = nnx.Einsum('nta,hab->nthb', (8, 2, 4), (8, 4), rngs=nnx.Rngs(0))
+    example_input = (jnp.zeros((16, 11, 2)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_batch_norm_infer():
+    layer = nnx.BatchNorm(num_features=10, momentum=0.9, epsilon=1e-5, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_layer_norm_infer():
+    layer = nnx.LayerNorm(num_features=10, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_rms_norm_infer():
+    layer = nnx.RMSNorm(num_features=10, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
+
+
+def test_group_norm_infer():
+    layer = nnx.GroupNorm(num_features=10, num_groups=2, rngs=nnx.Rngs(0))
+    layer.eval()
+    example_input = (jnp.zeros((20, 10)), )
+    run_and_compare(nnx.jit(layer), example_input)
