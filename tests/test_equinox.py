@@ -111,3 +111,87 @@ def test_odd_batch_dimension():
 
     input_spec = (jnp.zeros((2, 30, 5)), )
     run_and_compare(eqxi.finalise_fn(batched_model), input_spec)
+
+
+def test_linear():
+    model = jax.vmap(eqx.nn.Linear(in_features=10, out_features=20, key=jax.random.PRNGKey(0)))
+    input_spec = (jnp.zeros((20, 10)), )
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_identity():
+    model = jax.vmap(eqx.nn.Identity(key=jax.random.PRNGKey(0)))
+    input_spec = (jnp.zeros((20, 10)), )
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_gru_cell():
+    model = jax.vmap(eqx.nn.GRUCell(input_size=10, hidden_size=24, key=jax.random.PRNGKey(0)))
+    input_spec = (jnp.zeros((20, 10)), jnp.zeros((20, 24)))
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_lstm_cell():
+    class Model(eqx.Module):
+        cell: eqx.nn.LSTMCell
+
+        def __init__(self):
+            self.cell = eqx.nn.LSTMCell(input_size=10, hidden_size=24, key=jax.random.PRNGKey(0))
+
+        def __call__(self, xs):
+            def scan_fn(state, input):
+                return (self.cell(input, state), None)
+            init_state = (jnp.zeros(self.cell.hidden_size),
+                          jnp.zeros(self.cell.hidden_size))
+            (h, c), _ = jax.lax.scan(scan_fn, init_state, xs)
+            return h, c
+
+    model = jax.vmap(Model())
+    input_spec = (jnp.zeros((20, 30, 10)), )
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_rotary_attention():
+    class Model(eqx.Module):
+        mha_attention: eqx.nn.MultiheadAttention
+        rope_embeddings: eqx.nn.RotaryPositionalEmbedding
+
+        def __init__(self, key: jax.random.PRNGKey):
+            attention_key, rope_key = jax.random.split(key, 2)
+            self.mha_attention = eqx.nn.MultiheadAttention(
+                num_heads=4,
+                query_size=24,
+                key=attention_key,
+            )
+            self.rope_embeddings = eqx.nn.RotaryPositionalEmbedding(embedding_size=6)
+
+        def __call__(self, q, k, v):
+            def process_heads(key_heads, query_heads, value_heads):
+                query_heads = jax.vmap(self.rope_embeddings,
+                                       in_axes=1,
+                                       out_axes=1)(query_heads)
+                key_heads = jax.vmap(self.rope_embeddings,
+                                     in_axes=1,
+                                     out_axes=1)(key_heads)
+
+                return query_heads, key_heads, value_heads
+
+            x = self.mha_attention(q, k, v, process_heads=process_heads)
+            return x
+
+    model = jax.vmap(Model(jax.random.PRNGKey(0)))
+    input_spec = (jnp.zeros((5, 15, 24)), jnp.zeros((5, 15, 24)), jnp.zeros((5, 15, 24)))
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_prelu():
+    model = jax.vmap(eqx.nn.PReLU())
+    input_spec = (jnp.zeros((5, 20)), )
+    run_and_compare(eqxi.finalise_fn(model), input_spec)
+
+
+def test_polling():
+    channels = 3
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool2d(kernel_size=(3, 4))), (jnp.zeros((channels, 41, 21)), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3))), (jnp.zeros((channels, 41, 21, 10)), ))

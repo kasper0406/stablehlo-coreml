@@ -455,17 +455,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_broadcast_in_dim(self, context: TranscriptionContext, op: BroadcastInDimOp):
         x = context[op.operand.get_name()]
 
-        reshaped_operand_shape = [1] * len(op.result.type.shape)
+        result_shape = op.result.type.shape
+        if result_shape == []:
+            # Cast a scalar shape to a (1,) shape
+            result_shape = [1]
+
+        reshaped_operand_shape = [1] * len(result_shape)
         for i, op_shape in enumerate(op.operand.type.shape):
             result_idx = op.broadcast_dimensions[i]
             reshaped_operand_shape[result_idx] = op_shape
 
         x = mb.reshape(x=x, shape=reshaped_operand_shape)
         for result_dim, current_shape in enumerate(reshaped_operand_shape):
-            if current_shape != op.result.type.shape[result_dim]:
+            if current_shape != result_shape[result_dim]:
                 assert current_shape == 1
                 # Replicate data along dimension `dim` until the result dimension is filled up
-                values = [x] * op.result.type.shape[result_dim]
+                values = [x] * result_shape[result_dim]
                 x = mb.concat(values=values, axis=result_dim)
 
         context.add_variable(op.result.get_name(), x)
