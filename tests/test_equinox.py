@@ -209,11 +209,23 @@ def test_1d_polling():
     run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveAvgPool1d(target_shape=4)), (jnp.zeros((channels, 41, )), ))
     run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveMaxPool1d(target_shape=5)), (jnp.zeros((channels, 41, )), ))
 
+    batch_size = 10
+    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool1d(kernel_size=3))), (jnp.zeros((batch_size, channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool1d(kernel_size=3, stride=2))), (jnp.zeros((batch_size, channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool1d(kernel_size=3, stride=3))), (jnp.zeros((batch_size, channels, 41, )), ))
+
 
 def test_2d_polling():
     channels = 3
     run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool2d(kernel_size=(3, 4))), (jnp.zeros((channels, 41, 21)), ))
 
+    batch_size = 10
+    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool2d(kernel_size=(3, 4)))), (jnp.zeros((batch_size, channels, 41, 21)), ))
+
 
 def test_3d_polling():
-    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3)))), (jnp.zeros((10, channels, 41, 21, 10)), ))
+    channels = 3
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3))), (jnp.zeros((channels, 41, 21, 10)), ))
+
+    # Due to the CoreML rank <= 5 condition, the result can unfortunately not fit in a tensor
+    # run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3)))), (jnp.zeros((10, channels, 41, 21, 10)), ))

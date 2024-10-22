@@ -867,6 +867,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
         return mil_results
 
+    def __compute_windowed_reduction(self, context: TranscriptionContext, inputs, window_dimensions, window_strides, body, init_values, result_types):
+        def move_axis_last(arr, axis):
+            permutation = list(range(len(arr.shape)))
+            permutation.append(permutation.pop(axis))
+            return mb.transpose(x=arr, perm=permutation)
+
+        inputs_rank = len(window_dimensions)
+        partitioned_inputs = []
+        for input in inputs:
+            transformed = mb.sliding_windows(x=input, axis=0, size=window_dimensions[0], stride=window_strides[0])
+            transformed = move_axis_last(transformed, 1)
+            for axis in range(1, inputs_rank):
+                transformed = mb.sliding_windows(x=transformed, axis=axis, size=window_dimensions[axis], stride=window_strides[axis])
+                transformed = move_axis_last(transformed, axis + 1)
+
+                split_a = len(transformed.shape) - 2
+                split_b = 2
+                foo = mb.split(x=mb.shape(x=transformed), axis=0, split_sizes=(split_a, split_b))[0]
+                bar = mb.concat(values=[foo, np.array([-1], dtype=np.int32)], axis=0)
+
+                transformed = mb.reshape(x=transformed, shape=bar)
+            partitioned_inputs.append(transformed)
+
+        reduction_dimension = len(partitioned_inputs[0].shape) - 1
+        reduction_results = self.__reduce_helper(context, partitioned_inputs, [reduction_dimension], body, init_values, result_types)
+        return reduction_results
+
     @register_stablehlo_op
     def op_reduce_window(self, context: TranscriptionContext, op: ReduceWindowOp):
         if op.window_dilations and not np.all(op.window_dilations == 1):
@@ -879,11 +906,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if not window_strides:
             window_strides = np.ones((inputs_rank,), dtype=np.int32)
 
-        def move_axis_last(arr, axis):
-            permutation = list(range(len(arr.shape)))
-            permutation.append(permutation.pop(axis))
-            return mb.transpose(x=arr, perm=permutation)
-
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
@@ -892,23 +914,84 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [mb.pad(x=input, pad=padding, constant_val=init_value.val[0]) for input, init_value in zip(inputs, init_values)]
 
-        partitioned_inputs = []
-        for input in inputs:
-            transformed = mb.sliding_windows(x=input, axis=0, size=op.window_dimensions[0], stride=window_strides[0])
-            transformed = move_axis_last(transformed, 1)
-            for axis in range(1, inputs_rank):
-                transformed = mb.sliding_windows(x=transformed, axis=axis, size=op.window_dimensions[axis], stride=window_strides[axis])
-                transformed = move_axis_last(transformed, axis + 1)
-                transformed = mb.reshape(x=transformed, shape=tuple(transformed.shape[:-2]) + (-1,))
-            partitioned_inputs.append(transformed)
-        print(partitioned_inputs)
+        # Unfortunately CoreML only supports tensors with rank <= 6.
+        # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
+        # means the function can not be called with tensors of rank >= 4.
+        # To work around this problem, we iterate over the leading dimensions not being windowed over.
+        fixed_dimensions = []
+        reduction_dimensions = []
+        for axis in range(inputs_rank):
+            if op.window_dimensions[axis] == 1 and window_strides[axis] == 1:
+                fixed_dimensions.append(axis)
+            else:
+                reduction_dimensions.append(axis)
+        permutation = fixed_dimensions + reduction_dimensions
 
-        reduction_dimension = len(partitioned_inputs[0].shape) - 1
+        # TODO(knielsen): Make this nicer!
+        transposed_inputs = []
+        for input in list(inputs):
+            transposed_inputs.append(mb.transpose(x=input, perm=permutation))
+
+        max_dims = 3
+        if len(reduction_dimensions) > max_dims:
+            raise ValueError("Due to CoreML's rank <= 5 restriction, it is not supported to reduce on more then 3 dimensions!")
+        loop_dimensions = fixed_dimensions[:max(0, inputs_rank - max_dims)]
+        loop_shapes = [inputs[0].shape[dim] for dim in loop_dimensions]
+
+        def compute_reduction(result_idx, *partial_results):
+            # Pick out the attributes from the dimensions we are reducing over for this index
+            loop_shape_rank = len(loop_shapes)
+            idx_dims = permutation[loop_shape_rank:]
+            idx_inputs = [index_by_slices(input, [result_idx] + [...]) for input in transposed_inputs]
+            idx_window_dimensions = [op.window_dimensions[dim] for dim in idx_dims]
+            idx_window_strides = [window_strides[dim] for dim in idx_dims]
+            idx_result_types = [
+                index_by_slices(partial_result, [result_idx] + [...])
+                for partial_result in partial_results
+            ]
+
+            if loop_shape_rank > 0:
+                # We need to squeeze out the result_idx dimensions
+                idx_inputs = [
+                    mb.reshape(x=input, shape=mb.slice_by_size(x=mb.shape(x=input), begin=[loop_shape_rank], size=[-1]))
+                    for input in idx_inputs
+                ]
+                idx_result_types = [
+                    mb.reshape(x=result, shape=mb.slice_by_size(x=mb.shape(x=result), begin=[loop_shape_rank], size=[-1]))
+                    for result in idx_result_types
+                ]
+
+            results = self.__compute_windowed_reduction(
+                context=context,
+                inputs=idx_inputs,
+                window_dimensions=idx_window_dimensions,
+                window_strides=idx_window_strides,
+                body=op.body,
+                init_values=init_values,
+                result_types=idx_result_types,
+            )
+
+            result_rank = inputs_rank - loop_shape_rank
+            return [
+                update_tensor_by_slice(acc, [result_idx] + [slice(None)] * result_rank, result)
+                for acc, result in zip(partial_results, results)
+            ]
+
         result_types = [result.type for result in op.results]
-        main_reduction_results = self.__reduce_helper(context, partitioned_inputs, [reduction_dimension], op.body, init_values, result_types)
-        print(main_reduction_results)
+        reduction_results = [
+            mb.transpose(
+                x=np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type))),
+                perm=permutation,
+            )
+            for result_type in result_types
+        ]
+        reduction_results = iterate_indexes_in_shapes(compute_reduction, [loop_shapes], reduction_results, unroll_limit=5)
+        reduction_results = [
+            mb.transpose(x=reduction_result, perm=inverse_permutation(permutation))
+            for reduction_result in reduction_results
+        ]
 
-        for (res, mil_res) in zip(op.results, main_reduction_results):
+        for (res, mil_res) in zip(op.results, reduction_results):
             context.add_variable(res.get_name(), mil_res)
 
     @register_stablehlo_op
