@@ -190,8 +190,26 @@ def test_prelu():
     run_and_compare(eqxi.finalise_fn(model), input_spec)
 
 
-def test_polling():
+def test_1d_polling():
     channels = 3
     run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, stride=2)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, stride=3)), (jnp.zeros((channels, 41, )), ))
+
+    run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, stride=2)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, stride=3)), (jnp.zeros((channels, 41, )), ))
+
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveAvgPool1d(target_shape=4)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveMaxPool1d(target_shape=5)), (jnp.zeros((channels, 41, )), ))
+
+    # TODO(knielsen): Test padding!!!
+
+
+def test_2d_polling():
+    channels = 3
     run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool2d(kernel_size=(3, 4))), (jnp.zeros((channels, 41, 21)), ))
-    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3))), (jnp.zeros((channels, 41, 21, 10)), ))
+
+
+def test_3d_polling():
+    run_and_compare(eqxi.finalise_fn(jax.vmap(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3)))), (jnp.zeros((10, channels, 41, 21, 10)), ))
