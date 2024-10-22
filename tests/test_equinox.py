@@ -196,14 +196,18 @@ def test_1d_polling():
     run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, stride=2)), (jnp.zeros((channels, 41, )), ))
     run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, stride=3)), (jnp.zeros((channels, 41, )), ))
 
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, padding=2)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.AvgPool1d(kernel_size=3, stride=2, padding=3)), (jnp.zeros((channels, 41, )), ))
+
     run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3)), (jnp.zeros((channels, 41, )), ))
     run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, stride=2)), (jnp.zeros((channels, 41, )), ))
     run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, stride=3)), (jnp.zeros((channels, 41, )), ))
 
+    run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, padding=3)), (jnp.zeros((channels, 41, )), ))
+    run_and_compare(eqxi.finalise_fn(eqx.nn.MaxPool1d(kernel_size=3, stride=3, padding=2)), (jnp.zeros((channels, 41, )), ))
+
     run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveAvgPool1d(target_shape=4)), (jnp.zeros((channels, 41, )), ))
     run_and_compare(eqxi.finalise_fn(eqx.nn.AdaptiveMaxPool1d(target_shape=5)), (jnp.zeros((channels, 41, )), ))
-
-    # TODO(knielsen): Test padding!!!
 
 
 def test_2d_polling():

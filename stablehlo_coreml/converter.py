@@ -879,13 +879,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if not window_strides:
             window_strides = np.ones((inputs_rank,), dtype=np.int32)
 
-        # op.padding
         def move_axis_last(arr, axis):
             permutation = list(range(len(arr.shape)))
             permutation.append(permutation.pop(axis))
             return mb.transpose(x=arr, perm=permutation)
 
         inputs = [context[input.get_name()] for input in op.inputs]
+        init_values = [context[init_value.get_name()] for init_value in op.init_values]
+
+        # Pad the inputs if required
+        if op.padding:
+            padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
+            inputs = [mb.pad(x=input, pad=padding, constant_val=init_value.val[0]) for input, init_value in zip(inputs, init_values)]
+
         partitioned_inputs = []
         for input in inputs:
             transformed = mb.sliding_windows(x=input, axis=0, size=op.window_dimensions[0], stride=window_strides[0])
@@ -899,7 +905,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         reduction_dimension = len(partitioned_inputs[0].shape) - 1
         result_types = [result.type for result in op.results]
-        init_values = [context[init_value.get_name()] for init_value in op.init_values]
         main_reduction_results = self.__reduce_helper(context, partitioned_inputs, [reduction_dimension], op.body, init_values, result_types)
         print(main_reduction_results)
 
