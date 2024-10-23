@@ -783,116 +783,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Unforunately this level of granularity is not supported through MIL.
         # We try to detect some simple cases for reductions mapping to native MIL
         # instructions, and otherwise fall back to a MIL while-loop based implementation.
-
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
         result_types = [result.type for result in op.results]
 
-        mil_results = self.__reduce_helper(context, inputs, op.dimensions, op.body, init_values, result_types)
+        mil_results = self.__compute_reduction(context, inputs, op.dimensions, op.body, init_values, result_types)
         for (res, mil_res) in zip(op.results, mil_results):
             context.add_variable(res.get_name(), mil_res)
-
-    def __reduce_helper(self, context: TranscriptionContext, inputs, dimensions, body, init_values, result_types):
-        def match_reduction_type(hlo_body):
-            if len(hlo_body.blocks) != 1:
-                return None, None
-            args = list(hlo_body.blocks[0].arguments)
-            ops = list(hlo_body.blocks[0].operations)
-
-            # Simple matches are where the `hlo_body` is on the form
-            #   return _generic_reduction_op_type_(`args`)
-            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
-            simple_matches = {
-                MaxOp: (mb.reduce_max, mb.maximum),
-                MinOp: (mb.reduce_min, mb.minimum),
-                AddOp: (mb.reduce_sum, mb.add),
-                MulOp: (mb.reduce_prod, mb.mul),
-            }
-
-            for generic_reduce_op_type, mil_equivalents in simple_matches.items():
-                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
-                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
-                        return mil_equivalents
-
-            return None, None
-
-        mil_reduction, mil_single_reduction = match_reduction_type(body)
-        if mil_reduction and mil_single_reduction and len(inputs) == 1:
-            res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
-            # Handle initial value
-            res = mil_single_reduction(x=res, y=init_values[0])
-            return [res]
-
-        # Fall back to loop implementation
-        logger.warn("Falling back to while-loop implementation for reduction. This may be slower than expected!")
-
-        input_rank = len(inputs[0].shape)
-        # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
-        # of the input rank. This is to make computing element indexes easier.
-        # When updating the result, we later pick out just the result indices
-        # we care about in the actual result.
-        reduce_shape = [inputs[0].shape[dim] if dim in dimensions else 1 for dim in range(input_rank)]
-        result_shape = [inputs[0].shape[dim] if dim not in dimensions else 1 for dim in range(input_rank)]
-
-        def compute_reduction(result_idx, *partial_results):
-            def compute_inner(element_idx, *acc):
-                element_idx = mb.add(x=result_idx, y=element_idx)
-                elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
-
-                args = list(acc) + elements
-                hlo_params = list(body.blocks[0].arguments)
-                outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, body, args)
-
-                return outputs
-
-            reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
-
-            # The result rank is likely less than the input shape.
-            # We need to pick the indexes in the result shape we want to update
-            result_indices = [dim for dim in range(input_rank) if dim not in dimensions]
-            if len(result_indices) != 0:
-                result_idx = [mb.gather(x=result_idx, indices=result_indices)]
-            else:
-                result_idx = []
-
-            return [
-                update_tensor_by_slice(acc, result_idx, result)
-                for acc, result in zip(partial_results, reduction_results)
-            ]
-
-        mil_results = [
-            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type)))
-            for result_type in result_types
-        ]
-        mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
-        return mil_results
-
-    def __compute_windowed_reduction(self, context: TranscriptionContext, inputs, window_dimensions, window_strides, body, init_values, result_types):
-        def move_axis_last(arr, axis):
-            permutation = list(range(len(arr.shape)))
-            permutation.append(permutation.pop(axis))
-            return mb.transpose(x=arr, perm=permutation)
-
-        inputs_rank = len(window_dimensions)
-        partitioned_inputs = []
-        for input in inputs:
-            transformed = mb.sliding_windows(x=input, axis=0, size=window_dimensions[0], stride=window_strides[0])
-            transformed = move_axis_last(transformed, 1)
-            for axis in range(1, inputs_rank):
-                transformed = mb.sliding_windows(x=transformed, axis=axis, size=window_dimensions[axis], stride=window_strides[axis])
-                transformed = move_axis_last(transformed, axis + 1)
-
-                split_a = len(transformed.shape) - 2
-                split_b = 2
-                foo = mb.split(x=mb.shape(x=transformed), axis=0, split_sizes=(split_a, split_b))[0]
-                bar = mb.concat(values=[foo, np.array([-1], dtype=np.int32)], axis=0)
-
-                transformed = mb.reshape(x=transformed, shape=bar)
-            partitioned_inputs.append(transformed)
-
-        reduction_dimension = len(partitioned_inputs[0].shape) - 1
-        reduction_results = self.__reduce_helper(context, partitioned_inputs, [reduction_dimension], body, init_values, result_types)
-        return reduction_results
 
     @register_stablehlo_op
     def op_reduce_window(self, context: TranscriptionContext, op: ReduceWindowOp):
@@ -912,12 +809,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Pad the inputs if required
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
-            inputs = [mb.pad(x=input, pad=padding, constant_val=init_value.val[0]) for input, init_value in zip(inputs, init_values)]
+            inputs = [
+                mb.pad(x=input, pad=padding, constant_val=init_value.val[0])
+                for input, init_value in zip(inputs, init_values)
+            ]
 
         # Unfortunately CoreML only supports tensors with rank <= 6.
         # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
         # means the function can not be called with tensors of rank >= 4.
-        # To work around this problem, we iterate over the leading dimensions not being windowed over.
+        # To work around this problem, we have to iterate over the leading dimensions not being
+        # windowed over, and calculate the result values incrementally.
         fixed_dimensions = []
         reduction_dimensions = []
         for axis in range(inputs_rank):
@@ -927,20 +828,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 reduction_dimensions.append(axis)
         permutation = fixed_dimensions + reduction_dimensions
 
-        # TODO(knielsen): Make this nicer!
-        transposed_inputs = []
-        for input in list(inputs):
-            transposed_inputs.append(mb.transpose(x=input, perm=permutation))
-
+        # We will put as few dimensions as possible in the loop_dimensions (i.e. we may
+        # choose to put some of the `fixedf_dimensions` inside the reduction itself)
         max_dims = 3
         if len(reduction_dimensions) > max_dims:
             raise ValueError("Due to CoreML's rank <= 5 restriction, it is not supported to reduce on more then 3 dimensions!")
         loop_dimensions = fixed_dimensions[:max(0, inputs_rank - max_dims)]
         loop_shapes = [inputs[0].shape[dim] for dim in loop_dimensions]
+        loop_shape_rank = len(loop_shapes)
+
+        # Transpose the input so they are easily indexable inside the loop
+        transposed_inputs = [mb.transpose(x=input, perm=permutation) for input in inputs]
 
         def compute_reduction(result_idx, *partial_results):
             # Pick out the attributes from the dimensions we are reducing over for this index
-            loop_shape_rank = len(loop_shapes)
             idx_dims = permutation[loop_shape_rank:]
             idx_inputs = [index_by_slices(input, [result_idx] + [...]) for input in transposed_inputs]
             idx_window_dimensions = [op.window_dimensions[dim] for dim in idx_dims]
@@ -951,7 +852,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             ]
 
             if loop_shape_rank > 0:
-                # We need to squeeze out the result_idx dimensions
+                # We need to squeeze out the loop (result_idx) dimensions
                 idx_inputs = [
                     mb.reshape(x=input, shape=mb.slice_by_size(x=mb.shape(x=input), begin=[loop_shape_rank], size=[-1]))
                     for input in idx_inputs
@@ -1058,6 +959,132 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.pop_function()
 
         return outputs
+
+    def __compute_reduction(self, context: TranscriptionContext, inputs, dimensions, body, init_values, result_types):
+        def match_reduction_type(hlo_body):
+            if len(hlo_body.blocks) != 1:
+                return None, None
+            args = list(hlo_body.blocks[0].arguments)
+            ops = list(hlo_body.blocks[0].operations)
+
+            # Simple matches are where the `hlo_body` is on the form
+            #   return _generic_reduction_op_type_(`args`)
+            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
+            simple_matches = {
+                MaxOp: (mb.reduce_max, mb.maximum),
+                MinOp: (mb.reduce_min, mb.minimum),
+                AddOp: (mb.reduce_sum, mb.add),
+                MulOp: (mb.reduce_prod, mb.mul),
+            }
+
+            for generic_reduce_op_type, mil_equivalents in simple_matches.items():
+                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
+                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
+                        return mil_equivalents
+
+            return None, None
+
+        mil_reduction, mil_single_reduction = match_reduction_type(body)
+        if mil_reduction and mil_single_reduction and len(inputs) == 1:
+            res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
+            # Handle initial value
+            res = mil_single_reduction(x=res, y=init_values[0])
+            return [res]
+
+        # Fall back to loop implementation
+        logger.warning("Falling back to while-loop implementation for reduction. This may be slower than expected!")
+
+        input_rank = len(inputs[0].shape)
+        # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
+        # of the input rank. This is to make computing element indexes easier.
+        # When updating the result, we later pick out just the result indices
+        # we care about in the actual result.
+        reduce_shape = [inputs[0].shape[dim] if dim in dimensions else 1 for dim in range(input_rank)]
+        result_shape = [inputs[0].shape[dim] if dim not in dimensions else 1 for dim in range(input_rank)]
+
+        def compute_reduction(result_idx, *partial_results):
+            def compute_inner(element_idx, *acc):
+                element_idx = mb.add(x=result_idx, y=element_idx)
+                elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
+
+                args = list(acc) + elements
+                hlo_params = list(body.blocks[0].arguments)
+                outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, body, args)
+
+                return outputs
+
+            reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
+
+            # The result rank is likely less than the input shape.
+            # We need to pick the indexes in the result shape we want to update
+            result_indices = [dim for dim in range(input_rank) if dim not in dimensions]
+            if len(result_indices) != 0:
+                result_idx = [mb.gather(x=result_idx, indices=result_indices)]
+            else:
+                result_idx = []
+
+            return [
+                update_tensor_by_slice(acc, result_idx, result)
+                for acc, result in zip(partial_results, reduction_results)
+            ]
+
+        mil_results = [
+            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type)))
+            for result_type in result_types
+        ]
+        mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
+        return mil_results
+
+    def __compute_windowed_reduction(
+        self,
+        context: TranscriptionContext,
+        inputs,
+        window_dimensions,
+        window_strides,
+        body,
+        init_values,
+        result_types
+    ):
+        def move_axis_last(arr, axis):
+            permutation = list(range(len(arr.shape)))
+            permutation.append(permutation.pop(axis))
+            return mb.transpose(x=arr, perm=permutation)
+
+        # First group all the dimensions being reduced over in a group at the end
+        inputs_rank = len(window_dimensions)
+        partitioned_inputs = []
+        for input in inputs:
+            transformed = mb.sliding_windows(
+                x=input,
+                axis=0,
+                size=window_dimensions[0],
+                stride=window_strides[0]
+            )
+            transformed = move_axis_last(transformed, 1)
+            for axis in range(1, inputs_rank):
+                transformed = mb.sliding_windows(
+                    x=transformed, axis=axis, size=window_dimensions[axis], stride=window_strides[axis])
+                transformed = move_axis_last(transformed, axis + 1)
+                # Contract the two last dimensions into one
+                transformed_rank = len(transformed.shape)
+                new_shape = mb.concat(values=[
+                    mb.slice_by_size(x=mb.shape(x=transformed), begin=[0], size=[transformed_rank - 2]),
+                    np.array([-1], dtype=np.int32)
+                ], axis=0)
+                transformed = mb.reshape(x=transformed, shape=new_shape)
+            partitioned_inputs.append(transformed)
+
+        # Then use the normal reduce implementation to compute the result
+        reduction_dimension = len(partitioned_inputs[0].shape) - 1
+        reduction_results = self.__compute_reduction(
+            context=context,
+            inputs=partitioned_inputs,
+            dimensions=[reduction_dimension],
+            body=body,
+            init_values=init_values,
+            result_types=result_types,
+        )
+        return reduction_results
 
     def __resolve_type(self, obj):
         if isinstance(obj, np.ndarray):
