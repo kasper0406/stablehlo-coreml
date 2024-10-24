@@ -8,6 +8,8 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 )
 from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
 from .passes.utils import register_optimizations
+from .translation_context import TranslationContext
+from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -25,7 +27,6 @@ from jax._src.lib.mlir.dialects import hlo
 import numpy as np
 
 from typing import List, Optional
-import inspect
 from functools import partial, reduce
 
 
@@ -37,118 +38,6 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)
-
-
-class TranscriptionContext:
-    def __init__(self):
-        self._path = []
-        self.seen_paths = set()
-        self.variables = {}  # Nested map: path -> variable -> mil var
-
-    def push_function(self, name: str):
-        counter = 0
-        ctx_name = name
-        while True:
-            new_path = self._path + [ctx_name]
-            if "/".join(new_path) in self.seen_paths:
-                # Ensure that the new context name is in fact unique
-                # A collision can happen if the same function is called twice
-                ctx_name = f"{name}_{counter}"
-                counter += 1
-            else:
-                self._path.append(ctx_name)
-                self.seen_paths.add(self.path())
-                return ctx_name
-
-    def pop_function(self):
-        self.variables.pop(self.path())
-        self._path.pop()
-
-    def add_variable(self, name: str, mil_var: mil.Var):
-        path = self.path()
-        if path not in self.variables:
-            self.variables[path] = {}
-
-        if name in self.variables[path]:
-            raise ValueError(f"Variable {name} is already defined in path {path}")
-        self.variables[path][name] = mil_var
-
-    def add_result(self, hlo_result, result: mil.Var):
-        result_name = hlo_result.get_name()
-        self.add_variable(result_name, result)
-
-        def validate_shapes(hlo_shape: tuple, mil_shape: tuple):
-            if hlo_shape == tuple() and (mil_shape == tuple() or mil_shape == (1, )):
-                return True
-            if hlo_shape == mil_shape:
-                return True
-
-            raise ValueError(f"The HLO result shape `{hlo_shape}` is different from the actual MIL result shape `{mil_shape}`")
-
-        hlo_shape = tuple(hlo_result.type.shape)
-        mil_shape = tuple(result.shape)
-        validate_shapes(hlo_shape=hlo_shape, mil_shape=mil_shape)
-
-    def __getitem__(self, name: str):
-        # Walk up along the path list to find the first correctly named variable in scope
-        path = self._path.copy()
-        while True:
-            ctx = self.variables["/".join(path)]
-            if name in ctx:
-                return ctx[name]
-            if len(path) == 0:
-                raise ValueError(f"Variable with name {name} is not defined in path {path}")
-            path.pop()
-
-    def path(self) -> str:
-        return "/".join(self._path)
-
-
-def register_stablehlo_op(func):
-    # Check the signature
-    sig = inspect.signature(func)
-    params = list(sig.parameters.values())
-
-    # Exclude 'self' from the parameters
-    params = params[1:]
-
-    error_msg = "HLO op implementations should take parameters of exactly " \
-                "(context: TranscriptionContext, op: <HLO_OP_TYPE>)"
-    if len(params) != 2:
-        raise TypeError(error_msg)
-
-    if not issubclass(params[0].annotation, TranscriptionContext):
-        raise TypeError(error_msg)
-
-    # We identify the function by the type of operation it implements
-    func._implements_hlo_op = params[1].annotation
-    return func
-
-
-class StableHloOpsRegistry(type):
-    def __init__(cls, name, bases, clsdict):
-        super().__init__(name, bases, clsdict)
-
-        cls._stablehlo_ops_registry = {}
-        for name, method in clsdict.items():
-            op_type = getattr(method, '_implements_hlo_op', False)
-            if callable(method) and op_type:
-                if op_type in cls._stablehlo_ops_registry:
-                    raise TypeError(f"StableHLO op {op_type} has been registered more than once!")
-                cls._stablehlo_ops_registry[op_type] = method
-
-    def _dispatch_op(cls, self, context: TranscriptionContext, op):
-        if type(op) not in self._stablehlo_ops_registry:
-            raise TypeError(f"The StableHLO op {type(op)} has not been implemented!")
-
-        op_method = self._stablehlo_ops_registry[type(op)]
-        return op_method(self, context, op)
-
-    def __call__(cls, *args, **kwargs):
-        # Register the dispatch_op method
-        instance = super().__call__(*args, **kwargs)
-        setattr(instance, 'dispatch_op', cls._dispatch_op)
-        return instance
 
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
@@ -172,7 +61,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         return self.prog
 
     def build_func(self, hlo_func: FuncOp):
-        context = TranscriptionContext()  # Map from results to created variables
+        context = TranslationContext()  # Map from results to created variables
 
         func_inputs = {}
         for arg in hlo_func.arguments:
@@ -191,7 +80,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             ssa_func.set_outputs(self.process_block(context, hlo_func.body.blocks[0]))
             self.prog.add_function(hlo_func.name.value, ssa_func)
 
-    def process_block(self, context: TranscriptionContext, block: ir.Block):
+    def process_block(self, context: TranslationContext, block: ir.Block):
         outputs = None
         for op in block:
             # Convention: Only the "return" op is returning from its building function
@@ -204,7 +93,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         return outputs
 
     @register_stablehlo_op
-    def op_call(self, context: TranscriptionContext, op: CallOp):
+    def op_call(self, context: TranslationContext, op: CallOp):
         # We can not do function calls in MIL, so we have to inline the function
 
         # Get the argument mapping prior to entering the function context
@@ -223,53 +112,53 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             context.add_result(result, output)
 
     @register_stablehlo_op
-    def op_return(self, context: TranscriptionContext, op: ReturnOp):
+    def op_return(self, context: TranslationContext, op: ReturnOp):
         return [context[result.get_name()] for result in op.operands]
 
     @register_stablehlo_op
-    def op_func_return(self, context: TranscriptionContext, op: FuncReturnOp):
+    def op_func_return(self, context: TranslationContext, op: FuncReturnOp):
         # The HLO / MLIR types for function return ops seem to be both in use
         # The behaviour and fields of the two types should be similar, so we
         # simply delegate to the HLO version
         return self.op_return(context, op)
 
     @register_stablehlo_op
-    def op_add(self, context: TranscriptionContext, op: AddOp):
+    def op_add(self, context: TranslationContext, op: AddOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_op = mb.add(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_or(self, context: TranscriptionContext, op: OrOp):
+    def op_or(self, context: TranslationContext, op: OrOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_op = mb.logical_or(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_and(self, context: TranscriptionContext, op: AndOp):
+    def op_and(self, context: TranslationContext, op: AndOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_op = mb.logical_and(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_subtract(self, context: TranscriptionContext, op: SubtractOp):
+    def op_subtract(self, context: TranslationContext, op: SubtractOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_op = mb.sub(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_mul(self, context: TranscriptionContext, op: MulOp):
+    def op_mul(self, context: TranslationContext, op: MulOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_op = mb.mul(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_div(self, context: TranscriptionContext, op: DivOp):
+    def op_div(self, context: TranslationContext, op: DivOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
@@ -291,7 +180,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_neg(self, context: TranscriptionContext, op: NegOp):
+    def op_neg(self, context: TranslationContext, op: NegOp):
         # TODO(knielsen): Consider unsigned and more exotic types
         operand = context[op.operand.get_name()]
         minus_one = np.array([-1], dtype=types.nptype_from_builtin(operand.dtype))
@@ -299,25 +188,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_sign(self, context: TranscriptionContext, op: SignOp):
+    def op_sign(self, context: TranslationContext, op: SignOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.sign(x=operand)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_abs(self, context: TranscriptionContext, op: AbsOp):
+    def op_abs(self, context: TranslationContext, op: AbsOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.abs(x=operand)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_log(self, context: TranscriptionContext, op: LogOp):
+    def op_log(self, context: TranslationContext, op: LogOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.log(x=operand)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_log1p(self, context: TranscriptionContext, op: Log1pOp):
+    def op_log1p(self, context: TranslationContext, op: Log1pOp):
         operand = context[op.operand.get_name()]
         one = np.array([1], dtype=types.nptype_from_builtin(self.__resolve_type(operand)))
         x_plus_one = mb.add(x=one, y=operand)
@@ -325,38 +214,38 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_exp(self, context: TranscriptionContext, op: ExpOp):
+    def op_exp(self, context: TranslationContext, op: ExpOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.exp(x=operand)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_expm1(self, context: TranscriptionContext, op: Expm1Op):
+    def op_expm1(self, context: TranslationContext, op: Expm1Op):
         operand = context[op.operand.get_name()]
         cml_op = mb.add(x=mb.exp(x=operand), y=-1.0)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_transpose(self, context: TranscriptionContext, op: TransposeOp):
+    def op_transpose(self, context: TranslationContext, op: TransposeOp):
         operand = context[op.operand.get_name()]
         perm = np.array(op.permutation, dtype=np.int32)
         cml_op = mb.transpose(x=operand, perm=perm)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_sqrt(self, context: TranscriptionContext, op: SqrtOp):
+    def op_sqrt(self, context: TranslationContext, op: SqrtOp):
         operand = context[op.operand.get_name()]
         cml_op = mb.sqrt(x=operand)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_constant(self, context: TranscriptionContext, op: ConstantOp):
+    def op_constant(self, context: TranslationContext, op: ConstantOp):
         constant = np.array(op.value)
         constant = np.reshape(constant, op.result.type.shape)
         context.add_result(op.result, constant)
 
     @register_stablehlo_op
-    def op_dot_general(self, context: TranscriptionContext, op: DotGeneralOp):
+    def op_dot_general(self, context: TranslationContext, op: DotGeneralOp):
         # This roughly follows the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
         # but uses that we have a matrix multiplication primitive, instead of just a dot-product primitive.
         lhs_rank = len(op.lhs.type.shape)
@@ -467,14 +356,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, result)
 
     @register_stablehlo_op
-    def op_reshape(self, context: TranscriptionContext, op: ReshapeOp):
+    def op_reshape(self, context: TranslationContext, op: ReshapeOp):
         x = context[op.operand.get_name()]
         new_shape = op.result.type.shape
         reshape_res = mb.reshape(x=x, shape=new_shape)
         context.add_result(op.result, reshape_res)
 
     @register_stablehlo_op
-    def op_broadcast_in_dim(self, context: TranscriptionContext, op: BroadcastInDimOp):
+    def op_broadcast_in_dim(self, context: TranslationContext, op: BroadcastInDimOp):
         x = context[op.operand.get_name()]
 
         result_shape = op.result.type.shape
@@ -498,7 +387,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, x)
 
     @register_stablehlo_op
-    def op_while(self, context: TranscriptionContext, op: WhileOp):
+    def op_while(self, context: TranslationContext, op: WhileOp):
         def cond(*loop_args):
             params = [param for param in op.cond.blocks[0].arguments]
             outputs = self.__invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
@@ -519,7 +408,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             context.add_result(result_var, while_result)
 
     @register_stablehlo_op
-    def op_compare(self, context: TranscriptionContext, op: CompareOp):
+    def op_compare(self, context: TranslationContext, op: CompareOp):
         comparison_direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
         cml_op_builder = {
             "EQ": mb.equal,
@@ -536,14 +425,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_convert(self, context: TranscriptionContext, op: ConvertOp):
+    def op_convert(self, context: TranslationContext, op: ConvertOp):
         x = context[op.operand.get_name()]
         new_dtype = self.__get_dtype(op.result.type.element_type)
         cml_op = mb.cast(x=x, dtype=self.__dtype_str(new_dtype))
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_select(self, context: TranscriptionContext, op: SelectOp):
+    def op_select(self, context: TranslationContext, op: SelectOp):
         cond = context[op.pred.get_name()]
         a = context[op.on_true.get_name()]
         b = context[op.on_false.get_name()]
@@ -551,7 +440,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_dynamic_slice(self, context: TranscriptionContext, op: DynamicSliceOp):
+    def op_dynamic_slice(self, context: TranslationContext, op: DynamicSliceOp):
         x = context[op.operand.get_name()]
 
         # The HLO DynamicSliceOp gives the start indices as seperate 0-dimensional integer variables
@@ -568,7 +457,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_slice(self, context: TranscriptionContext, op: SliceOp):
+    def op_slice(self, context: TranslationContext, op: SliceOp):
         x = context[op.operand.get_name()]
 
         begin = np.array(op.start_indices, dtype=np.int32)
@@ -584,7 +473,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
-    def op_dynamic_update_slice(self, context: TranscriptionContext, op: DynamicUpdateSliceOp):
+    def op_dynamic_update_slice(self, context: TranslationContext, op: DynamicUpdateSliceOp):
         x = context[op.operand.get_name()]
         updates = context[op.update.get_name()]
 
@@ -601,7 +490,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, update_res)
 
     @register_stablehlo_op
-    def op_convolution(self, context: TranscriptionContext, op: ConvolutionOp):
+    def op_convolution(self, context: TranslationContext, op: ConvolutionOp):
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
         # TODO(knielsen): It should be possible to remove this batch dimension check, but
         #                 there should be a unit test testing it.
@@ -718,51 +607,51 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, cml_conv)
 
     @register_stablehlo_op
-    def op_max(self, context: TranscriptionContext, op: MaxOp):
+    def op_max(self, context: TranslationContext, op: MaxOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_res = mb.maximum(x=lhs, y=rhs)
         context.add_result(op.result, cml_res)
 
     @register_stablehlo_op
-    def op_min(self, context: TranscriptionContext, op: MinOp):
+    def op_min(self, context: TranslationContext, op: MinOp):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
         cml_res = mb.minimum(x=lhs, y=rhs)
         context.add_result(op.result, cml_res)
 
     @register_stablehlo_op
-    def op_rsqrt(self, context: TranscriptionContext, op: RsqrtOp):
+    def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
         x = context[op.operand.get_name()]
         mil_res = mb.rsqrt(x=x)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_tanh(self, context: TranscriptionContext, op: TanhOp):
+    def op_tanh(self, context: TranslationContext, op: TanhOp):
         x = context[op.operand.get_name()]
         mil_res = mb.tanh(x=x)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_sine(self, context: TranscriptionContext, op: SineOp):
+    def op_sine(self, context: TranslationContext, op: SineOp):
         x = context[op.operand.get_name()]
         mil_res = mb.sin(x=x)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_cosine(self, context: TranscriptionContext, op: CosineOp):
+    def op_cosine(self, context: TranslationContext, op: CosineOp):
         x = context[op.operand.get_name()]
         mil_res = mb.cos(x=x)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_tan(self, context: TranscriptionContext, op: TanOp):
+    def op_tan(self, context: TranslationContext, op: TanOp):
         x = context[op.operand.get_name()]
         mil_res = mb.tan(x=x)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_atan2(self, context: TranscriptionContext, op: Atan2Op):
+    def op_atan2(self, context: TranslationContext, op: Atan2Op):
         y = context[op.lhs.get_name()]
         x = context[op.rhs.get_name()]
         # Notice the fraction may be +-inf
@@ -778,20 +667,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, atan2_res)
 
     @register_stablehlo_op
-    def op_concatenate(self, context: TranscriptionContext, op: ConcatenateOp):
+    def op_concatenate(self, context: TranslationContext, op: ConcatenateOp):
         values = [context[input.get_name()] for input in op.inputs]
         values = promote_input_dtypes(values)
         mil_res = mb.concat(values=values, axis=op.dimension.value)
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_reverse(self, context: TranscriptionContext, op: ReverseOp):
+    def op_reverse(self, context: TranslationContext, op: ReverseOp):
         x = context[op.operand.get_name()]
         mil_res = mb.reverse(x=x, axes=np.array(op.dimensions, dtype=np.int32))
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_isfinite(self, context: TranscriptionContext, op: IsFiniteOp):
+    def op_isfinite(self, context: TranslationContext, op: IsFiniteOp):
         x = context[op.x.get_name()]
         # All finite numbers will have abs(x) < inf
         infinity = np.array(np.inf, dtype=types.nptype_from_builtin(self.__resolve_type(x)))
@@ -799,7 +688,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, mil_res)
 
     @register_stablehlo_op
-    def op_reduce(self, context: TranscriptionContext, op: ReduceOp):
+    def op_reduce(self, context: TranslationContext, op: ReduceOp):
         # HLO reductions can be arbitrarily complex and defines a custom function
         # specifying the reduction.
         # Unforunately this level of granularity is not supported through MIL.
@@ -814,7 +703,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             context.add_result(res, mil_res)
 
     @register_stablehlo_op
-    def op_reduce_window(self, context: TranscriptionContext, op: ReduceWindowOp):
+    def op_reduce_window(self, context: TranslationContext, op: ReduceWindowOp):
         if op.window_dilations and not np.all(op.window_dilations == 1):
             raise ValueError("Window dilations are currently unsupported for windowed reduce")
         if op.base_dilations and not np.all(op.base_dilations == 1):
@@ -918,7 +807,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             context.add_result(res, mil_res)
 
     @register_stablehlo_op
-    def op_iota(self, context: TranscriptionContext, op: IotaOp):
+    def op_iota(self, context: TranslationContext, op: IotaOp):
         iota_dim = int(op.iota_dimension)
         tensor_shape = op.result.type.shape
         vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
@@ -927,7 +816,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, res)
 
     @register_stablehlo_op
-    def op_custom_call(self, context: TranscriptionContext, op: CustomCallOp):
+    def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
         if op.call_target_name.value.startswith("mhlo."):
             mapped_op = None
             op_impl = None
@@ -954,7 +843,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         raise ValueError(f"Custom call is not supported: {op.call_target_name}")
 
-    def _op_mhlo_topk(self, context: TranscriptionContext, op: TopKOp):
+    def _op_mhlo_topk(self, context: TranslationContext, op: TopKOp):
         """
         This is a MHLO op, and follows a slightly different pattern, since it is unvoked by a
         custom call. It will return the results, as we currently can not rename the results
@@ -964,7 +853,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         mil_res = mb.topk(x=x, k=op.k.value, ascending=not op.largest.value)
         return mil_res
 
-    def __invoke_hlo_function(self, context: TranscriptionContext, func_name: str, hlo_params, hlo_func_body, cml_args):
+    def __invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
         context.push_function(func_name)
 
@@ -982,7 +871,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         return outputs
 
-    def __compute_reduction(self, context: TranscriptionContext, inputs, dimensions, body, init_values, result_types):
+    def __compute_reduction(self, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
         def match_reduction_type(hlo_body):
             if len(hlo_body.blocks) != 1:
                 return None, None
@@ -1059,7 +948,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     def __compute_windowed_reduction(
         self,
-        context: TranscriptionContext,
+        context: TranslationContext,
         inputs,
         window_dimensions,
         window_strides,
