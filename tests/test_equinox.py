@@ -5,9 +5,11 @@ import equinox.internal as eqxi
 
 from tests.test_jax import run_and_compare
 
+from functools import partial
+
 
 def run_and_compare_eqx(model, input_spec):
-    return run_and_compare(eqxi.finalise_fn(model), input_spec)
+    return run_and_compare(eqxi.finalise_fn(eqx.nn.inference_mode(model)), input_spec)
 
 
 def test_conv_1d():
@@ -243,3 +245,127 @@ def test_3d_polling():
 
     # Due to the CoreML rank <= 5 condition, the result can unfortunately not fit in a tensor
     # run_and_compare_eqx(jax.vmap(eqx.nn.AvgPool3d(kernel_size=(5, 4, 3))), (jnp.zeros((10, channels, 41, 21, 10)), ))
+
+
+def test_layernorm():
+    batch_size = 3
+    input_shape = (10, 3)
+    run_and_compare_eqx(jax.vmap(eqx.nn.LayerNorm(shape=input_shape)), (jnp.zeros((batch_size, *input_shape)), ))
+
+
+def test_rmsnorm():
+    batch_size = 3
+    input_shape = (10, 3)
+    run_and_compare_eqx(jax.vmap(eqx.nn.RMSNorm(shape=input_shape)), (jnp.zeros((batch_size, *input_shape)), ))
+
+
+def test_groupnorm():
+    batch_size = 3
+    input_shape = (4, 12)
+    run_and_compare_eqx(
+        jax.vmap(eqx.nn.GroupNorm(groups=4, channelwise_affine=False)),
+        (jnp.zeros((batch_size, *input_shape)), )
+    )
+    run_and_compare_eqx(
+        jax.vmap(eqx.nn.GroupNorm(groups=2, channels=4)),
+        (jnp.zeros((batch_size, *input_shape)), )
+    )
+
+
+# Unfortunately this test currently fails due to https://github.com/llvm/llvm-project/pull/113064
+# def test_batchnorm():
+#     batch_size = 3
+#     input_shape = (4, 12)
+
+#     class Model(eqx.Module):
+#         batch_norm: eqx.nn.BatchNorm
+
+#         def __init__(self, wrapping_layer: eqx.Module, key: jax.random.PRNGKey):
+#             self.v = eqx.nn.BatchNorm(input_size=4, axis_name="batch")
+
+#         def __call__(self, x, state):
+#             out, _state = self.batch_norm(x, state)
+#             return out
+
+#     model, state = eqx.nn.make_with_state(eqx.nn.BatchNorm)(input_size=4, axis_name="batch")
+#     batched_model = jax.vmap(partial(model, state=state), axis_name="batch")
+#     run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, *input_shape)), ))
+
+
+def test_spectralnorm():
+    batch_size = 5
+
+    class Model(eqx.Module):
+        spectral_norm: eqx.nn.SpectralNorm[eqx.Module]
+
+        def __init__(self, wrapping_layer: eqx.Module, key: jax.random.PRNGKey):
+            self.spectral_norm = eqx.nn.SpectralNorm(
+                layer=wrapping_layer,
+                weight_name="weight",
+                key=key,
+            )
+
+        def __call__(self, x, state):
+            out, _state = self.spectral_norm(x, state)
+            return out
+
+    wrapping_key, model_key = jax.random.split(jax.random.PRNGKey(0), 2)
+
+    # Linear wrapping layer
+    model, state = eqx.nn.make_with_state(Model)(
+        wrapping_layer=eqx.nn.Linear(in_features=12, out_features=24, key=wrapping_key),
+        key=model_key,
+    )
+    batched_model = jax.vmap(partial(model, state=state))
+    run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, 12)), ))
+
+    # Convolutional 1d wrapping layer
+    model, state = eqx.nn.make_with_state(Model)(
+        wrapping_layer=eqx.nn.Conv1d(in_channels=12, out_channels=24, kernel_size=3, key=wrapping_key),
+        key=model_key,
+    )
+    batched_model = jax.vmap(partial(model, state=state))
+    run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, 12, 31)), ))
+
+    # Convolutional 2d wrapping layer
+    model, state = eqx.nn.make_with_state(Model)(
+        wrapping_layer=eqx.nn.Conv2d(in_channels=12, out_channels=24, kernel_size=3, key=wrapping_key),
+        key=model_key,
+    )
+    batched_model = jax.vmap(partial(model, state=state))
+    run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, 12, 31, 15)), ))
+
+
+def test_weightnorm():
+    batch_size = 5
+    key = jax.random.PRNGKey(0)
+
+    class Model(eqx.Module):
+        weight_norm: eqx.nn.WeightNorm[eqx.Module]
+
+        def __init__(self, wrapping_layer: eqx.Module):
+            self.weight_norm = eqx.nn.WeightNorm(
+                layer=wrapping_layer,
+                weight_name="weight",
+            )
+
+        def __call__(self, x):
+            return self.weight_norm(x)
+
+    # Linear wrapping layer
+    model = jax.vmap(Model(
+        wrapping_layer=eqx.nn.Linear(in_features=12, out_features=24, key=key),
+    ))
+    run_and_compare_eqx(model, (jnp.zeros((batch_size, 12)), ))
+
+    # Convolutional 1d wrapping layer
+    model = jax.vmap(Model(
+        wrapping_layer=eqx.nn.Conv1d(in_channels=12, out_channels=24, kernel_size=3, key=key),
+    ))
+    run_and_compare_eqx(model, (jnp.zeros((batch_size, 12, 31)), ))
+
+    # Convolutional 2d wrapping layer
+    model = jax.vmap(Model(
+        wrapping_layer=eqx.nn.Conv2d(in_channels=12, out_channels=24, kernel_size=3, key=key),
+    ))
+    run_and_compare_eqx(model, (jnp.zeros((batch_size, 12, 31, 15)), ))
