@@ -856,22 +856,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 if operand_dim in dim_numbers.start_index_map:
                     start_index_dim = dim_numbers.start_index_map.index(operand_dim)
                     elements = operand.shape[operand_dim]
+
                     start_index = index_by_slices(start_indices, (slice_idx, start_index_dim))
+                    start_index = mb.reshape(x=start_index, shape=(1,))
+
                     actual_start_index = mb.maximum(x=mb.minimum(x=start_index, y=elements - slice_sizes[operand_dim]), y=0)
                     end_index = mb.add(x=actual_start_index, y=slice_sizes[operand_dim])
                     slice_start.append(actual_start_index)
                     slice_end.append(end_index)
                 elif operand_dim in dim_numbers.collapsed_slice_dims:
-                    slice_start.append(0)
-                    slice_end.append(1)
+                    slice_start.append(mb.reshape(x=0, shape=(1,)))
+                    slice_end.append(mb.reshape(x=1, shape=(1,)))
                 else:
-                    slice_start.append(0)
-                    slice_end.append(operand.shape[operand_dim])
+                    slice_start.append(mb.reshape(x=0, shape=(1,)))
+                    slice_end.append(mb.reshape(x=slice_sizes[operand_dim], shape=(1,)))
 
             selected_slice = mb.slice_by_index(
                 x=operand,
-                begin=mb.reshape(x=mb.concat(values=slice_start, axis=1), shape=(len(slice_start),)),
-                end=mb.reshape(x=mb.concat(values=slice_end, axis=1), shape=(len(slice_end),)),
+                begin=mb.concat(values=slice_start, axis=0),
+                end=mb.concat(values=slice_end, axis=0),
             )
             if len(dim_numbers.collapsed_slice_dims) > 0:
                 selected_slice = mb.squeeze(x=selected_slice, axes=dim_numbers.collapsed_slice_dims)
@@ -879,7 +882,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             update_slice_spec = [slice_idx if dim == stack_axis else slice(None) for dim in range(result_rank)]
             return [update_tensor_by_slice(partial_results, update_slice_spec, selected_slice)]
 
-        result = mb.fill(shape=op.result.type.shape)
+        result_dtype = self.__get_dtype(op.result.type.element_type)
+        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
         stack_dim = (result.shape[stack_axis], )
         result, = iterate_indexes_in_shapes(compute_index_slice, [stack_dim], [result], unroll_limit=5)
 
