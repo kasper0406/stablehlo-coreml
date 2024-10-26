@@ -169,6 +169,7 @@ def test_take():
 
 def test_gather():
     from jax.lax import GatherDimensionNumbers
+
     def wrapped_gather(dimension_numbers, slice_sizes):
         @jax.jit
         def internal_gather(operand, start_indices):
