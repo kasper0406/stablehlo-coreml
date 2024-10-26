@@ -3,13 +3,23 @@ import jax.numpy as jnp
 import equinox as eqx
 import equinox.internal as eqxi
 
-from tests.test_jax import run_and_compare
+from tests.test_jax import run_and_compare, run_and_compare_specific_input
 
 from functools import partial
 
 
+def run_and_compare_eqx_specific_input(model, inputs):
+    return run_and_compare_specific_input(
+        eqxi.finalise_fn(eqx.nn.inference_mode(model)),
+        inputs
+    )
+
+
 def run_and_compare_eqx(model, input_spec):
-    return run_and_compare(eqxi.finalise_fn(eqx.nn.inference_mode(model)), input_spec)
+    return run_and_compare(
+        eqxi.finalise_fn(eqx.nn.inference_mode(model)),
+        input_spec
+    )
 
 
 def test_conv_1d():
@@ -369,3 +379,11 @@ def test_weightnorm():
         wrapping_layer=eqx.nn.Conv2d(in_channels=12, out_channels=24, kernel_size=3, key=key),
     ))
     run_and_compare_eqx(model, (jnp.zeros((batch_size, 12, 31, 15)), ))
+
+
+def test_embedding():
+    key = jax.random.PRNGKey(0)
+    run_and_compare_eqx_specific_input(
+        jax.vmap(eqx.nn.Embedding(num_embeddings=5, embedding_size=10, key=key)),
+        (jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32), )
+    )

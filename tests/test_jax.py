@@ -161,6 +161,12 @@ def test_is_finite():
     run_and_compare_specific_input(jnp.isnan, input)
 
 
+def test_take():
+    run_and_compare_specific_input(jnp.take, (jnp.reshape(jnp.arange(24), (4, 6)), jnp.array([
+        [[0, 0], [1, 1], [2, 2]]
+    ], dtype=jnp.int32)))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []
