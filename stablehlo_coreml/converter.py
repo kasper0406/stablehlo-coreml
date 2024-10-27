@@ -124,38 +124,23 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_add(self, context: TranslationContext, op: AddOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.add(x=lhs, y=rhs)
-        context.add_result(op.result, cml_op)
+        self.__simple_binary_op(context, mb.add, op)
 
     @register_stablehlo_op
     def op_or(self, context: TranslationContext, op: OrOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.logical_or(x=lhs, y=rhs)
-        context.add_result(op.result, cml_op)
+        self.__simple_binary_op(context, mb.logical_or, op)
 
     @register_stablehlo_op
     def op_and(self, context: TranslationContext, op: AndOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.logical_and(x=lhs, y=rhs)
-        context.add_result(op.result, cml_op)
+        self.__simple_binary_op(context, mb.logical_and, op)
 
     @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.sub(x=lhs, y=rhs)
-        context.add_result(op.result, cml_op)
+        self.__simple_binary_op(context, mb.sub, op)
 
     @register_stablehlo_op
     def op_mul(self, context: TranslationContext, op: MulOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_op = mb.mul(x=lhs, y=rhs)
-        context.add_result(op.result, cml_op)
+        self.__simple_binary_op(context, mb.mul, op)
 
     @register_stablehlo_op
     def op_div(self, context: TranslationContext, op: DivOp):
@@ -189,21 +174,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_sign(self, context: TranslationContext, op: SignOp):
-        operand = context[op.operand.get_name()]
-        cml_op = mb.sign(x=operand)
-        context.add_result(op.result, cml_op)
+        self.__simple_unary_op(context, mb.sign, op)
 
     @register_stablehlo_op
     def op_abs(self, context: TranslationContext, op: AbsOp):
-        operand = context[op.operand.get_name()]
-        cml_op = mb.abs(x=operand)
-        context.add_result(op.result, cml_op)
+        self.__simple_unary_op(context, mb.abs, op)
 
     @register_stablehlo_op
     def op_log(self, context: TranslationContext, op: LogOp):
-        operand = context[op.operand.get_name()]
-        cml_op = mb.log(x=operand)
-        context.add_result(op.result, cml_op)
+        self.__simple_unary_op(context, mb.log, op)
 
     @register_stablehlo_op
     def op_log1p(self, context: TranslationContext, op: Log1pOp):
@@ -215,9 +194,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_exp(self, context: TranslationContext, op: ExpOp):
-        operand = context[op.operand.get_name()]
-        cml_op = mb.exp(x=operand)
-        context.add_result(op.result, cml_op)
+        self.__simple_unary_op(context, mb.exp, op)
 
     @register_stablehlo_op
     def op_expm1(self, context: TranslationContext, op: Expm1Op):
@@ -234,9 +211,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_sqrt(self, context: TranslationContext, op: SqrtOp):
-        operand = context[op.operand.get_name()]
-        cml_op = mb.sqrt(x=operand)
-        context.add_result(op.result, cml_op)
+        self.__simple_unary_op(context, mb.sqrt, op)
 
     @register_stablehlo_op
     def op_constant(self, context: TranslationContext, op: ConstantOp):
@@ -608,47 +583,31 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_max(self, context: TranslationContext, op: MaxOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_res = mb.maximum(x=lhs, y=rhs)
-        context.add_result(op.result, cml_res)
+        self.__simple_binary_op(context, mb.maximum, op)
 
     @register_stablehlo_op
     def op_min(self, context: TranslationContext, op: MinOp):
-        lhs = context[op.lhs.get_name()]
-        rhs = context[op.rhs.get_name()]
-        cml_res = mb.minimum(x=lhs, y=rhs)
-        context.add_result(op.result, cml_res)
+        self.__simple_binary_op(context, mb.minimum, op)
 
     @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.rsqrt(x=x)
-        context.add_result(op.result, mil_res)
+        self.__simple_unary_op(context, mb.rsqrt, op)
 
     @register_stablehlo_op
     def op_tanh(self, context: TranslationContext, op: TanhOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.tanh(x=x)
-        context.add_result(op.result, mil_res)
+        self.__simple_unary_op(context, mb.tanh, op)
 
     @register_stablehlo_op
     def op_sine(self, context: TranslationContext, op: SineOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.sin(x=x)
-        context.add_result(op.result, mil_res)
+        self.__simple_unary_op(context, mb.sin, op)
 
     @register_stablehlo_op
     def op_cosine(self, context: TranslationContext, op: CosineOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.cos(x=x)
-        context.add_result(op.result, mil_res)
+        self.__simple_unary_op(context, mb.cos, op)
 
     @register_stablehlo_op
     def op_tan(self, context: TranslationContext, op: TanOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.tan(x=x)
-        context.add_result(op.result, mil_res)
+        self.__simple_unary_op(context, mb.tan, op)
 
     @register_stablehlo_op
     def op_atan2(self, context: TranslationContext, op: Atan2Op):
@@ -944,6 +903,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.pop_function()
 
         return outputs
+
+    def __simple_unary_op(self, context: TranslationContext, mil_op, hlo_op):
+        operand = context[hlo_op.operand.get_name()]
+        cml_op = mil_op(x=operand)
+        context.add_result(hlo_op.result, cml_op)
+
+    def __simple_binary_op(self, context: TranslationContext, mil_op, hlo_op):
+        lhs = context[hlo_op.lhs.get_name()]
+        rhs = context[hlo_op.rhs.get_name()]
+        cml_op = mil_op(x=lhs, y=rhs)
+        context.add_result(hlo_op.result, cml_op)
 
     def __compute_reduction(self, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
         def match_reduction_type(hlo_body):
