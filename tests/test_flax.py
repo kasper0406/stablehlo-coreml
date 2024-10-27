@@ -2,7 +2,7 @@ import jax
 from flax import nnx
 import jax.numpy as jnp
 
-from tests.test_jax import run_and_compare, run_and_compare_specific_input
+from tests.utils import run_and_compare, run_and_compare_specific_input
 
 from tests.flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
 from tests.flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
