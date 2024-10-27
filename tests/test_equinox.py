@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import equinox.internal as eqxi
 
-from tests.test_jax import run_and_compare, run_and_compare_specific_input
+from tests.utils import run_and_compare, run_and_compare_specific_input
 
 from functools import partial
 
@@ -387,3 +387,26 @@ def test_embedding():
         jax.vmap(eqx.nn.Embedding(num_embeddings=5, embedding_size=10, key=key)),
         (jnp.array([0, 1, 2, 3, 4], dtype=jnp.int32), )
     )
+
+
+def test_mlp():
+    model = jax.vmap(eqx.nn.MLP(
+        in_size=10,
+        out_size=20,
+        width_size=30,
+        depth=3,
+        key=jax.random.PRNGKey(0))
+    )
+    input_spec = (jnp.zeros((20, 10)), )
+    run_and_compare_eqx(model, input_spec)
+
+
+def test_sequential():
+    model = jax.vmap(eqx.nn.Sequential(
+        [
+            eqx.nn.Linear(in_features=10, out_features=20, key=jax.random.PRNGKey(0)),
+            eqx.nn.Lambda(jax.nn.relu),
+        ]
+    ))
+    input_spec = (jnp.zeros((20, 10)), )
+    run_and_compare_eqx(model, input_spec)
