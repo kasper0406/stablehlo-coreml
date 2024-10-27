@@ -161,6 +161,80 @@ def test_is_finite():
     run_and_compare_specific_input(jnp.isnan, input)
 
 
+# Unfortunately this test currently fails due to https://github.com/llvm/llvm-project/pull/113064
+# def test_take():
+#     run_and_compare_specific_input(jnp.take, (jnp.reshape(jnp.arange(24), (4, 6)), jnp.array([
+#         [[0, 0], [1, 1], [2, 2]]
+#     ], dtype=jnp.int32)))
+
+
+def test_gather():
+    from jax.lax import GatherDimensionNumbers
+
+    def wrapped_gather(dimension_numbers, slice_sizes):
+        @jax.jit
+        def internal_gather(operand, start_indices):
+            return jax.lax.gather(
+                operand=operand,
+                start_indices=start_indices,
+                dimension_numbers=dimension_numbers,
+                slice_sizes=slice_sizes,
+            )
+        return internal_gather
+
+    operand = jnp.reshape(jnp.arange(8000), (10, 8, 5, 20))
+    start_indices = jnp.array([
+        [1, 1], [3, 1], [1, 10], [4, 15],
+    ], dtype=jnp.int32)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(0, 1),
+        collapsed_slice_dims=(0, 2,),
+        start_index_map=(1, 3, )
+    )
+
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 2, 1, 3)), (operand, start_indices))
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 3, 1, 4)), (operand, start_indices))
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 3, 1, 7)), (operand, start_indices))
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 8, 1, 2)), (operand, start_indices))
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(1, 2),
+        collapsed_slice_dims=(0, 2,),
+        start_index_map=(1, 3, )
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 3, 1, 4)), (operand, start_indices))
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(0, 2),
+        collapsed_slice_dims=(0, 2,),
+        start_index_map=(1, 3, )
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 3, 1, 4)), (operand, start_indices))
+
+    operand = jnp.reshape(jnp.arange(50), (5, 10))
+    start_indices = jnp.array([
+        [0, 1], [1, 0], [0, 0], [2, 6], [4, 2]
+    ], dtype=jnp.int32)
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(1, 2),
+        collapsed_slice_dims=tuple(),
+        start_index_map=(0, 1)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 10)), (operand, start_indices))
+
+    operand = jnp.reshape(jnp.arange(500), (5, 2, 5, 10))
+    start_indices = jnp.array([
+        [0, 1, 4], [1, 0, 8], [0, 0, 2], [2, 6, 1], [4, 2, 0]
+    ], dtype=jnp.int32)
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(0, 1, 2, 3),
+        collapsed_slice_dims=tuple(),
+        start_index_map=(0, 1, 2)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 2, 4)), (operand, start_indices))
+
+
 def jax_export(jax_func, input_spec):
     def compute_input_shapes(input_specs):
         shapes = []

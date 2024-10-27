@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, ReverseOp, IsFiniteOp,
+    OrOp, AndOp, ReverseOp, IsFiniteOp, GatherOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -814,6 +814,80 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         dtype = types.nptype_from_builtin(self.__get_dtype(op.result.type.element_type))
         res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
         context.add_result(op.result, res)
+
+    @register_stablehlo_op
+    def op_gather(self, context: TranslationContext, op: GatherOp):
+        """
+        Calculates special cases of the GatherOp. Assumes no backing dims, and
+        that the index_vector_dim is always the last indexing dimension.
+
+        TODO(knielsen): Consider if this can be done in a more efficient way
+        """
+        start_indices = context[op.start_indices.get_name()]
+        operand = context[op.operand.get_name()]
+
+        operand_rank = len(operand.shape)
+        start_indices_rank = len(start_indices.shape)
+
+        dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
+        if dim_numbers.operand_batching_dims != []:
+            raise ValueError("Batched Gather is not supported!")
+        if dim_numbers.index_vector_dim != start_indices_rank - 1:
+            raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
+
+        result_rank = operand_rank - len(dim_numbers.collapsed_slice_dims) + 1
+        assert result_rank == len(op.result.type.shape)
+
+        stack_axis = result_rank - 1
+        for stack_dim, (offset_dim, result_dim) in enumerate(zip(dim_numbers.offset_dims, range(result_rank))):
+            if offset_dim != result_dim:
+                stack_axis = stack_dim
+                break
+
+        slice_sizes = op.slice_sizes
+
+        def compute_index_slice(slice_idx, *partial_results):
+            partial_results = partial_results[0]
+
+            slice_start = []
+            slice_end = []
+
+            for operand_dim in range(operand_rank):
+                if operand_dim in dim_numbers.start_index_map:
+                    start_index_dim = dim_numbers.start_index_map.index(operand_dim)
+                    elements = operand.shape[operand_dim]
+
+                    start_index = index_by_slices(start_indices, (slice_idx, start_index_dim))
+                    start_index = mb.reshape(x=start_index, shape=(1,))
+
+                    actual_start_index = mb.maximum(x=mb.minimum(x=start_index, y=elements - slice_sizes[operand_dim]), y=0)
+                    end_index = mb.add(x=actual_start_index, y=slice_sizes[operand_dim])
+                    slice_start.append(actual_start_index)
+                    slice_end.append(end_index)
+                elif operand_dim in dim_numbers.collapsed_slice_dims:
+                    slice_start.append(mb.reshape(x=0, shape=(1,)))
+                    slice_end.append(mb.reshape(x=1, shape=(1,)))
+                else:
+                    slice_start.append(mb.reshape(x=0, shape=(1,)))
+                    slice_end.append(mb.reshape(x=slice_sizes[operand_dim], shape=(1,)))
+
+            selected_slice = mb.slice_by_index(
+                x=operand,
+                begin=mb.concat(values=slice_start, axis=0),
+                end=mb.concat(values=slice_end, axis=0),
+            )
+            if len(dim_numbers.collapsed_slice_dims) > 0:
+                selected_slice = mb.squeeze(x=selected_slice, axes=dim_numbers.collapsed_slice_dims)
+
+            update_slice_spec = [slice_idx if dim == stack_axis else slice(None) for dim in range(result_rank)]
+            return [update_tensor_by_slice(partial_results, update_slice_spec, selected_slice)]
+
+        result_dtype = self.__get_dtype(op.result.type.element_type)
+        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
+        stack_dim = (result.shape[stack_axis], )
+        result, = iterate_indexes_in_shapes(compute_index_slice, [stack_dim], [result], unroll_limit=5)
+
+        context.add_result(op.result, result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
