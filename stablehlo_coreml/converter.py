@@ -297,7 +297,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     assert idx_result.shape == (1, 1)
                     # This is a special case, where the result is a scalar of shape (1, 1)
                     # In order to not end up with a 0-rank tensor, we only contract one dimension
-                    idx_result = mb.squeeze(x=idx_result, axes=(-1, ))
+                    idx_result = mb.reshape(x=idx_result, shape=(1,))
                 else:
                     idx_result = mb.squeeze(x=idx_result, axes=(-1, -2))
             elif len(lhs_result_dim) == 0:
