@@ -45,8 +45,8 @@ packages = ["stablehlo_coreml"]
 python = ["3.10", "3.11"]
 
 [tool.hatch.envs.test]
-randomize = true
-parallel = true
+# randomize = true
+# parallel = true
 
 extra-dependencies = [
     "pytest",
