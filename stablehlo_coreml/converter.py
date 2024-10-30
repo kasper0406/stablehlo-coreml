@@ -682,7 +682,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                mb.pad(x=input, pad=padding, constant_val=init_value)
+                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
