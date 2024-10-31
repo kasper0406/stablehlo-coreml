@@ -58,6 +58,21 @@ extra-dependencies = [
     "equinox",
 ]
 
+[[tool.hatch.envs.test-pytorch.matrix]]
+python = ["3.10", "3.11"]
+
+[tool.hatch.envs.test-pytorch]
+randomize = true
+parallel = true
+
+extra-dependencies = [
+    "pytest",
+    "torch",
+    "torchvision",
+    "torch_xla2",
+    "transformers",
+]
+
 [project.urls]
 Homepage = "https://github.com/kasper0406/stablehlo-coreml"
 Issues = "https://github.com/kasper0406/stablehlo-coreml/issues"

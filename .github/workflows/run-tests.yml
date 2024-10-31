@@ -37,4 +37,7 @@ jobs:
         flake8 . --count --show-source --statistics --max-line-length=127
     - name: Test with hatch
       run: |
-        hatch -v run +py=${{ matrix.python-version }} test:pytest tests
+        hatch run +py=${{ matrix.python-version }} test:pytest -vv --ignore=tests/pytorch tests
+    - name: Test pytorch export
+      run: |
+        hatch run +py=${{ matrix.python-version }} test-pytorch:pytest -vv tests/pytorch/test_pytorch.py
