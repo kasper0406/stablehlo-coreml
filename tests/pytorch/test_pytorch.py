@@ -1,10 +1,12 @@
-import torch
-import torchvision
+import pytest
+
+torch = pytest.importorskip("torch")
+torchvision = pytest.importorskip("torchvision")
+torch_xla2 = pytest.importorskip("torch_xla2")
 
 import jax
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
-from torch_xla2 import export
 
 from tests.utils import run_and_compare_hlo_module, flatten
 
@@ -13,8 +15,8 @@ def export_to_stablehlo_module(pytorch_model, inputs):
     pytorch_model.eval()
 
     exported = torch.export.export(pytorch_model, inputs)
-    weights, func = export.exported_program_to_jax(exported)
-    jax_avals = export.extract_avals(exported)
+    weights, func = torch_xla2.export.exported_program_to_jax(exported)
+    jax_avals = torch_xla2.export.extract_avals(exported)
 
     @jax.jit
     def wrapped_weights_func(*inputs):
