@@ -1,14 +1,14 @@
 import pytest
 
-torch = pytest.importorskip("torch")
-torchvision = pytest.importorskip("torchvision")
-torch_xla2 = pytest.importorskip("torch_xla2")
-
 import jax
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 
 from tests.utils import run_and_compare_hlo_module, flatten
+
+torch = pytest.importorskip("torch")
+torchvision = pytest.importorskip("torchvision")
+torch_xla2 = pytest.importorskip("torch_xla2")
 
 
 def export_to_stablehlo_module(pytorch_model, inputs):
