@@ -94,19 +94,7 @@ def _count_program_complexity(mil_program: Program):
     return total_complexity
 
 
-def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_000):
-    """
-    Converts the given `jax_func` to a CoreML model.
-    If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
-    The resulting CoreML model will be returned.
-    """
-
-    jax_func = jax.jit(jax_func)
-    exported = jax_export(jax_func, inputs)
-    context = jax_mlir.make_ir_context()
-    hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
-    # print(f"HLO module: {hlo_module}")
-
+def run_and_compare_hlo_module(hlo_module, inputs, expected_outputs, max_complexity: int = 10_000):
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
     program_complexity = _count_program_complexity(mil_program)
     if program_complexity > max_complexity:
@@ -131,27 +119,41 @@ def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_00
 
     # Generate random inputs that matches cml_model input spec
     cml_input_key_values = {}
-    jax_input_values = []
     for input_name, input_value in zip(cml_model.input_description, flatten(inputs)):
         cml_input_key_values[input_name] = input_value
-        jax_input_values.append(input_value)
-
-    # Transfor the input to match the Jax model, and call it
-    jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, jax_input_values)
-    expected_output = jax_func(*jax_input_values)
 
     # TODO(knielsen): Is there a nicer way of doing this?
-    if not isinstance(expected_output, (list, tuple)):
-        expected_output = (expected_output, )
+    if not isinstance(expected_outputs, (list, tuple)):
+        expected_outputs = (expected_outputs, )
 
     # Prepare the output for comparison
     cml_expected_outputs = {}
-    for output_name, output_value in zip(cml_model.output_description, flatten(expected_output)):
+    for output_name, output_value in zip(cml_model.output_description, flatten(expected_outputs)):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
     compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
 
     return cml_model
+
+
+def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_000):
+    """
+    Converts the given `jax_func` to a CoreML model.
+    If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
+    The resulting CoreML model will be returned.
+    """
+
+    jax_func = jax.jit(jax_func)
+    exported = jax_export(jax_func, inputs)
+    context = jax_mlir.make_ir_context()
+    hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
+    # print(f"HLO module: {hlo_module}")
+
+    # Transfor the input to match the Jax model, and call it
+    jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, flatten(inputs))
+    expected_output = jax_func(*jax_input_values)
+
+    return run_and_compare_hlo_module(hlo_module, inputs, expected_output, max_complexity=max_complexity)
 
 
 def run_and_compare(jax_func, input_specification, max_complexity: int = 10_000):
