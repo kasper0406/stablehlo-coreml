@@ -8,15 +8,15 @@ from tests.utils import run_and_compare_hlo_module, flatten
 
 torch = pytest.importorskip("torch")
 torchvision = pytest.importorskip("torchvision")
-torch_xla2 = pytest.importorskip("torch_xla2")
+torch_xla2_export = pytest.importorskip("torch_xla2.export")
 
 
 def export_to_stablehlo_module(pytorch_model, inputs):
     pytorch_model.eval()
 
     exported = torch.export.export(pytorch_model, inputs)
-    weights, func = torch_xla2.export.exported_program_to_jax(exported)
-    jax_avals = torch_xla2.export.extract_avals(exported)
+    weights, func = torch_xla2_export.exported_program_to_jax(exported)
+    jax_avals = torch_xla2_export.extract_avals(exported)
 
     @jax.jit
     def wrapped_weights_func(*inputs):
