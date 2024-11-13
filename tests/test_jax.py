@@ -226,3 +226,10 @@ def test_gather():
         start_index_map=(0, 1, 2)
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 2, 4)), (operand, start_indices))
+
+
+def test_right_shift():
+    values = jnp.array([-1, -2, -4, -8, 0, 8], dtype=jnp.int32)
+    shift_amount = jnp.array([1, 2, 3, 4, 2, 3], dtype=jnp.int32)
+    run_and_compare_specific_input(jax.lax.shift_right_arithmetic, (values, shift_amount))
+    run_and_compare_specific_input(jax.lax.shift_right_logical, (values, shift_amount))

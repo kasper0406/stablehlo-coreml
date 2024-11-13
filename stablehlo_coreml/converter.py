@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, ReverseOp, IsFiniteOp, GatherOp,
+    OrOp, AndOp, ReverseOp, IsFiniteOp, GatherOp, ShiftRightLogicalOp, ShiftRightArithmeticOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -847,6 +847,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
         stack_dim = (result.shape[stack_axis], )
         result, = iterate_indexes_in_shapes(compute_index_slice, [stack_dim], [result], unroll_limit=5)
+
+        context.add_result(op.result, result)
+
+    @register_stablehlo_op
+    def op_shift_right_logical(self, context: TranslationContext, op: ShiftRightLogicalOp):
+        values = context[op.lhs.get_name()]
+        shifts = context[op.rhs.get_name()]
+
+        # TODO(knielsen): Figure out if this always works...
+
+        bit_width = values.dtype._width  # TODO(knielsen): Do something not using internal API?
+        offset = 2 << bit_width
+
+        negative_values = mb.less(x=values, y=0)
+        values = mb.select(cond=negative_values, a=mb.add(x=values, y=offset), b=values)
+        result = mb.floor_div(x=values, y=mb.exp2(x=shifts))
+        
+        result = mb.select(cond=negative_values, a=mb.mul(x=result, y=2), b=result)
+
+        context.add_result(op.result, result)
+    
+    @register_stablehlo_op
+    def op_shift_right_arithmetic(self, context: TranslationContext, op: ShiftRightArithmeticOp):
+        values = context[op.lhs.get_name()]
+        shifts = context[op.rhs.get_name()]
+
+        result = mb.floor_div(x=values, y=mb.exp2(x=shifts))
 
         context.add_result(op.result, result)
 
