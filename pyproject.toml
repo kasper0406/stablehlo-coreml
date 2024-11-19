@@ -50,7 +50,8 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "jax",
+    "jax @ https://storage.googleapis.com/jax-releases/nightly/jax/jax-0.4.36.dev20241119-py3-none-any.whl",
+    "jaxlib @ https://storage.googleapis.com/jax-releases/nightly/mac/jaxlib-0.4.36.dev20241119-cp311-cp311-macosx_11_0_arm64.whl",
     "flax>=0.9.0",
     "flatbuffers",
     "einops",

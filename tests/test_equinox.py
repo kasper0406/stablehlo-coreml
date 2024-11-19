@@ -282,24 +282,26 @@ def test_groupnorm():
     )
 
 
-# Unfortunately this test currently fails due to https://github.com/llvm/llvm-project/pull/113064
-# def test_batchnorm():
-#     batch_size = 3
-#     input_shape = (4, 12)
+def test_batchnorm():
+    batch_size = 3
+    input_shape = (4, 12)
+    
+    class Model(eqx.Module):
+        batch_norm: eqx.nn.BatchNorm
 
-#     class Model(eqx.Module):
-#         batch_norm: eqx.nn.BatchNorm
+        def __init__(self, input_size: int, axis_name: str):
+            self.batch_norm = eqx.nn.BatchNorm(
+                input_size=input_size,
+                axis_name=axis_name,
+            )
 
-#         def __init__(self, wrapping_layer: eqx.Module, key: jax.random.PRNGKey):
-#             self.v = eqx.nn.BatchNorm(input_size=4, axis_name="batch")
+        def __call__(self, x, state):
+            out, _state = self.batch_norm(x, state)
+            return out
 
-#         def __call__(self, x, state):
-#             out, _state = self.batch_norm(x, state)
-#             return out
-
-#     model, state = eqx.nn.make_with_state(eqx.nn.BatchNorm)(input_size=4, axis_name="batch")
-#     batched_model = jax.vmap(partial(model, state=state), axis_name="batch")
-#     run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, *input_shape)), ))
+    model, state = eqx.nn.make_with_state(Model)(input_size=4, axis_name="batch")
+    batched_model = jax.vmap(partial(model, state=state), axis_name="batch")
+    run_and_compare_eqx(batched_model, (jnp.zeros((batch_size, *input_shape)), ))
 
 
 def test_spectralnorm():
