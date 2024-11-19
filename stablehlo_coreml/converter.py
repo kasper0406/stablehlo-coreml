@@ -798,21 +798,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
-        # result_rank = operand_rank - len(dim_numbers.collapsed_slice_dims) + 1
-        # assert result_rank == len(op.result.type.shape)
         result_rank = len(op.result.type.shape)
 
-        # stack_axis = result_rank - 1
-        # for stack_dim, (offset_dim, result_dim) in enumerate(zip(dim_numbers.offset_dims, range(result_rank))):
-        #     if offset_dim != result_dim:
-        #         stack_axis = stack_dim
-        #         break
-
-        stack_axes = []
+        result_iteration_axes = []
         for maybe_stack_axis in range(result_rank):
             if maybe_stack_axis not in dim_numbers.offset_dims:
-                stack_axes.append(maybe_stack_axis)
-
+                result_iteration_axes.append(maybe_stack_axis)
 
         slice_sizes = op.slice_sizes
 
@@ -827,8 +818,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     start_index_dim = dim_numbers.start_index_map.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
-                    start_index_slice = [*slice_idx, start_index_dim]
-                    start_index = index_by_slices(start_indices, start_index_slice)
+                    start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
                     start_index = mb.reshape(x=start_index, shape=(1,))
 
                     actual_start_index = mb.maximum(x=mb.minimum(x=start_index, y=elements - slice_sizes[operand_dim]), y=0)
@@ -850,12 +840,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if len(dim_numbers.collapsed_slice_dims) > 0:
                 selected_slice = mb.squeeze(x=selected_slice, axes=dim_numbers.collapsed_slice_dims)
 
-            # update_slice_spec = [slice_idx[] if dim in stack_axes else slice(None) for dim in range(result_rank)]
+            # Figure out which result to update
             update_slice_spec = []
             stack_axes_idx = 0
             for output_dim in range(result_rank):
-                if output_dim in stack_axes:
-                    update_slice_spec.append(slice_idx[stack_axes_idx])
+                if output_dim in result_iteration_axes:
+                    result_idx = mb.gather(x=slice_idx, indices=[stack_axes_idx])
+                    update_slice_spec.append(result_idx)
                     stack_axes_idx += 1
                 else:
                     update_slice_spec.append(slice(None))
@@ -863,8 +854,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         result_dtype = self.__get_dtype(op.result.type.element_type)
         result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
-        stack_dims = [result.shape[stack_axis] for stack_axis in stack_axes]
-        result, = iterate_indexes_in_shapes(compute_index_slice, [stack_dims], [result], unroll_limit=100)
+        result_iteration_shape = [result.shape[stack_axis] for stack_axis in result_iteration_axes]
+        result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
         context.add_result(op.result, result)
 
