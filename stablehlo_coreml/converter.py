@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, ReverseOp, IsFiniteOp, GatherOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -135,6 +135,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.logical_and, op)
 
     @register_stablehlo_op
+    def op_not(self, context: TranslationContext, op: NotOp):
+        self.__simple_unary_op(context, mb.logical_not, op)
+
+    @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
         self.__simple_binary_op(context, mb.sub, op)
 
@@ -195,6 +199,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_exp(self, context: TranslationContext, op: ExpOp):
         self.__simple_unary_op(context, mb.exp, op)
+
+    @register_stablehlo_op
+    def op_pow(self, context: TranslationContext, op: PowOp):
+        self.__simple_binary_op(context, mb.pow, op)
 
     @register_stablehlo_op
     def op_expm1(self, context: TranslationContext, op: Expm1Op):
@@ -261,7 +269,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(result_shape) == 0:
             # Special case for scalar result
             result_shape = [1]
-        result = mb.fill(shape=result_shape)
+
+        # Allocate memory of the correct type for the result
+        result_dtype = self.__get_dtype(op.result.type.element_type)
+        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
 
         def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
@@ -792,20 +803,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
         if dim_numbers.operand_batching_dims != []:
-            raise ValueError("Batched Gather is not supported!")
+            raise ValueError("Batched operand dims gather is not supported!")
+        if dim_numbers.start_indices_batching_dims != []:
+            raise ValueError("Batched start indices gather is not supported!")
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
-        result_rank = operand_rank - len(dim_numbers.collapsed_slice_dims) + 1
-        assert result_rank == len(op.result.type.shape)
-
-        stack_axis = result_rank - 1
-        for stack_dim, (offset_dim, result_dim) in enumerate(zip(dim_numbers.offset_dims, range(result_rank))):
-            if offset_dim != result_dim:
-                stack_axis = stack_dim
-                break
-
+        result_rank = len(op.result.type.shape)
         slice_sizes = op.slice_sizes
+        result_iteration_axes = [axis for axis in range(result_rank) if axis not in dim_numbers.offset_dims]
 
         def compute_index_slice(slice_idx, *partial_results):
             partial_results = partial_results[0]
@@ -818,7 +824,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     start_index_dim = dim_numbers.start_index_map.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
-                    start_index = index_by_slices(start_indices, (slice_idx, start_index_dim))
+                    start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
                     start_index = mb.reshape(x=start_index, shape=(1,))
 
                     actual_start_index = mb.maximum(x=mb.minimum(x=start_index, y=elements - slice_sizes[operand_dim]), y=0)
@@ -840,13 +846,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if len(dim_numbers.collapsed_slice_dims) > 0:
                 selected_slice = mb.squeeze(x=selected_slice, axes=dim_numbers.collapsed_slice_dims)
 
-            update_slice_spec = [slice_idx if dim == stack_axis else slice(None) for dim in range(result_rank)]
+            # Figure out which result to update
+            update_slice_spec = []
+            stack_axes_idx = 0
+            for output_dim in range(result_rank):
+                if output_dim in result_iteration_axes:
+                    result_idx = mb.gather(x=slice_idx, indices=[stack_axes_idx])
+                    update_slice_spec.append(result_idx)
+                    stack_axes_idx += 1
+                else:
+                    update_slice_spec.append(slice(None))
             return [update_tensor_by_slice(partial_results, update_slice_spec, selected_slice)]
 
         result_dtype = self.__get_dtype(op.result.type.element_type)
         result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
-        stack_dim = (result.shape[stack_axis], )
-        result, = iterate_indexes_in_shapes(compute_index_slice, [stack_dim], [result], unroll_limit=5)
+        result_iteration_shape = [result.shape[stack_axis] for stack_axis in result_iteration_axes]
+        result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
         context.add_result(op.result, result)
 
@@ -1052,14 +1067,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # TODO(knielsen): Add additional types
         return {
             types.int32: "int32",
+            types.uint32: "uint32",
+            types.int16: "int16",
+            types.uint16: "uint16",
+            types.int8: "int8",
+            types.uint8: "uint8",
             types.fp16: "fp16",
             types.fp32: "fp32",
+            types.bool: "bool",
         }[type]
 
     def __get_dtype(self, element_type):
         if isinstance(element_type, ir.IntegerType):
-            # TODO(knielsen): Handle different kinds of integer types
-            return types.int32
+            match (element_type.width, element_type.is_unsigned):
+                case (32, False):
+                    return types.int32
+                case (32, True):
+                    return types.uint32
+                case (16, False):
+                    return types.int16
+                case (16, True):
+                    return types.uint16
+                case (8, False):
+                    return types.int8
+                case (8, True):
+                    return types.uint8
+                case (1, _):
+                    return types.bool
         if isinstance(element_type, ir.F16Type):
             return types.fp16
         if isinstance(element_type, ir.F32Type):

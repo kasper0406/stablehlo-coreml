@@ -100,7 +100,7 @@ def run_and_compare_hlo_module(hlo_module, inputs, expected_outputs, max_complex
     if program_complexity > max_complexity:
         raise ValueError(
             f"Generated a MIL program with complexity {program_complexity}, "
-            "max allowed complexity is {max_complexity}"
+            f"max allowed complexity is {max_complexity}"
         )
 
     pipeline = DEFAULT_HLO_PIPELINE
