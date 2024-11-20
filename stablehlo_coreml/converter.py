@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, ReverseOp, IsFiniteOp, GatherOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -133,6 +133,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_and(self, context: TranslationContext, op: AndOp):
         self.__simple_binary_op(context, mb.logical_and, op)
+    
+    @register_stablehlo_op
+    def op_not(self, context: TranslationContext, op: NotOp):
+        self.__simple_unary_op(context, mb.logical_not, op)
 
     @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
@@ -195,6 +199,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_exp(self, context: TranslationContext, op: ExpOp):
         self.__simple_unary_op(context, mb.exp, op)
+    
+    @register_stablehlo_op
+    def op_pow(self, context: TranslationContext, op: PowOp):
+        self.__simple_binary_op(context, mb.pow, op)
 
     @register_stablehlo_op
     def op_expm1(self, context: TranslationContext, op: Expm1Op):
@@ -261,7 +269,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(result_shape) == 0:
             # Special case for scalar result
             result_shape = [1]
-        result = mb.fill(shape=result_shape)
+
+        # Allocate memory of the correct type for the result
+        result_dtype = self.__get_dtype(op.result.type.element_type)
+        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
 
         def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
@@ -1063,6 +1074,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             types.int32: "int32",
             types.fp16: "fp16",
             types.fp32: "fp32",
+            types.bool: "bool",
         }[type]
 
     def __get_dtype(self, element_type):
