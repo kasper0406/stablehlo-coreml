@@ -133,7 +133,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_and(self, context: TranslationContext, op: AndOp):
         self.__simple_binary_op(context, mb.logical_and, op)
-    
+
     @register_stablehlo_op
     def op_not(self, context: TranslationContext, op: NotOp):
         self.__simple_unary_op(context, mb.logical_not, op)
@@ -199,7 +199,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_exp(self, context: TranslationContext, op: ExpOp):
         self.__simple_unary_op(context, mb.exp, op)
-    
+
     @register_stablehlo_op
     def op_pow(self, context: TranslationContext, op: PowOp):
         self.__simple_binary_op(context, mb.pow, op)
