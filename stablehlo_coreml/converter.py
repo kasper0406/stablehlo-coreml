@@ -139,10 +139,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_unary_op(context, mb.logical_not, op)
 
     @register_stablehlo_op
-    def op_not(self, context: TranslationContext, op: NotOp):
-        self.__simple_unary_op(context, mb.logical_not, op)
-
-    @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
         self.__simple_binary_op(context, mb.sub, op)
 
@@ -204,10 +200,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_exp(self, context: TranslationContext, op: ExpOp):
         self.__simple_unary_op(context, mb.exp, op)
     
-    @register_stablehlo_op
-    def op_pow(self, context: TranslationContext, op: PowOp):
-        self.__simple_binary_op(context, mb.pow, op)
-
     @register_stablehlo_op
     def op_pow(self, context: TranslationContext, op: PowOp):
         self.__simple_binary_op(context, mb.pow, op)
