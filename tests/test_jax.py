@@ -225,12 +225,12 @@ def test_gather():
         start_index_map=(0, 1, 2)
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 2, 4)), (operand, start_indices))
-    
+
     operand = jnp.reshape(jnp.arange(50), (10, 5))
     start_indices = jnp.array([
         [[3], [1], [7]],
         [[4], [0], [9]]
-    ], dtype=jnp.int32) # (2, 3, 1)
+    ], dtype=jnp.int32)  # (2, 3, 1)
 
     dimension_numbers = GatherDimensionNumbers(
         offset_dims=(2,),

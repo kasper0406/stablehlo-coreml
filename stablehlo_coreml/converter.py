@@ -139,6 +139,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_unary_op(context, mb.logical_not, op)
 
     @register_stablehlo_op
+    def op_not(self, context: TranslationContext, op: NotOp):
+        self.__simple_unary_op(context, mb.logical_not, op)
+
+    @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
         self.__simple_binary_op(context, mb.sub, op)
 
@@ -200,6 +204,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_exp(self, context: TranslationContext, op: ExpOp):
         self.__simple_unary_op(context, mb.exp, op)
     
+    @register_stablehlo_op
+    def op_pow(self, context: TranslationContext, op: PowOp):
+        self.__simple_binary_op(context, mb.pow, op)
+
     @register_stablehlo_op
     def op_pow(self, context: TranslationContext, op: PowOp):
         self.__simple_binary_op(context, mb.pow, op)
@@ -810,13 +818,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
         result_rank = len(op.result.type.shape)
-
-        result_iteration_axes = []
-        for maybe_stack_axis in range(result_rank):
-            if maybe_stack_axis not in dim_numbers.offset_dims:
-                result_iteration_axes.append(maybe_stack_axis)
-
         slice_sizes = op.slice_sizes
+        result_iteration_axes = [axis for axis in range(result_rank) if axis not in dim_numbers.offset_dims]
 
         def compute_index_slice(slice_idx, *partial_results):
             partial_results = partial_results[0]
@@ -1072,6 +1075,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # TODO(knielsen): Add additional types
         return {
             types.int32: "int32",
+            types.uint32: "uint32",
+            types.int16: "int16",
+            types.uint16: "uint16",
+            types.int8: "int8",
+            types.uint8: "uint8",
             types.fp16: "fp16",
             types.fp32: "fp32",
             types.bool: "bool",
