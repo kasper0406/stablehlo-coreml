@@ -227,6 +227,19 @@ def test_gather():
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 2, 4)), (operand, start_indices))
 
+    operand = jnp.reshape(jnp.arange(50), (10, 5))
+    start_indices = jnp.array([
+        [[3], [1], [7]],
+        [[4], [0], [9]]
+    ], dtype=jnp.int32)  # (2, 3, 1)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2,),
+        collapsed_slice_dims=(0,),
+        start_index_map=(0,)
+    )
+
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
 def test_right_shift():
     values = jnp.array([-1, -2, -4, -8, 0, 8], dtype=jnp.int32)
