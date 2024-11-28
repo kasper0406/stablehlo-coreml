@@ -285,7 +285,7 @@ def test_groupnorm():
 def test_batchnorm():
     batch_size = 3
     input_shape = (4, 12)
-    
+
     class Model(eqx.Module):
         batch_norm: eqx.nn.BatchNorm
 
