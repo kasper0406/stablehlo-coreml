@@ -31,13 +31,8 @@ dependencies = [
     # However, the code relies on the mlir StableHLO python bindings, and currently they are not published to pip
     # and the only pre-built stand-alone library is only built for linux.
     # Onces https://github.com/openxla/stablehlo/issues/2346 is resolved, this dependency can be switch to stablehlo instead.
-    # "jax>=0.4.32",
-    "jax @ https://storage.googleapis.com/jax-releases/nightly/jax/jax-0.4.36.dev20241119-py3-none-any.whl",
-    "jaxlib @ https://storage.googleapis.com/jax-releases/nightly/mac/jaxlib-0.4.36.dev20241119-cp311-cp311-macosx_11_0_arm64.whl"
+    "jax>=0.4.36",
 ]
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.version]
 path = "stablehlo_coreml/__init__.py"
