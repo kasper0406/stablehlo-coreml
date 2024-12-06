@@ -43,7 +43,7 @@ def evaluate_pytorch_model(model, inputs):
         expected_outputs = [model_outputs[return_name] for return_name in model_outputs]
         expected_outputs = [output_tensor.detach().numpy() for output_tensor in flatten(expected_outputs)]
 
-    run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs)
+    run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000)
 
 
 def test_resnet18():
@@ -70,19 +70,18 @@ def test_efficientnet_b0():
     evaluate_pytorch_model(model, inputs)
 
 
-# Currently not testable due to https://github.com/llvm/llvm-project/pull/113064
-# def test_bert():
-#     from transformers import AutoModel, AutoTokenizer
-#
-#     model_name = "bert-base-uncased"
-#     model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16)
-#     tokenizer = AutoTokenizer.from_pretrained(model_name)
-#
-#     inputs = tokenizer("this is a test of bert", return_tensors="pt")
-#     inputs = tuple([inputs[name] for name in inputs])
-#     evaluate_pytorch_model(model, inputs)
+def test_bert():
+    from transformers import AutoModel, AutoTokenizer
 
-# Currently not testable due to https://github.com/llvm/llvm-project/pull/113064
+    model_name = "bert-base-uncased"
+    model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    inputs = tokenizer("this is a test of bert", return_tensors="pt")
+    inputs = tuple([inputs[name] for name in inputs])
+    evaluate_pytorch_model(model, inputs)
+
+# Currently fails due to: https://github.com/apple/coremltools/pull/2395
 # def test_gpt2():
 #     from transformers import AutoModel, AutoTokenizer
 #

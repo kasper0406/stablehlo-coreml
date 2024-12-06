@@ -234,14 +234,7 @@ def iterate_indexes_in_shapes(func, shapes: List, init_values: List, unroll_limi
             results = func(*indexes, *acc)
             return [mb.add(x=i, y=1)] + results
 
-        # TODO: Fix this in a nicer way!!!
-        fixed_init_values = []
-        for init_value in init_values:
-            if len(init_value.shape) == 0:
-                fixed_init_values.append(mb.reshape(x=init_value, shape=(1,)))
-            else:
-                fixed_init_values.append(init_value)
-
+        fixed_init_values = [fix_scalar_tensor(init_value) for init_value in init_values]
         results = mb.while_loop(_cond=cond, _body=body, loop_vars=[0] + fixed_init_values)[1:]  # Skip the counter
 
     return results

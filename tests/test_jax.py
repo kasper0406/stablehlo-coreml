@@ -154,11 +154,10 @@ def test_is_finite():
     run_and_compare_specific_input(jnp.isnan, input)
 
 
-# Unfortunately this test currently fails due to https://github.com/llvm/llvm-project/pull/113064
-# def test_take():
-#     run_and_compare_specific_input(jnp.take, (jnp.reshape(jnp.arange(24), (4, 6)), jnp.array([
-#         [[0, 0], [1, 1], [2, 2]]
-#     ], dtype=jnp.int32)))
+def test_take():
+    run_and_compare_specific_input(jnp.take, (jnp.reshape(jnp.arange(24), (4, 6)), jnp.array([
+        [[0, 0], [1, 1], [2, 2]]
+    ], dtype=jnp.int32)))
 
 
 def test_gather():
