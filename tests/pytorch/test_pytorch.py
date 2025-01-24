@@ -81,6 +81,7 @@ def test_bert():
     inputs = tuple([inputs[name] for name in inputs])
     evaluate_pytorch_model(model, inputs)
 
+
 def test_gpt2():
     from transformers import AutoModel, AutoTokenizer
 
