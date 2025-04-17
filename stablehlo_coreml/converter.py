@@ -55,7 +55,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             self.func_index[func.name.value] = func
 
         for func in module.body:
-            if "public" == func.visibility.value:
+            if func.sym_visibility is None or "public" == func.sym_visibility.value:
                 self.build_func(func)
 
         return self.prog
@@ -900,7 +900,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         in the TopKOp
         """
         x = context[op.operand.get_name()]
-        mil_res = mb.topk(x=x, k=op.k.value, ascending=not op.largest.value)
+        descending = op.largest is None or op.largest.value
+        mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
         return mil_res
 
     def __invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
