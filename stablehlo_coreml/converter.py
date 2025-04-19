@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -215,6 +215,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         operand = context[op.operand.get_name()]
         perm = np.array(op.permutation, dtype=np.int32)
         cml_op = mb.transpose(x=operand, perm=perm)
+        context.add_result(op.result, cml_op)
+
+    @register_stablehlo_op
+    def op_pad(self, context: TranslationContext, op: PadOp):
+        operand = context[op.operand.get_name()]
+
+        if not np.all(np.array(op.interior_padding) == 0):
+            raise ValueError("Interior padding is not supported")
+
+        operand_rank = len(op.operand.type.shape)
+        indices = np.arange(2 * operand_rank, dtype=np.int32)
+        pad = np.zeros_like(indices)
+        pad = mb.scatter_along_axis(
+            data=pad,
+            indices=indices[::2],
+            mode="update",
+            updates=np.array(op.edge_padding_low, dtype=np.int32)
+        )
+        pad = mb.scatter_along_axis(
+            data=pad,
+            indices=indices[1::2],
+            mode="update",
+            updates=np.array(op.edge_padding_high, dtype=np.int32)
+        )
+
+        cml_padding_value = context[op.padding_value.get_name()]
+        cml_op = mb.pad(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
