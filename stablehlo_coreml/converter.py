@@ -19,7 +19,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, ScatterOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -889,6 +889,80 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
         result_iteration_shape = [result.shape[stack_axis] for stack_axis in result_iteration_axes]
         result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
+
+        context.add_result(op.result, result)
+
+    @register_stablehlo_op
+    def op_scatter(self, context: TranslationContext, op: ScatterOp):
+        """
+        Calculates special cases of the ScatterOp. Assumes no backing dims, and
+        that the index_vector_dim is always the last indexing dimension.
+
+        TODO(knielsen): Consider if this can be done in a more efficient way
+        """
+        scatter_indices = context[op.scatter_indices.get_name()]
+
+        if len(list(op.inputs)) != 1:
+            raise ValueError("Only supports a single ScatterOp input in conversion")
+        input = context[list(op.inputs)[0].get_name()]
+
+        if len(list(op.updates)) != 1:
+            raise ValueError("Only supports a single ScatterOp update in conversion")
+        update = context[list(op.updates)[0].get_name()]
+
+        dim_numbers = hlo.ScatterDimensionNumbers(op.scatter_dimension_numbers)
+        if dim_numbers.input_batching_dims != []:
+            raise ValueError("Batched input dims scatter is not supported!")
+        if dim_numbers.scatter_indices_batching_dims != []:
+            raise ValueError("Batched scatter indices dims scatter is not supported!")
+        if dim_numbers.update_window_dims != []:
+            raise ValueError("Windowed update dims scatter is not supported!")
+        if dim_numbers.scattered_dims_to_operand_dims != np.arange(len(input.shape)).tolist():
+            raise ValueError("scattered dims must align with update dims!")
+        if dim_numbers.inserted_window_dims != np.arange(len(input.shape)).tolist():
+            raise ValueError("inserted window dims must align with input dims!")
+
+        scatter_indices = mb.squeeze(x=scatter_indices, axes=[dim_numbers.index_vector_dim])
+
+        # TODO(knielsen): Consider refactoring. Can maybe be combined with the reduction type sniffing
+        def match_update_mode(hlo_body):
+            if len(hlo_body.blocks) != 1:
+                return None, None
+
+            def get_operand_names(op):
+                return [operand.get_name() for operand in list(op.operands)]
+
+            arg_names = [arg.get_name() for arg in list(hlo_body.blocks[0].arguments)]
+            ops = list(hlo_body.blocks[0].operations)
+
+            # Case where the `update` value is returned directly
+            if len(ops) == 1 and isinstance(ops[0], ReturnOp) and get_operand_names(ops[0]) == [arg_names[1]]:
+                return "update"
+
+            # Handle other easy cases that are supported by mb.scatter
+            simple_matches = {
+                AddOp: "add",
+                SubtractOp: "sub",
+                MulOp: "mul",
+                DivOp: "div",
+                MaxOp: "max",
+                MinOp: "min",
+            }
+
+            for hlo_update_mode_op, mil_equivalent in simple_matches.items():
+                if len(ops) == 2 and isinstance(ops[0], hlo_update_mode_op) and isinstance(ops[1], ReturnOp):
+                    result_names = [res.get_name() for res in ops[0].results]
+                    if get_operand_names(ops[0]) == arg_names and get_operand_names(ops[1]) == result_names:
+                        return mil_equivalent
+
+            return None
+
+        update_mode = match_update_mode(op.update_computation)
+        if update_mode is None:
+            raise ValueError("Unsupported update mode for scatter operation")
+
+        # TODO(knielsen): Have a way of setting validate_indices to False/True
+        result = mb.scatter(data=input, indices=scatter_indices, updates=update, mode=update_mode, validate_indices=True)
 
         context.add_result(op.result, result)
 

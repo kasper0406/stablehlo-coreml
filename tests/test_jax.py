@@ -262,3 +262,47 @@ def test_pad():
 
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
+
+
+def test_scatter():
+    def scatter_set(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].set(updates)
+    run_and_compare(scatter_set, (jnp.zeros((30,)),))
+
+    def scatter_add(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].add(updates)
+    run_and_compare(scatter_add, (jnp.zeros((30,)),))
+
+    def scatter_sub(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].subtract(updates)
+    run_and_compare(scatter_sub, (jnp.zeros((30,)),))
+
+    def scatter_mul(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].multiply(updates)
+    run_and_compare(scatter_mul, (jnp.zeros((30,)),))
+
+    def scatter_div(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].divide(updates)
+    run_and_compare(scatter_div, (jnp.zeros((30,)),))
+
+    def scatter_max(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].max(updates)
+    run_and_compare(scatter_max, (jnp.zeros((30,)),))
+
+    def scatter_min(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].min(updates)
+    run_and_compare(scatter_min, (jnp.zeros((30,)),))
