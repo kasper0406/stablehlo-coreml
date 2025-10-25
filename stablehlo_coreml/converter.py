@@ -17,9 +17,9 @@ from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
     Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
-    MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
-    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    MaxOp, FloorOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp,
+    TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp,
+    ReduceWindowOp, OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -628,6 +628,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_min(self, context: TranslationContext, op: MinOp):
         self.__simple_binary_op(context, mb.minimum, op)
+
+    @register_stablehlo_op
+    def op_floor(self, context: TranslationContext, op: FloorOp):
+        self.__simple_unary_op(context, mb.floor, op)
 
     @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
