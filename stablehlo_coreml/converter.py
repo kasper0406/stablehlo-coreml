@@ -19,7 +19,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, FloorOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp,
     TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp,
-    ReduceWindowOp, OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    ReduceWindowOp, OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, ScatterOp, GatherOp,
+    PowOp, PadOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -895,6 +896,92 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
         context.add_result(op.result, result)
+
+    @register_stablehlo_op
+    def op_scatter(self, context: TranslationContext, op: ScatterOp):
+        # For now, we only support a simple version of scatter, where we are not scattering windows
+        # but only individual elements.
+        dim_numbers = hlo.ScatterDimensionNumbers(op.scatter_dimension_numbers)
+        if len(dim_numbers.update_window_dims) > 0:
+            raise ValueError("Scattering with `update_window_dims` is not supported")
+
+        # We only support a single operand and a single update tensor
+        if len(op.inputs) != 1 or len(op.updates) != 1:
+            raise ValueError("Scatter with multiple operands/updates is not supported")
+
+        operand = context[op.inputs[0].get_name()]
+        scatter_indices = context[op.scatter_indices.get_name()]
+        updates = context[op.updates[0].get_name()]
+
+        # We need to determine the update mode from the `update_computation` body.
+        def match_update_computation(body):
+            if len(body.blocks) != 1:
+                return None
+            ops = list(body.blocks[0].operations)
+            if len(ops) != 2 or not isinstance(ops[1], ReturnOp):
+                return None
+
+            update_op = ops[0]
+            if list(ops[1].operands) != list(update_op.results):
+                return None
+
+            # The first argument to the update function is the value from the original tensor,
+            # and the second is the value from the updates tensor.
+            # We only match if the op returns the second argument, which corresponds to 'update' mode.
+            if isinstance(update_op, ReturnOp):
+                 if update_op.operands[0] == body.blocks[0].arguments[1]:
+                     return "update"
+
+            # For other modes, we check the op type.
+            mode_map = {
+                AddOp: "add",
+                SubtractOp: "sub",
+                MulOp: "mul",
+                DivOp: "div",
+                MaxOp: "max",
+                MinOp: "min",
+            }
+            if type(update_op) in mode_map:
+                return mode_map[type(update_op)]
+
+            return None
+
+        mode = match_update_computation(op.update_computation)
+        if mode is None:
+            raise ValueError("Unsupported update computation for scatter. Only simple updates are supported.")
+
+        # scatter_dims_to_operand_dims maps axes in scatter_indices to axes in operand.
+        # If this is a simple 1:1 mapping, we can potentially use scatter_along_axis.
+        # Otherwise, we must use scatter_nd. For simplicity, we'll use scatter_nd.
+        # MIL's scatter_nd is what we need. The indices should be shaped correctly.
+        # The `scatter_dims_to_operand_dims` tells us how to construct the indices for `scatter_nd`.
+        # For now, we assume a simple case that can be mapped directly.
+        # A full implementation would need to permute/reshape `scatter_indices` and `updates`.
+
+        # StableHLO's scatter ignores out of bounds indices, but CoreML's scatter_nd has undefined
+        # behavior for them. We need to filter out the out of bounds indices.
+        operand_shape = mb.shape(x=operand)
+        lower_bound_check = mb.greater_equal(x=scatter_indices, y=0)
+
+        # We need to broadcast the operand shape to match the indices shape for comparison.
+        # scatter_dims_to_operand_dims maps index dimensions to operand dimensions.
+        # We assume a simple 1-to-1 mapping for now.
+        mapped_operand_shape = mb.gather(x=operand_shape, indices=np.array(dim_numbers.scattered_dims_to_operand_dims, dtype=np.int32))
+        upper_bound_check = mb.less(x=scatter_indices, y=mapped_operand_shape)
+
+        in_bounds_mask = mb.logical_and(x=lower_bound_check, y=upper_bound_check)
+        # To perform a logical AND reduction, we can cast to int and use reduce_min.
+        in_bounds_mask_int = mb.cast(x=in_bounds_mask, dtype="int32")
+        in_bounds_mask_reduced = mb.reduce_min(x=in_bounds_mask_int, axes=[-1])
+        in_bounds_mask = mb.cast(x=in_bounds_mask_reduced, dtype="bool")
+
+        # Get the indices of the valid updates.
+        valid_update_indices = mb.non_zero(x=in_bounds_mask)
+        scatter_indices = mb.gather(x=scatter_indices, indices=valid_update_indices, axis=0)
+        updates = mb.gather(x=updates, indices=valid_update_indices, axis=0)
+
+        result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
+        context.add_result(op.results[0], result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
