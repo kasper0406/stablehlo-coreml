@@ -970,10 +970,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         upper_bound_check = mb.less(x=scatter_indices, y=mapped_operand_shape)
 
         in_bounds_mask = mb.logical_and(x=lower_bound_check, y=upper_bound_check)
-        # To perform a logical AND reduction, we can cast to int and use reduce_min.
-        in_bounds_mask_int = mb.cast(x=in_bounds_mask, dtype="int32")
-        in_bounds_mask_reduced = mb.reduce_min(x=in_bounds_mask_int, axes=[-1])
-        in_bounds_mask = mb.cast(x=in_bounds_mask_reduced, dtype="bool")
+        in_bounds_mask_reduced = np.zeros(in_bounds_mask.shape[:1] + (1,), dtype=np.bool)
+        for i in range(in_bounds_mask.shape[1]):
+            selected_slice = mb.slice_by_index(
+                x=in_bounds_mask,
+                begin=np.array([0, i]),
+                end=np.array([in_bounds_mask.shape[0], i + 1])
+            )
+            in_bounds_mask_reduced = mb.logical_and(x=in_bounds_mask_reduced, y=selected_slice)
+        in_bounds_mask = mb.squeeze(x=in_bounds_mask_reduced, axes=np.array([1]))
 
         # Get the indices of the valid updates.
         valid_update_indices = mb.non_zero(x=in_bounds_mask)
