@@ -1048,8 +1048,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         elif isinstance(op, OrOp):
             # Lexicographical sort: (a < b) || (a == b && c < d)
             # The LHS is the primary condition, RHS is the next level.
-            return self.__get_sort_key_from_op(op.rhs.owner, block, inputs) + \
-                   self.__get_sort_key_from_op(op.lhs.owner, block, inputs)
+            return self.__get_sort_key_from_op(op.lhs.owner, block, inputs) + \
+                   self.__get_sort_key_from_op(op.rhs.owner, block, inputs)
         elif isinstance(op, AndOp):
             # The `a == b && c < d` part. The first operand is the equality check.
             return self.__get_sort_key_from_op(op.rhs.owner, block, inputs)
