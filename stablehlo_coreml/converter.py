@@ -16,7 +16,7 @@ from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
     Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
-    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
+    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, SortOp,
     MaxOp, FloorOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp,
     TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp,
     ReduceWindowOp, OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, ScatterOp, GatherOp,
@@ -987,6 +987,74 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
         context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_sort(self, context: TranslationContext, op: SortOp):
+        inputs = [context[operand.get_name()] for operand in op.inputs]
+        sort_dim = op.dimension.value
+
+        keys_and_directions = self.__get_sort_keys_and_directions(op.comparator, inputs)
+        if not keys_and_directions:
+            raise ValueError("Unsupported comparator for SortOp. Only simple lexicographical compares are supported.")
+
+        if len(keys_and_directions) == 1:
+            key_tensor, ascending = keys_and_directions[0]
+            sort_indices = mb.argsort(x=key_tensor, axis=sort_dim, ascending=ascending)
+        else:
+            # We can simulate lexsort with a series of stable argsorts.
+            # A stable sort is required. MIL sort is stable.
+            indices = mb.range_1d(start=0, end=inputs[0].shape[sort_dim], step=1)
+
+            # Iteratively sort by each key
+            for key, ascending in reversed(keys_and_directions):
+                # Gather keys and sort
+                gathered_key = mb.gather(x=key, indices=indices, axis=sort_dim)
+                # argsort on the gathered keys will give the new relative order
+                relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+                # update the main indices
+                indices = mb.gather(x=indices, indices=relative_indices, axis=sort_dim)
+            sort_indices = indices
+
+        # Permute all inputs based on the final sort indices
+        for i, tensor in enumerate(inputs):
+            sorted_tensor = mb.gather(x=tensor, indices=sort_indices, axis=sort_dim)
+            context.add_result(op.results[i], sorted_tensor)
+
+    def __get_sort_keys_and_directions(self, body: ir.Region, inputs: List) -> List[tuple]:
+        # This function parses the comparator to extract sort keys and directions.
+        # It supports simple single-key comparators and chained lexicographical comparators.
+        keys = []
+        if not body.blocks:
+            return []
+
+        block = body.blocks[0]
+        return_op = block.operations[-1]
+        if not isinstance(return_op, ReturnOp):
+            return []
+
+        # Start traversal from the operation producing the return value
+        start_op = return_op.operands[0].owner
+        # sort priority LtR
+        return self.__get_sort_key_from_op(start_op, [i.get_name() for i in block.arguments], inputs)
+
+    def __get_sort_key_from_op(self, op, block, inputs):
+        op = op.opview
+        if isinstance(op, CompareOp):
+            direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
+            if direction in ("LT", "GT"):
+                num_inputs = len(inputs)
+                arg_index = block.index(op.lhs.get_name()) // 2
+                return [(inputs[arg_index], direction == "LT")]
+        elif isinstance(op, OrOp):
+            # Lexicographical sort: (a < b) || (a == b && c < d)
+            # The LHS is the primary condition, RHS is the next level.
+            return self.__get_sort_key_from_op(op.rhs.owner, block, inputs) + \
+                   self.__get_sort_key_from_op(op.lhs.owner, block, inputs)
+        elif isinstance(op, AndOp):
+            # The `a == b && c < d` part. The first operand is the equality check.
+            return self.__get_sort_key_from_op(op.rhs.owner, block, inputs)
+
+        return []
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
