@@ -14,7 +14,7 @@ from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
+    AddOp, SubtractOp, RemOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
     Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, SortOp,
     MaxOp, FloorOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp,
@@ -142,6 +142,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
         self.__simple_binary_op(context, mb.sub, op)
+
+    @register_stablehlo_op
+    def op_rem(self, context: TranslationContext, op: RemOp):
+        self.__simple_binary_op(context, mb.mod, op)
 
     @register_stablehlo_op
     def op_mul(self, context: TranslationContext, op: MulOp):
@@ -373,7 +377,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_reshape(self, context: TranslationContext, op: ReshapeOp):
         x = context[op.operand.get_name()]
         new_shape = op.result.type.shape
-        reshape_res = mb.reshape(x=x, shape=new_shape)
+        if len(new_shape) == 0:
+            reshape_res = mb.squeeze(x=x)
+        else:
+            reshape_res = mb.reshape(x=x, shape=new_shape)
         context.add_result(op.result, reshape_res)
 
     @register_stablehlo_op
@@ -437,7 +444,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
-        cml_op = cml_op_builder(x=lhs, y=rhs)
+        if types.is_bool(lhs.dtype):
+            if comparison_direction == "EQ":
+                cml_op = mb.logical_not(x=mb.logical_xor(x=lhs, y=rhs))
+            elif comparison_direction == "NE":
+                cml_op = mb.logical_xor(x=lhs, y=rhs)
+            else:
+                raise ValueError("Boolean inequalities are not supported!")
+        else:
+            cml_op = cml_op_builder(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -721,11 +736,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
+        def pad_maybe_int(*, x, pad, constant_val):
+            if types.is_float(x.dtype):
+                return mb.pad(x=x, pad=pad, constant_val=constant_val)
+            for i, (before, after) in enumerate(zip(pad[::2], pad[1::2])):
+                before = mb.fill(shape=x.shape[:i] + (before,) + x.shape[i + 1:], value=constant_val)
+                after = mb.fill(shape=x.shape[:i] + (after,) + x.shape[i + 1:], value=constant_val)
+                x = mb.concat(values=(before, x, after), axis=i)
+            return x
+
         # Pad the inputs if required
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                pad_maybe_int(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
