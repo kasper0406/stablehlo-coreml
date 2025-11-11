@@ -923,40 +923,34 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_scatter(self, context: TranslationContext, op: ScatterOp):
-        # For now, we only support a simple version of scatter, where we are not scattering windows
-        # but only individual elements.
         dim_numbers = hlo.ScatterDimensionNumbers(op.scatter_dimension_numbers)
-        if len(dim_numbers.update_window_dims) > 0:
-            raise ValueError("Scattering with `update_window_dims` is not supported")
-
-        # We only support a single operand and a single update tensor
-        if len(op.inputs) != 1 or len(op.updates) != 1:
-            raise ValueError("Scatter with multiple operands/updates is not supported")
-
+        dim_mapping = dim_numbers.scattered_dims_to_operand_dims
         operand = context[op.inputs[0].get_name()]
         scatter_indices = context[op.scatter_indices.get_name()]
         updates = context[op.updates[0].get_name()]
 
-        # We need to determine the update mode from the `update_computation` body.
-        def match_update_computation(body):
-            if len(body.blocks) != 1:
+        if len(dim_numbers.input_batching_dims) > 0:
+            raise ValueError("Scatter batching index is not supported!")
+        if np.max(dim_mapping) >= len(dim_mapping):
+            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
+        if len(op.inputs) != 1 or len(op.updates) != 1:
+            raise ValueError("Scatter with multiple operands is not supported!")
+
+        # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
+        def match_update_computation(hlo_body):
+            if len(hlo_body.blocks) != 1:
                 return None
-            ops = list(body.blocks[0].operations)
-            if len(ops) != 2 or not isinstance(ops[1], ReturnOp):
+            args = list(hlo_body.blocks[0].arguments)
+            ops = list(hlo_body.blocks[0].operations)
+            if not isinstance(ops[-1], ReturnOp):
+                return None
+            if len(ops) == 1 and ops[0].operands[0] == args[1]:
+                return "update"
+            if len(ops) != 2 or \
+                    list(ops[0].operands) != args or \
+                    list(ops[1].operands) != list(ops[0].results):
                 return None
 
-            update_op = ops[0]
-            if list(ops[1].operands) != list(update_op.results):
-                return None
-
-            # The first argument to the update function is the value from the original tensor,
-            # and the second is the value from the updates tensor.
-            # We only match if the op returns the second argument, which corresponds to 'update' mode.
-            if isinstance(update_op, ReturnOp):
-                 if update_op.operands[0] == body.blocks[0].arguments[1]:
-                     return "update"
-
-            # For other modes, we check the op type.
             mode_map = {
                 AddOp: "add",
                 SubtractOp: "sub",
@@ -965,51 +959,51 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 MaxOp: "max",
                 MinOp: "min",
             }
-            if type(update_op) in mode_map:
-                return mode_map[type(update_op)]
-
-            return None
+            return mode_map.get(type(ops[0]), None)
 
         mode = match_update_computation(op.update_computation)
         if mode is None:
             raise ValueError("Unsupported update computation for scatter. Only simple updates are supported.")
 
-        # scatter_dims_to_operand_dims maps axes in scatter_indices to axes in operand.
-        # If this is a simple 1:1 mapping, we can potentially use scatter_along_axis.
-        # Otherwise, we must use scatter_nd. For simplicity, we'll use scatter_nd.
-        # MIL's scatter_nd is what we need. The indices should be shaped correctly.
-        # The `scatter_dims_to_operand_dims` tells us how to construct the indices for `scatter_nd`.
-        # For now, we assume a simple case that can be mapped directly.
-        # A full implementation would need to permute/reshape `scatter_indices` and `updates`.
+        shuffled_shape = np.array([operand.shape[i] for i in dim_mapping])[(None,) * (scatter_indices.rank - 1)]
+        valid = mb.logical_and(
+                x=mb.greater_equal(x=scatter_indices, y=0),
+                y=mb.less(x=scatter_indices, y=shuffled_shape))
+        along = lambda n: mb.slice_by_index(
+                x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
+                end=scatter_indices.shape[:-1] + (n + 1,))
 
-        # StableHLO's scatter ignores out of bounds indices, but CoreML's scatter_nd has undefined
-        # behavior for them. We need to filter out the out of bounds indices.
-        operand_shape = mb.shape(x=operand)
-        lower_bound_check = mb.greater_equal(x=scatter_indices, y=0)
+        # if there's too many axes to unroll reasonably, there's too many to use
+        reduction = along(0)
+        for i in range(1, scatter_indices.shape[-1]):
+            reduction = mb.logical_and(x=reduction, y=along(i))
+        reduction = mb.squeeze(x=reduction, axes=(scatter_indices.rank - 1,))
 
-        # We need to broadcast the operand shape to match the indices shape for comparison.
-        # scatter_dims_to_operand_dims maps index dimensions to operand dimensions.
-        # We assume a simple 1-to-1 mapping for now.
-        mapped_operand_shape = mb.gather(x=operand_shape, indices=np.array(dim_numbers.scattered_dims_to_operand_dims, dtype=np.int32))
-        upper_bound_check = mb.less(x=scatter_indices, y=mapped_operand_shape)
+        if reduction.rank == 0:
+            assert scatter_indices.shape == (1,), \
+                    f"unexpected input shape for scatter indices of {scatter_indices.shape}"
+            assert updates.rank == operand.rank
 
-        in_bounds_mask = mb.logical_and(x=lower_bound_check, y=upper_bound_check)
-        in_bounds_mask_reduced = np.zeros(in_bounds_mask.shape[:1] + (1,), dtype=np.bool)
-        for i in range(in_bounds_mask.shape[1]):
-            selected_slice = mb.slice_by_index(
-                x=in_bounds_mask,
-                begin=np.array([0, i]),
-                end=np.array([in_bounds_mask.shape[0], i + 1])
-            )
-            in_bounds_mask_reduced = mb.logical_and(x=in_bounds_mask_reduced, y=selected_slice)
-        in_bounds_mask = mb.squeeze(x=in_bounds_mask_reduced, axes=np.array([1]))
+            update_bound = scatter_indices
+            axis0 = lambda operand, bound: bound if operand.rank <= 1 else mb.concat(
+                    values=(bound, operand.shape[1:]), axis=0)
+            before = mb.slice_by_index(x=operand, begin=(0,) * operand.rank, end=axis0(operand, update_bound))
 
-        # Get the indices of the valid updates.
-        valid_update_indices = mb.non_zero(x=in_bounds_mask)
-        scatter_indices = mb.gather(x=scatter_indices, indices=valid_update_indices, axis=0)
-        updates = mb.gather(x=updates, indices=valid_update_indices, axis=0)
+            update_bound = mb.minimum(x=mb.add(x=scatter_indices, y=updates.shape[:1]), y=operand.shape[:1])
+            after = mb.slice_by_index(x=operand, begin=update_bound, end=axis0(operand, update_bound))
 
-        result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
+            update_bound = mb.sub(x=update_bound, y=scatter_indices)
+            updates = mb.slice_by_index(x=updates, begin=(0,) * updates.rank, end=axis0(updates, update_bound))
+
+            result = mb.select(
+                    cond=reduction,
+                    a=mb.concat(values=(before, updates, after), axis=0),
+                    b=operand)
+        else:
+            where = mb.non_zero(x=reduction)
+            scatter_indices = mb.gather_nd(x=scatter_indices, indices=where)
+            updates = mb.gather_nd(x=updates, indices=where)
+            result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
         context.add_result(op.results[0], result)
 
     @register_stablehlo_op
@@ -1047,6 +1041,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def __get_sort_keys_and_directions(self, body: ir.Region, inputs: List) -> List[tuple]:
         # This function parses the comparator to extract sort keys and directions.
         # It supports simple single-key comparators and chained lexicographical comparators.
+        # TODO: op matching validation conditions; trace source for LHS & RHS, verify AndOp LHS
         keys = []
         if not body.blocks:
             return []
