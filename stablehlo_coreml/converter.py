@@ -1009,71 +1009,39 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_sort(self, context: TranslationContext, op: SortOp):
         inputs = [context[operand.get_name()] for operand in op.inputs]
-        sort_dim = op.dimension.value
+        if len(tracing := op.comparator.blocks) != 1 or not isinstance(tracing := tracing[0].operations[-1], ReturnOp):
+            raise ValueError("Unsupported comparator format!")
+        tracing = tracing.operands[0].owner.opview
+        args = list(op.comparator.blocks[0].arguments)
+        remaining, expecting, priorities = None, None, []
+        while tracing:
+            match tracing:
+                case CompareOp():
+                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
+                    if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
+                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2):
+                        raise ValueError("Unsupported comparator format!")
+                    if not expecting:
+                        priorities.append((inputs[lhs // 2], direction == "LT"))
+                    expecting = None if expecting else (lhs, rhs)
+                    tracing, remaining = remaining, None
+                case OrOp() if not expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case AndOp() if expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case _:
+                    raise ValueError("Unsupported comparator format!")
 
-        keys_and_directions = self.__get_sort_keys_and_directions(op.comparator, inputs)
-        if not keys_and_directions:
-            raise ValueError("Unsupported comparator for SortOp. Only simple lexicographical compares are supported.")
+        sort_dim, (key, ascending) = op.dimension.value, priorities[-1]
+        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        for key, ascending in priorities[-2::-1]:
+            gathered_key = mb.gather(x=key, indices=indices)
+            relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+            indices = mb.gather(x=indices, indices=relative_indices)
 
-        if len(keys_and_directions) == 1:
-            key_tensor, ascending = keys_and_directions[0]
-            sort_indices = mb.argsort(x=key_tensor, axis=sort_dim, ascending=ascending)
-        else:
-            # We can simulate lexsort with a series of stable argsorts.
-            # A stable sort is required. MIL sort is stable.
-            indices = mb.range_1d(start=0, end=inputs[0].shape[sort_dim], step=1)
-
-            # Iteratively sort by each key
-            for key, ascending in reversed(keys_and_directions):
-                # Gather keys and sort
-                gathered_key = mb.gather(x=key, indices=indices, axis=sort_dim)
-                # argsort on the gathered keys will give the new relative order
-                relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-                # update the main indices
-                indices = mb.gather(x=indices, indices=relative_indices, axis=sort_dim)
-            sort_indices = indices
-
-        # Permute all inputs based on the final sort indices
         for i, tensor in enumerate(inputs):
-            sorted_tensor = mb.gather(x=tensor, indices=sort_indices, axis=sort_dim)
-            context.add_result(op.results[i], sorted_tensor)
-
-    def __get_sort_keys_and_directions(self, body: ir.Region, inputs: List) -> List[tuple]:
-        # This function parses the comparator to extract sort keys and directions.
-        # It supports simple single-key comparators and chained lexicographical comparators.
-        # TODO: op matching validation conditions; trace source for LHS & RHS, verify AndOp LHS
-        keys = []
-        if not body.blocks:
-            return []
-
-        block = body.blocks[0]
-        return_op = block.operations[-1]
-        if not isinstance(return_op, ReturnOp):
-            return []
-
-        # Start traversal from the operation producing the return value
-        start_op = return_op.operands[0].owner
-        # sort priority LtR
-        return self.__get_sort_key_from_op(start_op, [i.get_name() for i in block.arguments], inputs)
-
-    def __get_sort_key_from_op(self, op, block, inputs):
-        op = op.opview
-        if isinstance(op, CompareOp):
-            direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
-            if direction in ("LT", "GT"):
-                num_inputs = len(inputs)
-                arg_index = block.index(op.lhs.get_name()) // 2
-                return [(inputs[arg_index], direction == "LT")]
-        elif isinstance(op, OrOp):
-            # Lexicographical sort: (a < b) || (a == b && c < d)
-            # The LHS is the primary condition, RHS is the next level.
-            return self.__get_sort_key_from_op(op.lhs.owner, block, inputs) + \
-                   self.__get_sort_key_from_op(op.rhs.owner, block, inputs)
-        elif isinstance(op, AndOp):
-            # The `a == b && c < d` part. The first operand is the equality check.
-            return self.__get_sort_key_from_op(op.rhs.owner, block, inputs)
-
-        return []
+            context.add_result(op.results[i], mb.gather(x=tensor, indices=indices, axis=sort_dim))
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
