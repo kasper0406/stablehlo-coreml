@@ -858,12 +858,30 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         start_indices_rank = len(start_indices.shape)
 
         dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
+        dim_mapping = dim_numbers.start_index_map
+        dim_batches = dim_numbers.operand_batching_dims
+
+        if dim_numbers.index_vector_dim != start_indices_rank - 1:
+            raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
+        # ignore start_indices_batching_dims since index_vector_dim is last
+        inferred_sizes = np.array([
+            1 if i in dim_mapping or i in dim_batches else
+            operand.shape[i] for i in range(operand_rank)])
+        if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
+                np.all(np.array(op.slice_sizes) == inferred_sizes):
+            if len(dim_mapping) == 1:
+                start_indices = mb.squeeze(x=start_indices, axes=(start_indices_rank - 1,))
+                result = mb.gather(x=operand, indices=start_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
+            elif np.max(dim_mapping) < len(dim_mapping):
+                result = mb.gather_nd(x=operand, indices=start_indices, batch_dims=len(dim_batches))
+                result = mb.expand_dims(x=result, axes=[i for i in dim_mapping if i not in dim_numbers.collapsed_slice_dims])
+            context.add_result(op.result, result)
+            return
+
         if dim_numbers.operand_batching_dims != []:
             raise ValueError("Batched operand dims gather is not supported!")
         if dim_numbers.start_indices_batching_dims != []:
             raise ValueError("Batched start indices gather is not supported!")
-        if dim_numbers.index_vector_dim != start_indices_rank - 1:
-            raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
         result_rank = len(op.result.type.shape)
         slice_sizes = op.slice_sizes
@@ -876,8 +894,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             slice_end = []
 
             for operand_dim in range(operand_rank):
-                if operand_dim in dim_numbers.start_index_map:
-                    start_index_dim = dim_numbers.start_index_map.index(operand_dim)
+                if operand_dim in dim_mapping:
+                    start_index_dim = dim_mapping.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
                     start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
