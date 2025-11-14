@@ -14,13 +14,13 @@ from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, SubtractOp, RemOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
+    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
     Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
-    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp, SortOp,
-    MaxOp, FloorOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp,
-    TransposeOp, DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp,
-    ReduceWindowOp, OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, ScatterOp, GatherOp,
-    PowOp, PadOp,
+    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
+    MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
+    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    ScatterOp, SortOp, RemOp, FloorOp, CeilOp, ClampOp
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -650,6 +650,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_unary_op(context, mb.floor, op)
 
     @register_stablehlo_op
+    def op_ceil(self, context: TranslationContext, op: CeilOp):
+        self.__simple_unary_op(context, mb.floor, op)
+
+    @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
         self.__simple_unary_op(context, mb.rsqrt, op)
 
@@ -1036,9 +1040,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             match tracing:
                 case CompareOp():
                     direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    if tracing.lhs not in args or tracing.rhs not in args:
+                        if len(args) > 2:
+                            raise ValueError("Unsupported comparator format!")
+                        tracing = tracing.lhs.owner.opview
+                        priorities.append((inputs[0], direction == "LT"))
+                        continue
                     lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
                     if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
-                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2):
+                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2 or lhs + 1 != rhs):
                         raise ValueError("Unsupported comparator format!")
                     if not expecting:
                         priorities.append((inputs[lhs // 2], direction == "LT"))
@@ -1048,6 +1058,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
                 case AndOp() if expecting:
                     tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case SelectOp():
+                    tracing = next(
+                            i for i in list(tracing.operands)[1:]
+                            if not isinstance(getattr(i.owner, "opview", None), ConstantOp))
+                    if tracing in args:
+                        if args.index(tracing) == 1:
+                            priorities[0] = (priorities[0][0], not priorities[0][1])
+                        break
+                    tracing = tracing.owner.opview
                 case _:
                     raise ValueError("Unsupported comparator format!")
 
@@ -1060,6 +1079,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         for i, tensor in enumerate(inputs):
             context.add_result(op.results[i], mb.gather(x=tensor, indices=indices, axis=sort_dim))
+
+    @register_stablehlo_op
+    def op_clamp(self, context: TranslationContext, op: ClampOp):
+        min = context[op.min.get_name()]
+        max = context[op.max.get_name()]
+        operand = context[op.operand.get_name()]
+        result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
+        context.add_result(op.results[0], result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
