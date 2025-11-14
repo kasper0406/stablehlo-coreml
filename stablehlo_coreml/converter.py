@@ -20,7 +20,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
-    ScatterOp, SortOp, RemOp, FloorOp, CeilOp, ClampOp
+    ScatterOp, SortOp, RemOp, FloorOp, CeilOp, ClampOp, CaseOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -1087,6 +1087,29 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         operand = context[op.operand.get_name()]
         result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
         context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_case(self, context: TranslationContext, op: CaseOp):
+        index = context[op.index.get_name()]
+
+        def params(i):
+            closure, args = [], []
+            for j in op.branches[i].blocks[0].operations:
+                for k in j.operands:
+                    if k.get_name() in context.variables[context.path()]:
+                        closure.append(k)
+                        args.append(context[k.get_name()])
+            return (closure, op.branches[i], args)
+
+        remaining = self.__invoke_hlo_function(context, "branch_default", *params(-1))
+        for i in reversed(range(len(op.branches) - 1)):
+            current = self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
+            remaining = mb.cond(
+                    pred=mb.equal(x=index, y=i),
+                    _true_fn=(lambda x: lambda: x)(current),
+                    _false_fn=(lambda x: lambda: x)(remaining))
+        for i, result in enumerate(remaining):
+            context.add_result(op.results[i], result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
