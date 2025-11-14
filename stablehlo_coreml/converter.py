@@ -812,7 +812,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 window_strides=idx_window_strides,
                 body=op.body,
                 init_values=init_values,
-                result_types=idx_result_types,
+                result_types=result_types, # TODO: differentiate idx_result_types
             )
 
             result_rank = inputs_rank - loop_shape_rank
