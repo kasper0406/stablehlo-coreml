@@ -873,14 +873,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             operand.shape[i] for i in range(operand_rank)])
         if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
                 np.all(np.array(op.slice_sizes) == inferred_sizes):
+            upper, lower = [operand.shape[i] for i in dim_mapping], [0] * len(dim_mapping)
+            broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
+            clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             if len(dim_mapping) == 1:
-                start_indices = mb.squeeze(x=start_indices, axes=(start_indices_rank - 1,))
-                result = mb.gather(x=operand, indices=start_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
-            elif np.max(dim_mapping) < len(dim_mapping):
-                result = mb.gather_nd(x=operand, indices=start_indices, batch_dims=len(dim_batches))
+                clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
+                result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
+                context.add_result(op.result, result)
+                return
+            elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
+                result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
                 result = mb.expand_dims(x=result, axes=[i for i in dim_mapping if i not in dim_numbers.collapsed_slice_dims])
-            context.add_result(op.result, result)
-            return
+                context.add_result(op.result, result)
+                return
 
         if dim_numbers.operand_batching_dims != []:
             raise ValueError("Batched operand dims gather is not supported!")
