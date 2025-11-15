@@ -651,7 +651,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_ceil(self, context: TranslationContext, op: CeilOp):
-        self.__simple_unary_op(context, mb.floor, op)
+        self.__simple_unary_op(context, mb.ceil, op)
 
     @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
