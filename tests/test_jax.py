@@ -241,6 +241,33 @@ def test_gather():
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
 
+def test_scatter():
+    from jax.lax import ScatterDimensionNumbers
+
+    def wrapped_scatter_add(dimension_numbers):
+        @jax.jit
+        def internal_scatter_add(operand, scatter_indices, updates):
+            return jax.lax.scatter_add(
+                operand=operand,
+                scatter_indices=scatter_indices,
+                updates=updates,
+                dimension_numbers=dimension_numbers,
+            )
+        return internal_scatter_add
+
+    scatter_indices = [[[0, 2], [1, 0], [2, 1]], [[0, 1], [1, 0], [0, 9]]]
+    scatter_indices = jnp.array(scatter_indices)
+    operand = jnp.arange(1, 25).reshape((3, 4, 2))
+    update = jnp.ones((2, 3, 2, 2), dtype=jnp.int32)
+    dimension_numbers = ScatterDimensionNumbers(
+        update_window_dims = (2, 3),
+        inserted_window_dims = (0,),
+        scatter_dims_to_operand_dims = (1, 0),
+    )
+
+    run_and_compare_specific_input(wrapped_scatter_add(dimension_numbers), (operand, scatter_indices, update))
+
+
 def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((0, 0), (10, 5))), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((0, 10), (5, 0), (2, 1))), (jnp.zeros((10, 20, 15)),))
