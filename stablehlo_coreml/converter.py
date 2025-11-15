@@ -6,7 +6,10 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
+from .utils import (
+    RankedSliceType, index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
+    inverse_permutation
+)
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
@@ -805,6 +808,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     for result in idx_result_types
                 ]
 
+            mock_result_types = [RankedSliceType(i.shape, j.element_type) for i, j in zip(idx_result_types, result_types)]
             results = self.__compute_windowed_reduction(
                 context=context,
                 inputs=idx_inputs,
@@ -812,7 +816,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 window_strides=idx_window_strides,
                 body=op.body,
                 init_values=init_values,
-                result_types=result_types, # TODO: differentiate idx_result_types
+                result_types=mock_result_types,
             )
 
             result_rank = inputs_rank - loop_shape_rank
