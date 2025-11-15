@@ -1040,40 +1040,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError("Unsupported comparator format!")
         tracing = tracing.operands[0].owner.opview
         args = list(op.comparator.blocks[0].arguments)
-        remaining, expecting, priorities = None, None, []
-        while tracing:
-            match tracing:
-                case CompareOp():
-                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
-                    if tracing.lhs not in args or tracing.rhs not in args:
-                        if len(args) > 2:
-                            raise ValueError("Unsupported comparator format!")
-                        tracing = tracing.lhs.owner.opview
-                        priorities.append((inputs[0], direction == "LT"))
-                        continue
-                    lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
-                    if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
-                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2 or lhs + 1 != rhs):
-                        raise ValueError("Unsupported comparator format!")
-                    if not expecting:
-                        priorities.append((inputs[lhs // 2], direction == "LT"))
-                    expecting = None if expecting else (lhs, rhs)
-                    tracing, remaining = remaining, None
-                case OrOp() if not expecting:
-                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
-                case AndOp() if expecting:
-                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
-                case SelectOp():
-                    tracing = next(
-                            i for i in list(tracing.operands)[1:]
-                            if not isinstance(getattr(i.owner, "opview", None), ConstantOp))
-                    if tracing in args:
-                        if args.index(tracing) == 1:
-                            priorities[0] = (priorities[0][0], not priorities[0][1])
-                        break
-                    tracing = tracing.owner.opview
-                case _:
-                    raise ValueError("Unsupported comparator format!")
+        selecting = any(isinstance(i, SelectOp) for i in op.comparator.blocks[0].operations)
+        priorities = self.__verify_totalsort(tracing, args, inputs) \
+                if selecting else self.__verify_lexsort(tracing, args, inputs)
+        if priorities is None:
+            raise ValueError("Unrecognized comparator format; only lexsort and float sort are supported!")
 
         sort_dim, (key, ascending) = op.dimension.value, priorities[-1]
         indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
@@ -1084,6 +1055,74 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         for i, tensor in enumerate(inputs):
             context.add_result(op.results[i], mb.gather(x=tensor, indices=indices, axis=sort_dim))
+
+    def __verify_lexsort(self, tracing, args, inputs):
+        remaining, expecting, priorities = None, None, []
+        while tracing:
+            match tracing:
+                case CompareOp():
+                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    if tracing.lhs not in args or tracing.rhs not in args:
+                        return None
+                    lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
+                    if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
+                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2 or lhs + 1 != rhs):
+                        return None
+                    if not expecting:
+                        priorities.append((inputs[lhs // 2], direction == "LT"))
+                    expecting = None if expecting else (lhs, rhs)
+                    tracing, remaining = remaining, None
+                case OrOp() if not expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case AndOp() if expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case _:
+                    return None
+        return priorities
+
+    def __verify_totalsort(self, tracing, args, inputs):
+        if not isinstance(tracing, CompareOp) or len(args) > 2 or len(inputs) > 1:
+            return None
+        direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+        lhs = self.__verify_zero_nan(tracing.lhs.owner.opview, args)
+        rhs = self.__verify_zero_nan(tracing.rhs.owner.opview, args)
+        if direction not in ("LT", "GT") or lhs is None or rhs is None or lhs == rhs:
+            return None
+        return [(inputs[lhs], direction == "LT")]
+
+    def __verify_zero_nan(self, tracing, args):
+        remaining, idx = None, None
+        selecting, comparing = [lambda x: np.array(x) == 0, np.isnan], ["EQ", "NE"]
+        while tracing:
+            match tracing:
+                case SelectOp():
+                    const = tracing.operands[1].owner.opview.value
+                    if not len(selecting) or not selecting.pop()(const):
+                        return None
+                    if len(selecting):
+                        remaining = tracing.operands[2].owner.opview
+                        tracing = tracing.operands[0].owner.opview
+                    else:
+                        if tracing.operands[2] != args[idx]:
+                            return None
+                        tracing, remaining = tracing.operands[0].owner.opview, None
+                case CompareOp():
+                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    if not len(comparing) or direction != comparing.pop():
+                        return None
+                    if len(comparing):
+                        if tracing.lhs != tracing.rhs or tracing.lhs not in args:
+                            return None
+                        idx = args.index(tracing.lhs)
+                        tracing, remaining = remaining, None
+                    else:
+                        const = np.array(tracing.rhs.owner.opview.value)
+                        if const != 0 or tracing.lhs != args[idx]:
+                            return None
+                        tracing = None
+                case _:
+                    return None
+        return idx
 
     @register_stablehlo_op
     def op_clamp(self, context: TranslationContext, op: ClampOp):
