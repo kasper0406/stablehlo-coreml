@@ -1110,7 +1110,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         remaining = tracing.operands[2].owner.opview
                         tracing = tracing.operands[0].owner.opview
                     else:
-                        if tracing.operands[2] != args[idx]:
+                        if idx is None or tracing.operands[2] != args[idx]:
                             return None
                         tracing, remaining = tracing.operands[0].owner.opview, None
                 case CompareOp():
@@ -1118,7 +1118,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     if not len(comparing) or direction != comparing.pop():
                         return None
                     if len(comparing):
-                        if tracing.lhs != tracing.rhs or tracing.lhs not in args:
+                        if tracing.lhs != tracing.rhs or tracing.lhs not in args or len(selecting) != 1:
                             return None
                         idx = args.index(tracing.lhs)
                         tracing, remaining = remaining, None
