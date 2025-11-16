@@ -281,21 +281,16 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((1, 2), (3, 4)), constant_values=12.3), (jnp.zeros((10, 20)),))
 
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="reflect"), (jnp.zeros((10, 20)),))
-
-    # Currently fails. Can be introduce once https://github.com/apple/coremltools/pull/2489 releases
-    # run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="wrap"), (jnp.zeros((10, 20)),))
-
+    run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="wrap"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="edge"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="linear_ramp"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="maximum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="mean"), (jnp.zeros((10, 20)),))
-
-    # Currently conversion for `SortOp`` is not implemented, which median finding relies on
-    # run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
-
+    run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
 
 # (readline patch continued) run test directly
 if __name__ == "__main__":
-    test_scatter()
+    # test_scatter()
+    test_pad()
