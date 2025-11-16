@@ -292,5 +292,4 @@ def test_pad():
 
 # (readline patch continued) run test directly
 if __name__ == "__main__":
-    # test_scatter()
-    test_pad()
+    test_scatter()

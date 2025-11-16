@@ -881,7 +881,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             if len(dim_mapping) == 1:
-                clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
+                if start_indices_rank > 1:
+                    clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
                 result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
                 context.add_result(op.result, result)
                 return
@@ -1056,12 +1057,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         sort_dim, (key, ascending) = op.dimension.value, priorities[-1]
         indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
         for key, ascending in priorities[-2::-1]:
-            gathered_key = mb.gather(x=key, indices=indices)
+            gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
             relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-            indices = mb.gather(x=indices, indices=relative_indices)
+            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], mb.gather(x=tensor, indices=indices, axis=sort_dim))
+            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
 
     def __verify_lexsort(self, tracing, args, inputs):
         remaining, expecting, priorities = None, None, []
