@@ -2,6 +2,11 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
+# temporary namespace patch to enable pdb readline, which hatch breaks
+import pathlib, sys
+sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
+# end of patch
+
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
 
@@ -255,6 +260,7 @@ def test_scatter():
             )
         return internal_scatter_add
 
+    # https://raw.githubusercontent.com/openxla/stablehlo/bd8d708/docs/images/spec/scatter.svg
     scatter_indices = [[[0, 2], [1, 0], [2, 1]], [[0, 1], [1, 0], [0, 9]]]
     scatter_indices = jnp.array(scatter_indices)
     operand = jnp.arange(1, 25).reshape((3, 4, 2))
@@ -289,3 +295,7 @@ def test_pad():
 
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
+
+# (readline patch continued) run test directly
+if __name__ == "__main__":
+    test_scatter()

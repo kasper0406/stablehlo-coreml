@@ -967,6 +967,9 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(op.inputs) != 1 or len(op.updates) != 1:
             raise ValueError("Scatter with multiple operands is not supported!")
 
+        # this can be done pre-emptively because of the constraint on scatter windows
+        scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
+
         # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
         def match_update_computation(hlo_body):
             if len(hlo_body.blocks) != 1:
@@ -996,7 +999,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if mode is None:
             raise ValueError("Unsupported update computation for scatter. Only simple updates are supported.")
 
-        shuffled_shape = np.array([operand.shape[i] for i in dim_mapping])[(None,) * (scatter_indices.rank - 1)]
+        shuffled_shape = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
         valid = mb.logical_and(
                 x=mb.greater_equal(x=scatter_indices, y=0),
                 y=mb.less(x=scatter_indices, y=shuffled_shape))
