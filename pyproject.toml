@@ -24,7 +24,7 @@ keywords=[ "stablehlo", "hlo", "xla", "coreml", "machinelearning", "ml", "coreml
 requires-python = ">=3.9"
 
 dependencies = [
-    'coremltools>=8.2; python_version >= "3.10" and python_version <= "3.12"',
+    'coremltools>=9.0; python_version >= "3.10" and python_version <= "3.12"',
     "numpy~=2.0",
 
     # Jax is not actually a strict requirement for the main library.
