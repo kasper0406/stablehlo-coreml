@@ -871,7 +871,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
-        # ignore start_indices_batching_dims since index_vector_dim is last
+        if dim_batches != dim_numbers.start_indices_batching_dims:
+            raise ValueError("Operand and index batch dimensions are only supported if they match")
         inferred_sizes = np.array([
             1 if i in dim_mapping or i in dim_batches else
             operand.shape[i] for i in range(operand_rank)])
