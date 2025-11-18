@@ -967,6 +967,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
         if len(op.inputs) != 1 or len(op.updates) != 1:
             raise ValueError("Scatter with multiple operands is not supported!")
+        # MIL only supports scatter window update sizes that match the operand shape
+        #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
+        # [sic] via
+        #     https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather.scatter_nd
+        if scatter_indices.shape != (1,) and updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
+            raise ValueError("Scatter windows that only partially fill dimensions are not supported!")
 
         # this can be done pre-emptively because of the constraint on scatter windows
         scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
@@ -1000,10 +1006,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if mode is None:
             raise ValueError("Unsupported update computation for scatter. Only simple updates are supported.")
 
-        shuffled_shape = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
+        upper_bound = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
         valid = mb.logical_and(
                 x=mb.greater_equal(x=scatter_indices, y=0),
-                y=mb.less(x=scatter_indices, y=shuffled_shape))
+                y=mb.less(x=scatter_indices, y=upper_bound))
         along = lambda n: mb.slice_by_index(
                 x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
                 end=scatter_indices.shape[:-1] + (n + 1,))

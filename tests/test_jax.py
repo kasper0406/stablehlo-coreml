@@ -2,11 +2,6 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
-# temporary namespace patch to enable pdb readline, which hatch breaks
-import pathlib, sys
-sys.path.insert(0, str(pathlib.Path(__file__).parents[1]))
-# end of patch
-
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
 
@@ -246,6 +241,50 @@ def test_gather():
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
 
+def test_simple_scatter():
+    def scatter_set(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].set(updates)
+    run_and_compare(scatter_set, (jnp.zeros((30,)),))
+
+    def scatter_add(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].add(updates)
+    run_and_compare(scatter_add, (jnp.zeros((30,)),))
+
+    def scatter_sub(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].subtract(updates)
+    run_and_compare(scatter_sub, (jnp.zeros((30,)),))
+
+    def scatter_mul(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].multiply(updates)
+    run_and_compare(scatter_mul, (jnp.zeros((30,)),))
+
+    def scatter_div(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].divide(updates)
+    run_and_compare(scatter_div, (jnp.zeros((30,)),))
+
+    def scatter_max(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].max(updates)
+    run_and_compare(scatter_max, (jnp.zeros((30,)),))
+
+    def scatter_min(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].min(updates)
+    run_and_compare(scatter_min, (jnp.zeros((30,)),))
+
+
 def test_scatter():
     from jax.lax import ScatterDimensionNumbers
 
@@ -261,13 +300,14 @@ def test_scatter():
         return internal_scatter_add
 
     # https://raw.githubusercontent.com/openxla/stablehlo/bd8d708/docs/images/spec/scatter.svg
+    # original test case features partially filled update dimension windows
     scatter_indices = [[[0, 2], [1, 0], [2, 1]], [[0, 1], [1, 0], [0, 9]]]
     scatter_indices = jnp.array(scatter_indices)
     operand = jnp.arange(1, 25).reshape((3, 4, 2))
-    update = jnp.ones((2, 3, 2, 2), dtype=jnp.int32)
+    update = jnp.ones((2, 3, 2), dtype=jnp.int32)
     dimension_numbers = ScatterDimensionNumbers(
-        update_window_dims = (2, 3),
-        inserted_window_dims = (0,),
+        update_window_dims = (2,),
+        inserted_window_dims = (0, 1),
         scatter_dims_to_operand_dims = (1, 0),
     )
 
@@ -289,7 +329,3 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
-
-# (readline patch continued) run test directly
-if __name__ == "__main__":
-    test_scatter()
