@@ -1164,6 +1164,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         args.append(context[k.get_name()])
             return (closure, op.branches[i], args)
 
+        # TODO: the branches should only be invoked inside the _true_fn and _false_fn
         remaining = self.__invoke_hlo_function(context, "branch_default", *params(-1))
         for i in reversed(range(len(op.branches) - 1)):
             current = self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
