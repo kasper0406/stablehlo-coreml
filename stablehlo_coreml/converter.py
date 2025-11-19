@@ -891,7 +891,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
                 result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
                 window_outputs = [i for i in range(operand_rank) if i not in dim_batches and i not in dim_numbers.collapsed_slice_dims]
-                result = mb.expand_dims(x=result, axes=[j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1])
+                window_outputs = [j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1]
+                result = mb.expand_dims(x=result, axes=window_outputs)
                 context.add_result(op.result, result)
                 return
 
@@ -981,6 +982,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
 
         # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
+        # TODO: Consider refactoring. Can maybe be combined with the reduction type sniffing
         def match_update_computation(hlo_body):
             if len(hlo_body.blocks) != 1:
                 return None
@@ -1007,7 +1009,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         mode = match_update_computation(op.update_computation)
         if mode is None:
-            raise ValueError("Unsupported update computation for scatter. Only simple updates are supported.")
+            raise ValueError("Unsupported update mode for scatter operation")
 
         upper_bound = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
         valid = mb.logical_and(
