@@ -878,9 +878,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             operand.shape[i] for i in range(operand_rank)])
         if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
                 np.all(np.array(op.slice_sizes) == inferred_sizes):
-            upper, lower = [operand.shape[i] for i in dim_mapping], [0] * len(dim_mapping)
+            upper, lower = [operand.shape[i] - 1 for i in dim_mapping], [0] * len(dim_mapping)
             broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
+            clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
             if len(dim_mapping) == 1:
                 if start_indices_rank > 1:
                     clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
@@ -889,7 +890,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 return
             elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
                 result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
-                result = mb.expand_dims(x=result, axes=[i for i in dim_mapping if i not in dim_numbers.collapsed_slice_dims])
+                window_outputs = [i - sum(i >= j for j in dim_numbers.collapsed_slice_dims) for i in dim_numbers.offset_dims]
+                result = mb.expand_dims(x=result, axes=[j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1])
                 context.add_result(op.result, result)
                 return
 
