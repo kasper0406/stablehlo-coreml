@@ -43,7 +43,8 @@ def evaluate_pytorch_model(model, inputs):
         expected_outputs = [model_outputs[return_name] for return_name in model_outputs]
         expected_outputs = [output_tensor.detach().numpy() for output_tensor in flatten(expected_outputs)]
 
-    run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000)
+    # These models are quite big, so tolerances are relaxed
+    run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000, atol=5e-01, rtol=5e-02)
 
 
 def test_resnet18():

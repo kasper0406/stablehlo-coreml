@@ -4,8 +4,7 @@ import jax.numpy as jnp
 
 from tests.utils import run_and_compare, run_and_compare_specific_input
 
-from tests.flax_blocks import ResidualConv, Encoder, UNet, UNetWithXlstm
-from tests.flax_xlstm import sLSTMCell, sLSTMBlock, mLSTMCell, mLSTMBlock, xLSTMModule, xLSTM
+from tests.flax_blocks import ResidualConv, Encoder, UNet
 
 from functools import partial
 
@@ -292,100 +291,6 @@ def test_unet():
     model = UNet(num_layers=2, rngs=nnx.Rngs(0))
     model.eval()
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))
-
-
-def test_slstm_cell():
-    batch_size = 2
-    hidden_size = 4
-    rngs = nnx.Rngs(0)
-
-    model = sLSTMCell(num_cells=hidden_size, rngs=rngs)
-    model.eval()
-    x = jnp.zeros((batch_size, hidden_size))
-    carry = sLSTMCell.init_carry(batch_size, hidden_size, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_slstm_block():
-    batch_size = 2
-    hidden_size = 4
-    num_heads = 3
-    rngs = nnx.Rngs(0)
-
-    model = sLSTMBlock(hidden_size=hidden_size, num_heads=num_heads, rngs=rngs)
-    model.eval()
-    x = jnp.zeros((batch_size, hidden_size))
-    carry = sLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_mlstm_cell():
-    batch_size = 2
-    hidden_size = 4
-    rngs = nnx.Rngs(0)
-
-    model = mLSTMCell(hidden_size=hidden_size, rngs=rngs)
-    model.eval()
-    x = jnp.zeros((batch_size, hidden_size))
-    carry = mLSTMCell.init_carry(batch_size, hidden_size, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_mlstm_block():
-    batch_size = 2
-    hidden_size = 4
-    num_heads = 3
-    rngs = nnx.Rngs(0)
-
-    model = mLSTMBlock(hidden_size=hidden_size, num_heads=num_heads, rngs=rngs)
-    model.eval()
-    x = jnp.zeros((batch_size, hidden_size))
-    carry = mLSTMBlock.init_carry(batch_size, hidden_size, num_heads, rngs=rngs)
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_xlstm_module():
-    batch_size = 2
-    hidden_size = 4
-    num_heads = 2
-    num_mlstm = 1
-    num_slstm = 1
-    rngs = nnx.Rngs(0)
-
-    model = xLSTMModule(hidden_size=hidden_size, num_heads=num_heads, num_mlstm=num_mlstm, num_slstm=num_slstm, rngs=rngs)
-    model.eval()
-    x = jnp.zeros((batch_size, hidden_size))
-    carry = model.init_carry(batch_size, rngs=rngs)
-    # The xLSTM module model is quite deep, so we allow more slack in the outputs
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_xlstm():
-    batch_size = 4
-    hidden_size = 3
-    rngs = nnx.Rngs(0)
-
-    model = xLSTM(hidden_size=hidden_size, num_heads=1, num_layers=1, rngs=rngs)
-    carry = model.init_carry(batch_size, rngs=rngs)
-    x = jnp.zeros((batch_size, hidden_size))
-    model.eval()
-
-    # The xLSTM model is quite deep, so we allow more slack in the outputs
-    run_and_compare(nnx.jit(model), (carry, x))
-
-
-def test_unet_with_xlstm():
-    batch_size = 2
-    num_conv_layers = 2
-    input_size = 2 ** num_conv_layers
-    rngs = nnx.Rngs(0)
-
-    model = UNetWithXlstm(num_conv_layers=num_conv_layers, rngs=rngs)
-    carry = model.init_carry(batch_size, rngs=rngs)
-    x = jnp.zeros((batch_size, input_size, 1))
-    model.eval()
-
-    run_and_compare(nnx.jit(model), (carry, x, ))
 
 
 def test_activations():

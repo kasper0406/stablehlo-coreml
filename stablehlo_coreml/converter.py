@@ -574,10 +574,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 kernel_spatial_dims = dim_spec.kernel_spatial_dimensions
                 raw_weight_shape = context[op.rhs.get_name()].shape
                 kernel_sizes = [raw_weight_shape[d] for d in kernel_spatial_dims]
-                
+
                 new_pad_out = []
                 pad_in = []
-                
+
                 for i in range(len(kernel_sizes)):
                     k = kernel_sizes[i]
                     s = strides[i]
@@ -586,26 +586,26 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
                     p_low = pad[2*i]
                     p_high = pad[2*i+1]
-                    
+
                     # Target crop
                     t_low = k_eff - 1 - p_low
                     t_high = k_eff - 1 - p_high
-                    
+
                     # Calculate input padding needed to satisfy non-negative crop
                     # pad_in >= ceil(-t / s)
                     pi_low = max(0, (-t_low + s - 1) // s)
                     pi_high = max(0, (-t_high + s - 1) // s)
-                    
+
                     # Calculate output crop
                     po_low = t_low + pi_low * s
                     po_high = t_high + pi_high * s
-                    
+
                     new_pad_out.extend([po_low, po_high])
                     pad_in.extend([pi_low, pi_high])
-                
+
                 pad = np.array(new_pad_out, dtype=np.int32)
                 pad_in = np.array(pad_in, dtype=np.int32)
-                
+
                 if np.any(pad_in > 0):
                     # Apply padding to x
                     # x is [batch, channel, spatial...]
@@ -997,17 +997,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         descending = op.largest is None or op.largest.value
         mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
         return mil_res
-    
+
     def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
         x = context[op.operand.get_name()]
         mil_res = mb.asin(x=x)
         return [mil_res]
-    
+
     def _op_mhlo_sinh(self, context: TranslationContext, op: SinhOp):
         x = context[op.operand.get_name()]
         mil_res = mb.sinh(x=x)
         return [mil_res]
-    
+
     def _op_mhlo_asinh(self, context: TranslationContext, op: AsinhOp):
         x = context[op.operand.get_name()]
         # asinh(x) = log(x + sqrt(x^2 + 1))

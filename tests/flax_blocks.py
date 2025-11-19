@@ -3,8 +3,6 @@ import jax.numpy as jnp
 
 from typing import List
 
-from .flax_xlstm import xLSTM
-
 
 class ResidualConv(nnx.Module):
     scale_conv: nnx.Conv
@@ -152,36 +150,3 @@ class UNet(nnx.Module):
         out = self.audio_decoding(hidden, skip_connections)
 
         return out
-
-
-class UNetWithXlstm(nnx.Module):
-    encoder: Encoder
-    decoder: Decoder
-    xlstm: xLSTM
-
-    def __init__(self, num_conv_layers: int, rngs: nnx.Rngs):
-        self.hidden_size = 2 ** num_conv_layers
-
-        self.audio_encoding = Encoder(num_layers=num_conv_layers, rngs=rngs)
-        self.audio_decoding = Decoder(num_layers=num_conv_layers, rngs=rngs)
-        self.xlstm = xLSTM(hidden_size=self.hidden_size, num_heads=1, num_layers=1, rngs=rngs)
-
-    def __call__(self, carry, x):
-        if x.shape[1] != self.hidden_size or x.shape[2] != 1:
-            raise ValueError("The input must be exactly squeezed to length 1 with x.shape[1] output features")
-
-        def compress_dynamic_range(samples):
-            mu = jnp.array(255.0, dtype=jnp.float16)
-            return jnp.sign(samples) * jnp.log1p(mu * jnp.abs(samples)) / jnp.log1p(mu)
-        x = compress_dynamic_range(x)
-
-        hidden, skip_connections = self.audio_encoding(x)
-        hidden = jnp.squeeze(hidden, axis=1)
-        carry, hidden = self.xlstm(carry, hidden)
-        hidden = jnp.expand_dims(hidden, axis=1)
-        out = self.audio_decoding(hidden, skip_connections)
-
-        return carry, out
-
-    def init_carry(self, batch_size: int, rngs: nnx.Rngs):
-        return self.xlstm.init_carry(batch_size, rngs)

@@ -111,8 +111,8 @@ def test_complex_reductions():
 
     run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 3)),))
     run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 3)),))
-    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((20, 30, 40)),))
-    run_and_compare(partial(jnp.argmin, axis=1, keepdims=True), (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((20, 100, 40)),))
+    run_and_compare(partial(jnp.argmin, axis=1, keepdims=True), (jnp.zeros((20, 100, 40)),))
 
 
 def test_topk():
