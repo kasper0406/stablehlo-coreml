@@ -42,7 +42,7 @@ class sLSTMCell(nnx.Module):
     output_gate_proj: nnx.Linear
     output_state_proj: nnx.Linear
 
-    if_conv: nnx.Conv
+    if_conv: Optional[nnx.Conv]
 
     def __init__(self, num_cells: int, rngs: nnx.Rngs, input_size: Optional[int] = None, apply_if_conv: bool = True):
         self.num_cells = num_cells
@@ -78,7 +78,7 @@ class sLSTMCell(nnx.Module):
         self.output_gate_proj = construct_x_proj()
         self.output_state_proj = construct_hidden_proj()
 
-        self.if_conv = None
+        self.if_conv = nnx.data(None)
         if apply_if_conv:
             self.if_conv = nnx.Conv(
                 in_features=1,
@@ -413,11 +413,11 @@ class xLSTMModule(nnx.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
 
-        self.mlstms = []
+        self.mlstms = nnx.List()
         for _ in range(num_mlstm):
             self.mlstms.append(mLSTMBlock(hidden_size, num_heads, rngs=rngs))
 
-        self.slstms = []
+        self.slstms = nnx.List()
         for _ in range(num_slstm):
             self.slstms.append(sLSTMBlock(hidden_size, num_heads, rngs=rngs))
 
@@ -468,7 +468,7 @@ class xLSTM(nnx.Module):
         mlstm_per_layer: int = 1,
         slstm_per_layer: int = 1
     ):
-        self.layers = []
+        self.layers = nnx.List()
         for _ in range(num_layers):
             self.layers.append(xLSTMModule(hidden_size, num_heads, mlstm_per_layer, slstm_per_layer, rngs))
 

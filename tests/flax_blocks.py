@@ -63,7 +63,7 @@ class Encoder(nnx.Module):
     normalization: nnx.Module
 
     def __init__(self, num_layers: int, rngs: nnx.Rngs):
-        self.cnn_layers = []
+        self.cnn_layers = nnx.List()
 
         for i in range(num_layers):
             in_channels = (2 ** i)
@@ -97,8 +97,8 @@ class Decoder(nnx.Module):
     output_polling: nnx.Conv
 
     def __init__(self, num_layers: int, rngs: nnx.Rngs):
-        self.cnn_layers = []
-        self.residual_norm_layers = []
+        self.cnn_layers = nnx.List()
+        self.residual_norm_layers = nnx.List()
 
         input_features = 2 ** num_layers
         for i in range(num_layers):

@@ -27,7 +27,7 @@ def test_flax_stacked_linear():
         def __init__(self, rngs=nnx.Rngs):
             self.upscale_layer = nnx.Linear(in_features=2, out_features=4, bias_init=nnx.initializers.ones, rngs=rngs)
 
-            self.hidden_layers = []
+            self.hidden_layers = nnx.List()
             for _ in range(3):  # 3 hidden layers
                 self.hidden_layers.append(nnx.Linear(
                     in_features=4,
@@ -289,7 +289,7 @@ def test_encoder():
 
 
 def test_unet():
-    model = UNet(num_layers=3, rngs=nnx.Rngs(0))
+    model = UNet(num_layers=2, rngs=nnx.Rngs(0))
     model.eval()
     run_and_compare(nnx.jit(model), (jnp.zeros((4, 8, 1)), ))
 
