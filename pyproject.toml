@@ -66,9 +66,10 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "torch",
+    "torch>=2.9.1",
     "torchvision",
-    "torch_xla2",
+    "torchax",
+    "flax", # torchax wants flax to be installed
     "transformers",
 ]
 

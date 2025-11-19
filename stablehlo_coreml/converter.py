@@ -1145,8 +1145,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 for acc, result in zip(partial_results, reduction_results)
             ]
 
+        def get_result_type(result_type):
+            if hasattr(result_type, 'dtype'):
+                return result_type.dtype
+            elif hasattr(result_type, 'element_type'):
+                return self.__get_dtype(result_type.element_type)
+            else:
+                raise ValueError("Unable to resolve result type dtype")
+
         mil_results = [
-            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type)))
+            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(get_result_type(result_type)))
             for result_type in result_types
         ]
         mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
