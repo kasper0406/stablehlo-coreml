@@ -276,6 +276,17 @@ def test_complex_gather():
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
 
+    start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims = (3, 4),
+        collapsed_slice_dims = (),
+        operand_batching_dims = (0, 1),
+        start_indices_batching_dims = (0, 1),
+        start_index_map = (3, 2),
+    )
+    result = wrapped_gather(dimension_numbers, (1, 1, 1, 1))(operand, start_indices)
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 1)), (operand, start_indices))
+
 
 def test_simple_scatter():
     def scatter_set(arr):
