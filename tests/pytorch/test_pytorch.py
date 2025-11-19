@@ -25,7 +25,8 @@ def export_to_stablehlo_module(pytorch_model, inputs):
         # which is not registered with jax for jitting.
         # We will try to convert it to a dict first.
         try:
-            return dict(out)
+            out_dict = dict(out)
+            return {k: v for k, v in out_dict.items() if isinstance(v, jax.Array)}
         except (TypeError, ValueError):
             return out
 
