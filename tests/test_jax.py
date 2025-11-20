@@ -241,6 +241,127 @@ def test_gather():
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
 
+def test_complex_gather():
+    from jax.lax import GatherDimensionNumbers
+
+    def wrapped_gather(dimension_numbers, slice_sizes):
+        @jax.jit
+        def internal_gather(operand, start_indices):
+            return jax.lax.gather(
+                operand=operand,
+                start_indices=start_indices,
+                dimension_numbers=dimension_numbers,
+                slice_sizes=slice_sizes,
+            )
+        return internal_gather
+
+    start_indices = [
+                     [
+                      [[0, 0], [1, 0], [2, 1]],
+                      [[0, 1], [1, 1], [0, 9]]
+                     ],
+                     [
+                      [[0, 0], [2, 1], [2, 2]],
+                      [[1, 2], [0, 1], [1, 0]]
+                     ]
+                    ]
+    start_indices = jnp.array(start_indices, dtype=jnp.int32)
+    operand = jnp.arange(1, 49).reshape((2, 3, 4, 2))
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims = (3, 4),
+        collapsed_slice_dims = (1,),
+        operand_batching_dims = (0,),
+        start_indices_batching_dims = (0,),
+        start_index_map = (2, 1),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
+
+    start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims = (3, 4),
+        collapsed_slice_dims = (),
+        operand_batching_dims = (0, 1),
+        start_indices_batching_dims = (0, 1),
+        start_index_map = (3, 2),
+    )
+    result = wrapped_gather(dimension_numbers, (1, 1, 1, 1))(operand, start_indices)
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 1)), (operand, start_indices))
+
+
+def test_simple_scatter():
+    def scatter_set(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].set(updates)
+    run_and_compare(scatter_set, (jnp.zeros((30,)),))
+
+    def scatter_add(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].add(updates)
+    run_and_compare(scatter_add, (jnp.zeros((30,)),))
+
+    def scatter_sub(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].subtract(updates)
+    run_and_compare(scatter_sub, (jnp.zeros((30,)),))
+
+    def scatter_mul(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].multiply(updates)
+    run_and_compare(scatter_mul, (jnp.zeros((30,)),))
+
+    def scatter_div(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].divide(updates)
+    run_and_compare(scatter_div, (jnp.zeros((30,)),))
+
+    def scatter_max(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].max(updates)
+    run_and_compare(scatter_max, (jnp.zeros((30,)),))
+
+    def scatter_min(arr):
+        indices = jnp.arange(arr.shape[0] // 2) * 2
+        updates = jnp.arange(indices.shape[0])
+        return arr.at[indices].min(updates)
+    run_and_compare(scatter_min, (jnp.zeros((30,)),))
+
+
+def test_scatter():
+    from jax.lax import ScatterDimensionNumbers
+
+    def wrapped_scatter_add(dimension_numbers):
+        @jax.jit
+        def internal_scatter_add(operand, scatter_indices, updates):
+            return jax.lax.scatter_add(
+                operand=operand,
+                scatter_indices=scatter_indices,
+                updates=updates,
+                dimension_numbers=dimension_numbers,
+            )
+        return internal_scatter_add
+
+    # https://raw.githubusercontent.com/openxla/stablehlo/bd8d708/docs/images/spec/scatter.svg
+    # original test case features partially filled update dimension windows
+
+    scatter_indices = [[[0, 2], [1, 0], [2, 1]], [[0, 1], [1, 0], [0, 9]]]
+    scatter_indices = jnp.array(scatter_indices)
+    operand = jnp.arange(1, 25).reshape((3, 4, 2))
+    update = jnp.ones((2, 3, 2), dtype=jnp.int32)
+    dimension_numbers = ScatterDimensionNumbers(
+        update_window_dims = (2,),
+        inserted_window_dims = (0, 1),
+        scatter_dims_to_operand_dims = (1, 0),
+    )
+
+    run_and_compare_specific_input(wrapped_scatter_add(dimension_numbers), (operand, scatter_indices, update))
+
+
 def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((0, 0), (10, 5))), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((0, 10), (5, 0), (2, 1))), (jnp.zeros((10, 20, 15)),))
@@ -252,9 +373,6 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="linear_ramp"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="maximum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="mean"), (jnp.zeros((10, 20)),))
-
-    # Currently conversion for `SortOp`` is not implemented, which median finding relies on
-    # run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
-
+    run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))

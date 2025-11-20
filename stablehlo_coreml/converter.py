@@ -6,7 +6,10 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
+from .utils import (
+    RankedSliceType, index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
+    inverse_permutation
+)
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
@@ -20,6 +23,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    ScatterOp, SortOp, RemOp, FloorOp, CeilOp, ClampOp, CaseOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -141,6 +145,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_subtract(self, context: TranslationContext, op: SubtractOp):
         self.__simple_binary_op(context, mb.sub, op)
+
+    @register_stablehlo_op
+    def op_rem(self, context: TranslationContext, op: RemOp):
+        self.__simple_binary_op(context, mb.mod, op)
 
     @register_stablehlo_op
     def op_mul(self, context: TranslationContext, op: MulOp):
@@ -372,7 +380,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_reshape(self, context: TranslationContext, op: ReshapeOp):
         x = context[op.operand.get_name()]
         new_shape = op.result.type.shape
-        reshape_res = mb.reshape(x=x, shape=new_shape)
+        if len(new_shape) == 0:
+            reshape_res = mb.squeeze(x=x)
+        else:
+            reshape_res = mb.reshape(x=x, shape=new_shape)
         context.add_result(op.result, reshape_res)
 
     @register_stablehlo_op
@@ -436,7 +447,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
-        cml_op = cml_op_builder(x=lhs, y=rhs)
+        if types.is_bool(lhs.dtype):
+            if comparison_direction == "EQ":
+                cml_op = mb.logical_not(x=mb.logical_xor(x=lhs, y=rhs))
+            elif comparison_direction == "NE":
+                cml_op = mb.logical_xor(x=lhs, y=rhs)
+            else:
+                raise ValueError("Boolean inequalities are not supported!")
+        else:
+            cml_op = cml_op_builder(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -676,6 +695,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.minimum, op)
 
     @register_stablehlo_op
+    def op_floor(self, context: TranslationContext, op: FloorOp):
+        self.__simple_unary_op(context, mb.floor, op)
+
+    @register_stablehlo_op
+    def op_ceil(self, context: TranslationContext, op: CeilOp):
+        self.__simple_unary_op(context, mb.ceil, op)
+
+    @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
         self.__simple_unary_op(context, mb.rsqrt, op)
 
@@ -762,11 +789,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
+        def pad_maybe_int(*, x, pad, constant_val):
+            if types.is_float(x.dtype):
+                return mb.pad(x=x, pad=pad, constant_val=constant_val)
+            for i, (before, after) in enumerate(zip(pad[::2], pad[1::2])):
+                before = mb.fill(shape=x.shape[:i] + (before,) + x.shape[i + 1:], value=constant_val)
+                after = mb.fill(shape=x.shape[:i] + (after,) + x.shape[i + 1:], value=constant_val)
+                x = mb.concat(values=(before, x, after), axis=i)
+            return x
+
         # Pad the inputs if required
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                pad_maybe_int(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
@@ -818,6 +854,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     for result in idx_result_types
                 ]
 
+            mock_result_types = [RankedSliceType(i.shape, j.element_type) for i, j in zip(idx_result_types, result_types)]
             results = self.__compute_windowed_reduction(
                 context=context,
                 inputs=idx_inputs,
@@ -825,7 +862,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 window_strides=idx_window_strides,
                 body=op.body,
                 init_values=init_values,
-                result_types=idx_result_types,
+                result_types=mock_result_types,
             )
 
             result_rank = inputs_rank - loop_shape_rank
@@ -875,12 +912,40 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         start_indices_rank = len(start_indices.shape)
 
         dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
+        dim_mapping = dim_numbers.start_index_map
+        dim_batches = dim_numbers.operand_batching_dims
+
+        if dim_numbers.index_vector_dim != start_indices_rank - 1:
+            raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
+        if dim_batches != dim_numbers.start_indices_batching_dims:
+            raise ValueError("Operand and index batch dimensions are only supported if they match")
+        inferred_sizes = np.array([
+            1 if i in dim_mapping or i in dim_batches else
+            operand.shape[i] for i in range(operand_rank)])
+        if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
+                np.all(np.array(op.slice_sizes) == inferred_sizes):
+            upper, lower = [operand.shape[i] - 1 for i in dim_mapping], [0] * len(dim_mapping)
+            broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
+            clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
+            clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
+            if len(dim_mapping) == 1:
+                if start_indices_rank > 1:
+                    clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
+                result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
+                context.add_result(op.result, result)
+                return
+            elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
+                result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
+                window_outputs = [i for i in range(operand_rank) if i not in dim_batches and i not in dim_numbers.collapsed_slice_dims]
+                window_outputs = [j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1]
+                result = mb.expand_dims(x=result, axes=window_outputs)
+                context.add_result(op.result, result)
+                return
+
         if dim_numbers.operand_batching_dims != []:
             raise ValueError("Batched operand dims gather is not supported!")
         if dim_numbers.start_indices_batching_dims != []:
             raise ValueError("Batched start indices gather is not supported!")
-        if dim_numbers.index_vector_dim != start_indices_rank - 1:
-            raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
         result_rank = len(op.result.type.shape)
         slice_sizes = op.slice_sizes
@@ -893,8 +958,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             slice_end = []
 
             for operand_dim in range(operand_rank):
-                if operand_dim in dim_numbers.start_index_map:
-                    start_index_dim = dim_numbers.start_index_map.index(operand_dim)
+                if operand_dim in dim_mapping:
+                    start_index_dim = dim_mapping.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
                     start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
@@ -937,6 +1002,224 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
         context.add_result(op.result, result)
+
+    @register_stablehlo_op
+    def op_scatter(self, context: TranslationContext, op: ScatterOp):
+        dim_numbers = hlo.ScatterDimensionNumbers(op.scatter_dimension_numbers)
+        dim_mapping = dim_numbers.scattered_dims_to_operand_dims
+        operand = context[op.inputs[0].get_name()]
+        scatter_indices = context[op.scatter_indices.get_name()]
+        updates = context[op.updates[0].get_name()]
+
+        if len(dim_numbers.input_batching_dims) > 0:
+            raise ValueError("Scatter batching index is not supported!")
+        if np.max(dim_mapping) >= len(dim_mapping):
+            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
+        if len(op.inputs) != 1 or len(op.updates) != 1:
+            raise ValueError("Scatter with multiple operands is not supported!")
+        # MIL only supports scatter window update sizes that match the operand shape
+        #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
+        # [sic] via
+        #     https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather.scatter_nd
+        if scatter_indices.shape != (1,) and updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
+            raise ValueError("Scatter windows that only partially fill dimensions are not supported!")
+
+        # this can be done pre-emptively because of the constraint on scatter windows
+        scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
+
+        # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
+        # TODO: Consider refactoring. Can maybe be combined with the reduction type sniffing
+        def match_update_computation(hlo_body):
+            if len(hlo_body.blocks) != 1:
+                return None
+            args = list(hlo_body.blocks[0].arguments)
+            ops = list(hlo_body.blocks[0].operations)
+            if not isinstance(ops[-1], ReturnOp):
+                return None
+            if len(ops) == 1 and ops[0].operands[0] == args[1]:
+                return "update"
+            if len(ops) != 2 or \
+                    list(ops[0].operands) != args or \
+                    list(ops[1].operands) != list(ops[0].results):
+                return None
+
+            mode_map = {
+                AddOp: "add",
+                SubtractOp: "sub",
+                MulOp: "mul",
+                DivOp: "div",
+                MaxOp: "max",
+                MinOp: "min",
+            }
+            return mode_map.get(type(ops[0]), None)
+
+        mode = match_update_computation(op.update_computation)
+        if mode is None:
+            raise ValueError("Unsupported update mode for scatter operation")
+
+        upper_bound = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
+        valid = mb.logical_and(
+                x=mb.greater_equal(x=scatter_indices, y=0),
+                y=mb.less(x=scatter_indices, y=upper_bound))
+        along = lambda n: mb.slice_by_index(
+                x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
+                end=scatter_indices.shape[:-1] + (n + 1,))
+
+        # if there's too many axes to unroll reasonably, there's too many to use
+        reduction = along(0)
+        for i in range(1, scatter_indices.shape[-1]):
+            reduction = mb.logical_and(x=reduction, y=along(i))
+        reduction = mb.squeeze(x=reduction, axes=(scatter_indices.rank - 1,))
+
+        if reduction.rank == 0:
+            assert scatter_indices.shape == (1,), \
+                    f"unexpected input shape for scatter indices of {scatter_indices.shape}"
+            assert updates.rank == operand.rank
+
+            update_bound = scatter_indices
+            axis0 = lambda operand, bound: bound if operand.rank <= 1 else mb.concat(
+                    values=(bound, operand.shape[1:]), axis=0)
+            before = mb.slice_by_index(x=operand, begin=(0,) * operand.rank, end=axis0(operand, update_bound))
+
+            update_bound = mb.minimum(x=mb.add(x=scatter_indices, y=updates.shape[:1]), y=operand.shape[:1])
+            after = mb.slice_by_index(x=operand, begin=update_bound, end=axis0(operand, update_bound))
+
+            update_bound = mb.sub(x=update_bound, y=scatter_indices)
+            updates = mb.slice_by_index(x=updates, begin=(0,) * updates.rank, end=axis0(updates, update_bound))
+
+            result = mb.select(
+                    cond=reduction,
+                    a=mb.concat(values=(before, updates, after), axis=0),
+                    b=operand)
+        else:
+            where = mb.non_zero(x=reduction)
+            scatter_indices = mb.gather_nd(x=scatter_indices, indices=where)
+            updates = mb.gather_nd(x=updates, indices=where)
+            result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
+        context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_sort(self, context: TranslationContext, op: SortOp):
+        inputs = [context[operand.get_name()] for operand in op.inputs]
+        if len(tracing := op.comparator.blocks) != 1 or not isinstance(tracing := tracing[0].operations[-1], ReturnOp):
+            raise ValueError("Unsupported comparator format!")
+        tracing = tracing.operands[0].owner.opview
+        args = list(op.comparator.blocks[0].arguments)
+        selecting = any(isinstance(i, SelectOp) for i in op.comparator.blocks[0].operations)
+        priorities = self.__verify_totalsort(tracing, args, inputs) \
+                if selecting else self.__verify_lexsort(tracing, args, inputs)
+        if priorities is None:
+            raise ValueError("Unrecognized comparator format; only lexsort and float sort are supported!")
+
+        sort_dim, (key, ascending) = op.dimension.value, priorities[-1]
+        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        for key, ascending in priorities[-2::-1]:
+            gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
+            relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+
+        for i, tensor in enumerate(inputs):
+            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+
+    def __verify_lexsort(self, tracing, args, inputs):
+        remaining, expecting, priorities = None, None, []
+        while tracing:
+            match tracing:
+                case CompareOp():
+                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    if tracing.lhs not in args or tracing.rhs not in args:
+                        return None
+                    lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
+                    if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
+                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2 or lhs + 1 != rhs):
+                        return None
+                    if not expecting:
+                        priorities.append((inputs[lhs // 2], direction == "LT"))
+                    expecting = None if expecting else (lhs, rhs)
+                    tracing, remaining = remaining, None
+                case OrOp() if not expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case AndOp() if expecting:
+                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
+                case _:
+                    return None
+        return priorities
+
+    def __verify_totalsort(self, tracing, args, inputs):
+        if not isinstance(tracing, CompareOp) or len(args) > 2 or len(inputs) > 1:
+            return None
+        direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+        lhs = self.__verify_zero_nan(tracing.lhs.owner.opview, args)
+        rhs = self.__verify_zero_nan(tracing.rhs.owner.opview, args)
+        if direction not in ("LT", "GT") or lhs is None or rhs is None or lhs == rhs:
+            return None
+        return [(inputs[lhs], direction == "LT")]
+
+    def __verify_zero_nan(self, tracing, args):
+        remaining, idx = None, None
+        selecting, comparing = [lambda x: np.array(x) == 0, np.isnan], ["EQ", "NE"]
+        while tracing:
+            match tracing:
+                case SelectOp():
+                    const = tracing.operands[1].owner.opview.value
+                    if not len(selecting) or not selecting.pop()(const):
+                        return None
+                    if len(selecting):
+                        remaining = tracing.operands[2].owner.opview
+                        tracing = tracing.operands[0].owner.opview
+                    else:
+                        if idx is None or tracing.operands[2] != args[idx]:
+                            return None
+                        tracing, remaining = tracing.operands[0].owner.opview, None
+                case CompareOp():
+                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
+                    if not len(comparing) or direction != comparing.pop():
+                        return None
+                    if len(comparing):
+                        if tracing.lhs != tracing.rhs or tracing.lhs not in args or len(selecting) != 1:
+                            return None
+                        idx = args.index(tracing.lhs)
+                        tracing, remaining = remaining, None
+                    else:
+                        const = np.array(tracing.rhs.owner.opview.value)
+                        if const != 0 or tracing.lhs != args[idx]:
+                            return None
+                        tracing = None
+                case _:
+                    return None
+        return idx
+
+    @register_stablehlo_op
+    def op_clamp(self, context: TranslationContext, op: ClampOp):
+        min = context[op.min.get_name()]
+        max = context[op.max.get_name()]
+        operand = context[op.operand.get_name()]
+        result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
+        context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_case(self, context: TranslationContext, op: CaseOp):
+        index = context[op.index.get_name()]
+
+        def params(i):
+            closure, args = [], []
+            for j in op.branches[i].blocks[0].operations:
+                for k in j.operands:
+                    if k.get_name() in context.variables[context.path()]:
+                        closure.append(k)
+                        args.append(context[k.get_name()])
+            return (closure, op.branches[i], args)
+
+        # TODO: the branches should only be invoked inside the _true_fn and _false_fn
+        remaining = self.__invoke_hlo_function(context, "branch_default", *params(-1))
+        for i in reversed(range(len(op.branches) - 1)):
+            current = self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
+            remaining = mb.cond(
+                    pred=mb.equal(x=index, y=i),
+                    _true_fn=(lambda x: lambda: x)(current),
+                    _false_fn=(lambda x: lambda: x)(remaining))
+        for i, result in enumerate(remaining):
+            context.add_result(op.results[i], result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
