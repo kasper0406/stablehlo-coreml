@@ -21,7 +21,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
 )
-from jaxlib.mlir.dialects.mhlo import (TopKOp)
+from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
@@ -568,8 +568,54 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     output_shape=output_shape
                 )
 
-                # We need to subtract 1 from the padding to make the dimensions line up
-                pad -= 1
+                # Calculate the padding for the transposed convolution
+                # We need to invert the padding: p_transpose = K - 1 - p_original
+                # If the target padding is negative, we need to pad the input x
+                kernel_spatial_dims = dim_spec.kernel_spatial_dimensions
+                raw_weight_shape = context[op.rhs.get_name()].shape
+                kernel_sizes = [raw_weight_shape[d] for d in kernel_spatial_dims]
+
+                new_pad_out = []
+                pad_in = []
+
+                for i in range(len(kernel_sizes)):
+                    k = kernel_sizes[i]
+                    s = strides[i]
+                    d = kernel_dilation[i] if kernel_dilation is not None else 1
+                    k_eff = (k - 1) * d + 1
+
+                    p_low = pad[2*i]
+                    p_high = pad[2*i+1]
+
+                    # Target crop
+                    t_low = k_eff - 1 - p_low
+                    t_high = k_eff - 1 - p_high
+
+                    # Calculate input padding needed to satisfy non-negative crop
+                    # pad_in >= ceil(-t / s)
+                    pi_low = max(0, (-t_low + s - 1) // s)
+                    pi_high = max(0, (-t_high + s - 1) // s)
+
+                    # Calculate output crop
+                    po_low = t_low + pi_low * s
+                    po_high = t_high + pi_high * s
+
+                    new_pad_out.extend([po_low, po_high])
+                    pad_in.extend([pi_low, pi_high])
+
+                pad = np.array(new_pad_out, dtype=np.int32)
+                pad_in = np.array(pad_in, dtype=np.int32)
+
+                if np.any(pad_in > 0):
+                    # Apply padding to x
+                    # x is [batch, channel, spatial...]
+                    x_rank = len(x.shape)
+                    full_pad_in = np.zeros(2 * x_rank, dtype=np.int32)
+                    # Fill spatial padding starting at dimension 2
+                    for i in range(len(pad_in)):
+                        full_pad_in[4 + i] = pad_in[i]
+                    x = mb.pad(x=x, pad=full_pad_in)
+
                 if np.any(pad < 0):
                     raise ValueError("The case where the padding turns negative when translating to a "
                                      "transposed convolution is not supported.")
@@ -901,6 +947,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 case "mhlo.topk":
                     mapped_op = TopKOp
                     op_impl = self._op_mhlo_topk
+                case "mhlo.asin":
+                    mapped_op = AsinOp
+                    op_impl = self._op_mhlo_asin
+                case "mhlo.sinh":
+                    mapped_op = SinhOp
+                    op_impl = self._op_mhlo_sinh
+                case "mhlo.asinh":
+                    mapped_op = AsinhOp
+                    op_impl = self._op_mhlo_asinh
+                case "mhlo.acos":
+                    mapped_op = AcosOp
+                    op_impl = self._op_mhlo_acos
+                case "mhlo.cosh":
+                    mapped_op = CoshOp
+                    op_impl = self._op_mhlo_cosh
+                case "mhlo.acosh":
+                    mapped_op = AcoshOp
+                    op_impl = self._op_mhlo_acosh
+                case "mhlo.atanh":
+                    mapped_op = AtanhOp
+                    op_impl = self._op_mhlo_atanh
 
             if not mapped_op:
                 raise ValueError(f"mhlo op '{op.call_target_name.value}' is not implemented")
@@ -930,6 +997,56 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         descending = op.largest is None or op.largest.value
         mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
         return mil_res
+
+    def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.asin(x=x)
+        return [mil_res]
+
+    def _op_mhlo_sinh(self, context: TranslationContext, op: SinhOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.sinh(x=x)
+        return [mil_res]
+
+    def _op_mhlo_asinh(self, context: TranslationContext, op: AsinhOp):
+        x = context[op.operand.get_name()]
+        # asinh(x) = log(x + sqrt(x^2 + 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
+        sqrt_part = mb.sqrt(x=x_sq_plus_1)
+        log_arg = mb.add(x=x, y=sqrt_part)
+        mil_res = mb.log(x=log_arg)
+        return [mil_res]
+
+    def _op_mhlo_acos(self, context: TranslationContext, op: AcosOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.acos(x=x)
+        return [mil_res]
+
+    def _op_mhlo_cosh(self, context: TranslationContext, op: CoshOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.cosh(x=x)
+        return [mil_res]
+
+    def _op_mhlo_acosh(self, context: TranslationContext, op: AcoshOp):
+        x = context[op.operand.get_name()]
+        # acosh(x) = log(x + sqrt(x^2 - 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
+        sqrt_part = mb.sqrt(x=x_sq_minus_1)
+        log_arg = mb.add(x=x, y=sqrt_part)
+        mil_res = mb.log(x=log_arg)
+        return [mil_res]
+
+    def _op_mhlo_atanh(self, context: TranslationContext, op: AtanhOp):
+        x = context[op.operand.get_name()]
+        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
+        one_plus_x = mb.add(x=1.0, y=x)
+        one_minus_x = mb.sub(x=1.0, y=x)
+        div_res = mb.real_div(x=one_plus_x, y=one_minus_x)
+        log_res = mb.log(x=div_res)
+        mil_res = mb.mul(x=0.5, y=log_res)
+        return [mil_res]
 
     def __invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
@@ -1028,8 +1145,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 for acc, result in zip(partial_results, reduction_results)
             ]
 
+        def get_result_type(result_type):
+            if hasattr(result_type, 'dtype'):
+                return result_type.dtype
+            elif hasattr(result_type, 'element_type'):
+                return self.__get_dtype(result_type.element_type)
+            else:
+                raise ValueError("Unable to resolve result type dtype")
+
         mil_results = [
-            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type)))
+            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(get_result_type(result_type)))
             for result_type in result_types
         ]
         mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
