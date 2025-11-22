@@ -6,6 +6,65 @@ from jaxlib.mlir.dialects.stablehlo import (
 from jax._src.lib.mlir.dialects import hlo
 
 
+def stable_argsort(x, axis=-1, ascending=True, argsort_op=np.argsort):
+    """
+    Implements a stable argsort using an unstable argsort op.
+
+    Args:
+        x: Input tensor.
+        axis: Axis to sort along.
+        ascending: Boolean, sort direction.
+        argsort_op: The unstable argsort function to use.
+    """
+    # 1. Generate the Tie-Breaker (Iota/Indices)
+    # This must be the same shape as x or broadcastable
+    n = x.shape[axis]
+
+    # Create a grid of indices [0, 1, 2... N-1]
+    # (implementation depends on framework, e.g., iota or meshgrid)
+    indices = np.indices(x.shape)[axis].astype(np.uint64)
+
+    # 2. Prepare the Primary Key (Bit-Twiddling)
+    if np.issubdtype(x.dtype, np.floating):
+        # Map floats to unsigned integers that preserve order
+        # IEEE 754 mapping ensures:
+        # - Negatives are reversed (so -2 < -1)
+        # - Positives are offset to be larger than negatives
+        x_uint = x.view(np.uint32).astype(np.uint64) # Assuming 32-bit float
+
+        # Mask for negative numbers (sign bit set)
+        # If sign bit is 1 (negative), we invert all bits to reverse order
+        # If sign bit is 0 (positive), we flip the sign bit to 1 to place it above negatives
+        mask = (x_uint & 0x80000000) >> 31
+        mask_neg = mask * 0xFFFFFFFF           # All 1s if negative
+        mask_pos = (1 - mask) * 0x80000000     # Sign bit 1 if positive
+
+        key_uint = x_uint ^ (mask_neg | mask_pos)
+    else:
+        # Integers are easier, just cast to unsigned
+        key_uint = x.astype(np.uint64)
+        # Handle signed int negatives if necessary by adding bias
+        # (Simple cast works for positive ints, signed requires bit flip on MSB)
+        if np.issubdtype(x.dtype, np.signedinteger):
+             key_uint ^= (1 << 63) # Flip MSB to shift range
+
+    # 3. Handle Descending Request
+    # We do NOT pass 'descending' to the op.
+    # We bit-invert the key so largest values become smallest,
+    # but we keep the indices untouched to preserve stability.
+    if not ascending:
+        key_uint = ~key_uint
+
+    # 4. Create Composite Key
+    # Shift Key to upper 32 bits, Index to lower 32 bits
+    # (Adjust bit-widths based on your data types)
+    composite_key = (key_uint << np.uint64(32)) | indices
+
+    # 5. Perform Unstable Sort on Unique Keys
+    # We always sort ASCENDING because we handled direction in step 3.
+    return argsort_op(composite_key, axis=axis)
+
+
 def match_sort(comparator_root, args, inputs):
     """
     Analyzes the comparator region of a SortOp to determine if it implements a multi-key (lexicographical) sort.

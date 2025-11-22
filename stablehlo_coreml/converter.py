@@ -7,6 +7,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
 from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
+from .sort_utils import stable_argsort
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
@@ -424,7 +425,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         for key, ascending in sort_keys[-2::-1]:
             gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
-            relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+            relative_indices = stable_argsort(x=gathered_key, axis=sort_dim, ascending=ascending, argsort_op=mb.argsort)
             indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
