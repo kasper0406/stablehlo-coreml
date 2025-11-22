@@ -60,11 +60,14 @@ def match_sort(comparator_root, args, inputs):
     def match_comparison(op, expected_direction=None):
         if not isinstance(op, CompareOp):
             return None
+
         direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
         if expected_direction and direction != expected_direction:
             return None
+
         if expected_direction is None and direction not in ("LT", "GT"):
-             return None
+            return None
+
         return op
 
     def match_select_chain(op):
