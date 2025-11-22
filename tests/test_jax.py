@@ -285,7 +285,7 @@ def test_complex_gather():
         offset_dims = (3, 4),
         collapsed_slice_dims = (1,),
         operand_batching_dims = (0,),
-        start_indices_batching_dims = (0,),
+        start_indices_batching_dims = (1,),
         start_index_map = (2, 1),
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
