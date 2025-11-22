@@ -374,10 +374,6 @@ def test_multi_input_argsort():
     ))
 
 
-def test_argsort_fails_when_stable():
-    pass
-
-
 def test_case():
     def switch_fn(index, x):
         return jax.lax.switch(index, [
