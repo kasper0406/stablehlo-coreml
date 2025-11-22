@@ -1,7 +1,7 @@
 import numpy as np
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.stablehlo import (
-    CompareOp, SelectOp, OrOp, AndOp
+    CompareOp, SelectOp, OrOp, AndOp, ConstantOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -203,18 +203,19 @@ def match_total_order_arg(tracing, args):
         match tracing:
             case SelectOp():
                 const_op = get_op(tracing.operands[1])
-                if not const_op:
+                if not const_op or not isinstance(const_op, ConstantOp):
                     return None
                 const = const_op.value
 
                 if not len(selecting) or not selecting.pop()(const):
                     return None
-                if len(selecting):
+                if len(selecting): # select CompareOp %cst_# (=NaN) SelectOp
                     remaining = get_op(tracing.operands[2])
                     tracing = get_op(tracing.operands[0])
                     if not remaining or not tracing:
                         return None
-                else:
+                else: # select CompareOp %cst_# (=0) %arg#
+                    # we should know the arg index from the popped CompareOp
                     if idx is None or tracing.operands[2] != args[idx]:
                         return None
                     tracing = get_op(tracing.operands[0])
@@ -225,14 +226,18 @@ def match_total_order_arg(tracing, args):
                 direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
                 if not len(comparing) or direction != comparing.pop():
                     return None
-                if len(comparing):
-                    if tracing.lhs != tracing.rhs or tracing.lhs not in args or len(selecting) != 1:
+                if len(comparing): # `np.isnan` via `NE %arg# %arg#`
+                    if tracing.lhs != tracing.rhs or tracing.lhs not in args:
+                        return None
+                    # ensure op types are interleaved as expected
+                    # by checking the size of the selection queue
+                    if len(selecting) != 1:
                         return None
                     idx = args.index(tracing.lhs)
                     tracing, remaining = remaining, None
-                else:
+                else: # merge `-0` and `+0` via `EQ %arg# %cst_# (=0.)`
                     rhs_op = get_op(tracing.rhs)
-                    if not rhs_op:
+                    if not rhs_op or not isinstance(rhs_op, ConstantOp):
                         return None
                     const = np.array(rhs_op.value)
                     if const != 0 or tracing.lhs != args[idx]:
