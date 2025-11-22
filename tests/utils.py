@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 from jax.export import export as _jax_export
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
@@ -33,7 +34,12 @@ def jax_export(jax_func, input_spec):
 def generate_random_from_shape(input_spec, key=jax.random.PRNGKey):
     shape = input_spec.shape
     dtype = input_spec.dtype
-    output = jax.random.normal(key=key, shape=shape, dtype=dtype)
+    if jnp.issubdtype(dtype, jnp.integer):
+        output = jax.random.randint(key=key, shape=shape, minval=-100, maxval=100, dtype=dtype)
+    elif jnp.issubdtype(dtype, jnp.bool_):
+        output = jax.random.bernoulli(key=key, shape=shape).astype(dtype)
+    else:
+        output = jax.random.normal(key=key, shape=shape, dtype=dtype)
     return output
 
 
