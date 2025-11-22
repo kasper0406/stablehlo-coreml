@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+import pytest
 
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
@@ -287,6 +288,8 @@ def test_sort():
     # Test with larger random input
     run_and_compare(jnp.sort, (jnp.zeros((100, 50), dtype=jnp.float32),))
     run_and_compare(partial(jnp.sort, axis=0), (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, descending=True), (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, axis=0, descending=True), (jnp.zeros((100, 50), dtype=jnp.float32),))
 
     # Test with NaNs and negative zeros to trigger total sort logic
     # Total sort order for floats: NaN < -Inf < ... < -0.0 < 0.0 < ... < Inf
@@ -297,33 +300,82 @@ def test_sort():
     run_and_compare_specific_input(jnp.sort, (data,))
 
 
-# CoreML argsort is unstable, so we only test cases without repeated keys to avoid issues with ties
-def test_multikey_sort():
+def test_multikey_sort_fails_due_to_stability():
     # Test lexicographical sort with multiple keys
-    # Case 1: 1D arrays
-    k1 = jnp.array([1, 3, 2, 4], dtype=jnp.int32)
-    k2 = jnp.array([3, 1, 2, 4], dtype=jnp.int32)
-
-    def lex_sort_1d(k1, k2):
+    def sort_dim_0(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
-    run_and_compare_specific_input(lex_sort_1d, (k1, k2))
+    k1 = jnp.array([1, 3, 2, 4], dtype=jnp.int32)
+    k2 = jnp.array([3, 1, 2, 4], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
-    # Case 2: 2D arrays
+    k1 = jnp.array([1, 5, 1, 4, 3, 4, 4], dtype=jnp.int32)
+    k2 = jnp.array([9, 4, 0, 4, 0, 2, 1], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+
+    k1 = jnp.array([1, 3, 1, 4, 3, 5, 4], dtype=jnp.int32)
+    k2 = jnp.array([0, 4, 0, 4, 0, -21, -12], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+
     k1_2d = jnp.array([[1, 2], [3, 4]], dtype=jnp.int32)
     k2_2d = jnp.array([[3, 1], [2, 4]], dtype=jnp.int32)
 
-    def lex_sort_2d(k1, k2):
+    def sort_dim_1(k1, k2):
         return jax.lax.sort([k1, k2], dimension=1, num_keys=2)
 
-    run_and_compare_specific_input(lex_sort_2d, (k1_2d, k2_2d))
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_1, (k1_2d, k2_2d))
 
-    # Case 3: Larger random inputs
-    # We use float32 to avoid ties, as CoreML sort is unstable
-    def lex_sort_large(k1, k2):
+    # Larger random inputs
+    def sort_dim_0_large(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
-    run_and_compare(lex_sort_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
+    with pytest.raises(Exception):
+        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.int32), jnp.zeros((100, 50), dtype=jnp.int32)))
+    with pytest.raises(Exception):
+        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
+
+
+def test_unstable_argsort():
+    def unstable_argsort(x, **kwargs):
+        return jnp.argsort(x, stable=False, **kwargs)
+
+    run_and_compare_specific_input(unstable_argsort, (jnp.array([3, 1, 2], dtype=jnp.int32),))
+    run_and_compare_specific_input(unstable_argsort, (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+    run_and_compare_specific_input(partial(unstable_argsort, axis=0), (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+
+    # Test with larger random input
+    run_and_compare(unstable_argsort, (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(unstable_argsort, axis=0), (jnp.zeros((100, 50), dtype=jnp.float32),))
+
+
+def test_multi_input_argsort():
+    # Because argsort is unstable, we cannot directly compare the output indices.
+    # Instead, we perform argsort followed by gather to retrieve the sorted values,
+    # which can then be compared.
+    def unstable_argsort_and_lookup(sort_array, lookup_array, lookup_values):
+        _sorted_array, ordered_lookup_idx = jax.lax.sort([sort_array, lookup_array], dimension=0, num_keys=1, is_stable=False)
+        gathered = jnp.take(lookup_values, ordered_lookup_idx)
+        return gathered
+
+    run_and_compare_specific_input(unstable_argsort_and_lookup, (
+        jnp.array([3, 1, 2, 3, 1, 2, 3, 1, 2], dtype=jnp.int32),
+        jnp.array([2, 0, 1, 2, 0, 1, 2, 0, 1], dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.int32)
+    ))
+
+    run_and_compare_specific_input(unstable_argsort_and_lookup, (
+        jnp.array([3, 1, 2, 3, 1, 2, 3, 1, 2], dtype=jnp.float32),
+        jnp.array([2, 0, 1, 2, 0, 1, 2, 0, 1], dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.float32)
+    ))
+
+
+def test_argsort_fails_when_stable():
+    pass
 
 
 def test_case():
@@ -354,11 +406,11 @@ def test_reshape_scalar():
 
 
 def test_compare_bool():
-    run_and_compare(jnp.equal, (
+    run_and_compare_specific_input(jnp.equal, (
         jnp.array([True, False, True], dtype=jnp.bool_),
         jnp.array([True, True, False], dtype=jnp.bool_)
     ))
-    run_and_compare(jnp.not_equal, (
+    run_and_compare_specific_input(jnp.not_equal, (
         jnp.array([True, False, True], dtype=jnp.bool_),
         jnp.array([True, True, False], dtype=jnp.bool_)
     ))

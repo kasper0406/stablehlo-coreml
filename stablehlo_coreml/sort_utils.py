@@ -1,14 +1,15 @@
 import numpy as np
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.stablehlo import (
-    CompareOp, SelectOp, OrOp, AndOp
+    CompareOp, SelectOp, ConstantOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
 
 def match_sort(comparator_root, args, inputs):
     """
-    Analyzes the comparator region of a SortOp to determine if it implements a multi-key (lexicographical) sort.
+    Analyzes the comparator region of a SortOp to determine if it implements a supported sorting pattern.
+    We try to analyze the comparator logic for multi-key sorts.
 
     Multi-key sort compares multiple keys in sequence. If the primary keys are equal,
     it moves to the secondary keys, and so on.
@@ -24,161 +25,185 @@ def match_sort(comparator_root, args, inputs):
     Returns:
         A list of (tensor, ascending) tuples representing the sort keys, or None if the pattern doesn't match.
     """
-    remaining, expecting, sort_keys = None, None, []
-
     def get_op(val):
         if isinstance(val.owner, ir.Block):
             return None
         return val.owner.opview
 
-    def get_arg_index(value, args):
+    def get_arg_index(value):
         if value in args:
             return args.index(value)
-        if isinstance(value.owner, ir.Block):
+        op = get_op(value)
+        if op is None:
             return None
-        return match_total_order_arg(value.owner.opview, args)
+        return match_nan_and_zero_handling(op, args)
 
-    # Walk backwards through the operations graph to understand the sorting logic
+    def identify_comparison_args(compare_op: CompareOp) -> tuple[int | None, bool | None]:
+        lhs = get_arg_index(compare_op.lhs)
+        rhs = get_arg_index(compare_op.rhs)
+        if lhs is None or rhs is None:
+            return None, None
+
+        # According to StableHLO sort spec, arguments are guaranteed to be interleaved:
+        #   (lhs_0, rhs_0, lhs_1, rhs_1, ...)
+        # Therefore the input pair being compared should be adjacent, and the corresponding
+        # key index can be derived by integer division by 2.
+        # Reference: https://openxla.org/stablehlo/spec#sort
+        if (lhs // 2) != (rhs // 2):
+            return None, None
+
+        direction = hlo.ComparisonDirectionAttr(compare_op.comparison_direction).value
+        is_ascending = lhs < rhs and direction == "LT" or lhs > rhs and direction == "GT"
+
+        return lhs // 2, is_ascending
+
+    def match_comparison(op, expected_direction=None):
+        if not isinstance(op, CompareOp):
+            return None
+        direction = hlo.ComparisonDirectionAttr(op.comparison_direction).value
+        if expected_direction and direction != expected_direction:
+            return None
+        if expected_direction is None and direction not in ("LT", "GT"):
+             return None
+        return op
+
+    def match_select_chain(op):
+        # Matches: select(pred, on_true, on_false)
+        # where pred is (k1 == k2) and on_false is (k1 < k2)
+        if not isinstance(op, SelectOp):
+            return None
+
+        pred = get_op(op.pred)
+        on_false = get_op(op.on_false)
+
+        # 1. Check pred: k1 == k2
+        pred_cmp = match_comparison(pred, "EQ")
+        if not pred_cmp:
+            return None
+
+        # 2. Check on_false: k1 < k2 (or >)
+        false_cmp = match_comparison(on_false)
+        if not false_cmp:
+            return None
+
+        # 3. Verify operands match between pred and on_false
+        if {pred_cmp.lhs, pred_cmp.rhs} != {false_cmp.lhs, false_cmp.rhs}:
+            return None
+
+        # 4. Identify key
+        key_info = identify_comparison_args(pred_cmp)
+        if key_info[0] is None:
+            return None
+
+        return key_info, get_op(op.on_true)
+
+    def match_leaf(op):
+        # Matches: k1 < k2
+        cmp = match_comparison(op)
+        if not cmp:
+            return None
+        return identify_comparison_args(cmp)
+
+    # Walk through the operations graph to match the sort pattern
+    sort_keys = []
     current_op = comparator_root
     while current_op:
-        match current_op:
-            case SelectOp():
-                # Pattern: select(pred, on_true, on_false)
-                # This represents the chain: if (k1 == k2) then compare(next) else compare(k1 < k2)
-                pred = get_op(current_op.pred)
-                on_true = get_op(current_op.on_true)
-                on_false = get_op(current_op.on_false)
+        # Try to match a chain node (SelectOp)
+        chain_result = match_select_chain(current_op)
+        if chain_result:
+            (key_idx, is_asc), next_op = chain_result
+            sort_keys.append((inputs[key_idx], is_asc))
+            current_op = next_op
+            continue
 
-                if not isinstance(pred, CompareOp):
-                    return None
-                if hlo.ComparisonDirectionAttr(pred.comparison_direction).value != "EQ":
-                    return None
-
-                if not isinstance(on_false, CompareOp):
-                    return None
-                dir_false = hlo.ComparisonDirectionAttr(on_false.comparison_direction).value
-                if dir_false not in ("LT", "GT"):
-                    return None
-
-                if {pred.lhs, pred.rhs} != {on_false.lhs, on_false.rhs}:
-                    return None
-
-                # Identify which input is being compared in the 'else' branch (on_false)
-                lhs = get_arg_index(pred.lhs, args)
-                rhs = get_arg_index(pred.rhs, args)
-                if lhs is None or rhs is None:
-                    return None
-
-                # Arguments are interleaved: (lhs_0, rhs_0, lhs_1, rhs_1, ...)
-                k1 = lhs // 2
-                k2 = rhs // 2
-
-                if k1 != k2:
-                    return None
-                k = k1
-
-                is_lhs_first = (lhs % 2 == 0)
-                ascending = (dir_false == "LT") == is_lhs_first
-                sort_keys.append((inputs[k], ascending))
-
-                # Continue analyzing the 'then' branch (on_true) for the next key
-                current_op = on_true
-
-            case CompareOp():
-                # Base case: A simple comparison, usually the last one in the chain or the only one.
-                direction = hlo.ComparisonDirectionAttr(current_op.comparison_direction).value
-
-                lhs = get_arg_index(current_op.lhs, args)
-                rhs = get_arg_index(current_op.rhs, args)
-                if lhs is None or rhs is None:
-                    return None
-
-                k1 = lhs // 2
-                k2 = rhs // 2
-
-                if k1 != k2:
-                    return None
-                k = k1
-
-                if expecting:
-                    # If we were inside an AndOp/OrOp structure
-                    exp_lhs, exp_rhs = expecting
-                    if {lhs, rhs} != {exp_lhs, exp_rhs}:
-                        return None
-                    if direction != "EQ":
-                        return None
-                else:
-                    if direction not in ("LT", "GT"):
-                        return None
-                    is_lhs_first = (lhs % 2 == 0)
-                    ascending = (direction == "LT") == is_lhs_first
-                    sort_keys.append((inputs[k], ascending))
-
-                expecting = None if expecting else (lhs, rhs)
-                current_op, remaining = remaining, None
-            case OrOp() if not expecting:
-                current_op, remaining = get_op(current_op.lhs), get_op(current_op.rhs)
-            case AndOp() if expecting:
-                current_op, remaining = get_op(current_op.lhs), get_op(current_op.rhs)
-            case _:
+        # Try to match a leaf node (CompareOp)
+        leaf_result = match_leaf(current_op)
+        if leaf_result:
+            key_idx, is_asc = leaf_result
+            if key_idx is None:
                 return None
+            sort_keys.append((inputs[key_idx], is_asc))
+            return sort_keys
+
+        # If neither matched, it's not a valid sort pattern
+        return None
+
     return sort_keys
 
 
-def match_total_order_arg(tracing, args):
+def match_nan_and_zero_handling(op, args):
     """
-    Matches the operation chain that handles NaN and zero comparisons for total sort.
+    Jax generates nan-checks and +0/-0 merges in the comparator. This function matches this pattern:
+        select(<var> != <var>, NaN, select(<var> == 0, 0, <var>))
 
-    It looks for logic that canonicalizes NaNs and zeros before comparison and returns
-    the index of the original argument being compared.
+    It will extract the argument index of <var> if the pattern matches.
+
+    Notice that this is technically non correct, as MIL does not handle NaN's in the same way as StableHLO.
+    +0/-0 looks to be correctly handled.
     """
-    remaining, idx = None, None
-    selecting, comparing = [lambda x: np.array(x) == 0, np.isnan], ["EQ", "NE"]
-
     def get_op(val):
         if isinstance(val.owner, ir.Block):
             return None
         return val.owner.opview
 
-    while tracing:
-        match tracing:
-            case SelectOp():
-                const_op = get_op(tracing.operands[1])
-                if not const_op:
-                    return None
-                const = const_op.value
+    def match_constant(val, check_fn):
+        const_op = get_op(val)
+        if not isinstance(const_op, ConstantOp):
+            return False
+        return check_fn(const_op.value)
 
-                if not len(selecting) or not selecting.pop()(const):
-                    return None
-                if len(selecting):
-                    remaining = get_op(tracing.operands[2])
-                    tracing = get_op(tracing.operands[0])
-                    if not remaining or not tracing:
-                        return None
-                else:
-                    if idx is None or tracing.operands[2] != args[idx]:
-                        return None
-                    tracing = get_op(tracing.operands[0])
-                    if not tracing:
-                        return None
-                    remaining = None
-            case CompareOp():
-                direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
-                if not len(comparing) or direction != comparing.pop():
-                    return None
-                if len(comparing):
-                    if tracing.lhs != tracing.rhs or tracing.lhs not in args or len(selecting) != 1:
-                        return None
-                    idx = args.index(tracing.lhs)
-                    tracing, remaining = remaining, None
-                else:
-                    rhs_op = get_op(tracing.rhs)
-                    if not rhs_op:
-                        return None
-                    const = np.array(rhs_op.value)
-                    if const != 0 or tracing.lhs != args[idx]:
-                        return None
-                    tracing = None
-            case _:
-                return None
-    return idx
+    def match_isnan(val):
+        # Matches: <var> != <var>
+        compare_op = get_op(val)
+        if not isinstance(compare_op, CompareOp):
+            return None
+        if hlo.ComparisonDirectionAttr(compare_op.comparison_direction).value != "NE":
+            return None
+        if compare_op.lhs != compare_op.rhs:
+            return None
+        return compare_op.lhs
+
+    def match_is_zero(val):
+        # Matches: <var> == 0
+        compare_op = get_op(val)
+        if not isinstance(compare_op, CompareOp):
+            return None
+        if hlo.ComparisonDirectionAttr(compare_op.comparison_direction).value != "EQ":
+            return None
+        if not match_constant(compare_op.rhs, lambda x: np.array(x) == 0):
+            return None
+        return compare_op.lhs
+
+    # 1. Match outer select: select(pred, NaN, on_false)
+    if not isinstance(op, SelectOp):
+        return None
+
+    if not match_constant(op.on_true, np.isnan):
+        return None
+
+    # 2. Match NaN check: pred is (x != x)
+    matched_arg_idx = match_isnan(op.pred)
+    if matched_arg_idx is None:
+        return None
+
+    # 3. Match inner select: select(pred, 0, x)
+    inner_op = get_op(op.on_false)
+    if not isinstance(inner_op, SelectOp):
+        return None
+
+    if not match_constant(inner_op.on_true, lambda x: np.array(x) == 0):
+        return None
+
+    if inner_op.on_false != matched_arg_idx:
+        return None
+
+    # 4. Match Zero check: pred is (x == 0)
+    x_val_zero = match_is_zero(inner_op.pred)
+    if x_val_zero != matched_arg_idx:
+        return None
+
+    # 5. Return index if found in args
+    if matched_arg_idx in args:
+        return args.index(matched_arg_idx)
+
+    return None
