@@ -1,7 +1,7 @@
 import numpy as np
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.stablehlo import (
-    CompareOp, SelectOp, ConstantOp
+    CompareOp, SelectOp, ConstantOp, OrOp, AndOp
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -100,6 +100,57 @@ def match_sort(comparator_root, args, inputs):
 
         return key_info, get_op(op.on_true)
 
+    def match_or_chain(op):
+        # Matches: (k1 < k2) OR ((k1 == k2) AND next_logic)
+        if not isinstance(op, OrOp):
+            return None
+
+        # 1. Check lhs: k1 < k2 (or >)
+        # Note: The order of operands in OrOp/AndOp might not be guaranteed, but usually it follows the logic structure.
+        # Let's assume lhs is the comparison first.
+        
+        primary_cmp = get_op(op.lhs)
+        and_op = get_op(op.rhs)
+        
+        # It's possible they are swapped? (k1 == k2 AND next) OR (k1 < k2)
+        # Let's try to detect which one is the comparison.
+        
+        cmp_match = match_comparison(primary_cmp)
+        if not cmp_match:
+            # Try swapping
+            primary_cmp, and_op = and_op, primary_cmp
+            cmp_match = match_comparison(primary_cmp)
+            
+        if not cmp_match:
+            return None
+            
+        if not isinstance(and_op, AndOp):
+            return None
+            
+        # 2. Check AndOp: (k1 == k2) AND next_logic
+        eq_op = get_op(and_op.lhs)
+        next_logic = get_op(and_op.rhs)
+        
+        eq_match = match_comparison(eq_op, "EQ")
+        if not eq_match:
+            # Try swapping
+            eq_op, next_logic = next_logic, eq_op
+            eq_match = match_comparison(eq_op, "EQ")
+            
+        if not eq_match:
+            return None
+            
+        # 3. Verify operands match between primary_cmp and eq_op
+        if {cmp_match.lhs, cmp_match.rhs} != {eq_match.lhs, eq_match.rhs}:
+            return None
+            
+        # 4. Identify key
+        key_info = identify_comparison_args(cmp_match)
+        if key_info[0] is None:
+            return None
+            
+        return key_info, next_logic
+
     def match_leaf(op):
         # Matches: k1 < k2
         cmp = match_comparison(op)
@@ -115,6 +166,14 @@ def match_sort(comparator_root, args, inputs):
         chain_result = match_select_chain(current_op)
         if chain_result:
             (key_idx, is_asc), next_op = chain_result
+            sort_keys.append((inputs[key_idx], is_asc))
+            current_op = next_op
+            continue
+
+        # Try to match a chain node (OrOp/AndOp)
+        or_chain_result = match_or_chain(current_op)
+        if or_chain_result:
+            (key_idx, is_asc), next_op = or_chain_result
             sort_keys.append((inputs[key_idx], is_asc))
             current_op = next_op
             continue

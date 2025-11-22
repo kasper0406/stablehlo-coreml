@@ -397,8 +397,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # To bridge this gap, we must analyze the comparator's structure to reverse-engineer
         # the sorting criteria (which keys to sort by and in what direction).
         inputs = [context[operand.get_name()] for operand in op.inputs]
-        if op.is_stable and len(inputs) > 1:
-            raise ValueError("Stable sorting is not supported for multi-input sorting")
+        # if op.is_stable and len(inputs) > 1:
+        #     raise ValueError("Stable sorting is not supported for multi-input sorting")
 
         if len(op.comparator.blocks) != 1:
             raise ValueError("Unsupported comparator format: must have exactly one block")
@@ -419,20 +419,96 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError("Unrecognized comparator format")
 
         # Apply the sort
-        sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        sort_dim = op.dimension.value
 
-        # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
-        if len(sort_keys) > 1:
-            raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
-        # The following code would be used if CoreML had a stable argsort
-        # for key, ascending in sort_keys[-2::-1]:
-        #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
-        #     relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-        #     indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+        def stable_argsort(key, ascending):
+            # If stability is not required, we can use the standard argsort
+            if not op.is_stable and len(sort_keys) == 1:
+                return mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+
+            # To achieve stability, we add a small perturbation based on the index
+            dim_size = key.shape[sort_dim]
+            
+            # If dim_size <= 1, it's already sorted/stable
+            if dim_size <= 1:
+                 return mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+
+            if not types.is_float(key.dtype):
+                # Integer case
+                # We cast to fp32 and use a fixed epsilon because integers have a min gap of 1.
+                # This avoids the complex adaptive epsilon calculation which seems to cause issues for integers.
+                key = mb.cast(x=key, dtype="fp32")
+                epsilon = 0.5 / float(dim_size)
+            else:
+                # Float case: Adaptive epsilon
+                # 1. Unstable sort to find gaps
+                unstable_indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+                sorted_key = mb.gather_along_axis(x=key, indices=unstable_indices, axis=sort_dim)
+                
+                # 2. Compute differences
+                rank = len(key.shape)
+                
+                slice1_spec = [slice(None)] * rank
+                slice1_spec[sort_dim] = slice(0, -1)
+                slice1 = index_by_slices(sorted_key, slice1_spec)
+                
+                slice2_spec = [slice(None)] * rank
+                slice2_spec[sort_dim] = slice(1, None)
+                slice2 = index_by_slices(sorted_key, slice2_spec)
+                
+                diffs = mb.sub(x=slice2, y=slice1)
+                if not ascending:
+                    diffs = mb.neg(x=diffs)
+                
+                # 3. Find min non-zero difference
+                infinity = np.array(np.inf, dtype=np.float32)
+                diffs_non_zero = mb.select(cond=mb.equal(x=diffs, y=0.0), a=infinity, b=diffs)
+                
+                min_diff = mb.reduce_min(x=diffs_non_zero, axes=[sort_dim], keep_dims=True)
+                min_diff = mb.select(cond=mb.equal(x=min_diff, y=infinity), a=1.0, b=min_diff)
+                
+                # 4. Compute epsilon
+                epsilon = mb.real_div(x=min_diff, y=float(dim_size + 1))
+            
+            # 5. Apply perturbation
+            indices = np.arange(dim_size, dtype=np.float32)
+            broadcast_shape = [1] * len(key.shape)
+            broadcast_shape[sort_dim] = dim_size
+            indices = np.reshape(indices, broadcast_shape)
+            
+            perturbation = mb.mul(x=indices, y=epsilon)
+            
+            if ascending:
+                key = mb.add(x=key, y=perturbation)
+            else:
+                key = mb.sub(x=key, y=perturbation)
+
+            return mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+
+        key, ascending = sort_keys[-1]
+        indices = stable_argsort(key, ascending)
+
+        for key, ascending in sort_keys[-2::-1]:
+            if key.dtype == types.int32:
+                # Workaround for CoreML bug where int32 gather might corrupt negative values
+                key_fp32 = mb.cast(x=key, dtype="fp32")
+                gathered_key_fp32 = mb.gather_along_axis(x=key_fp32, indices=indices, axis=sort_dim)
+                gathered_key = mb.cast(x=gathered_key_fp32, dtype="int32")
+            else:
+                gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
+
+            relative_indices = stable_argsort(gathered_key, ascending)
+            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+            if tensor.dtype == types.int32:
+                # Workaround for CoreML bug where int32 gather might corrupt negative values
+                tensor_fp32 = mb.cast(x=tensor, dtype="fp32")
+                gathered_fp32 = mb.gather_along_axis(x=tensor_fp32, indices=indices, axis=sort_dim)
+                gathered = mb.cast(x=gathered_fp32, dtype="int32")
+                context.add_result(op.results[i], gathered)
+            else:
+                context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
 
     @register_stablehlo_op
     def op_case(self, context: TranslationContext, op: CaseOp):
