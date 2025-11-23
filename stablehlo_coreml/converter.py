@@ -991,10 +991,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         start_indices_rank = len(start_indices.shape)
 
         dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
-        if dim_numbers.operand_batching_dims != []:
-            raise ValueError("Batched operand dims gather is not supported!")
-        if dim_numbers.start_indices_batching_dims != []:
-            raise ValueError("Batched start indices gather is not supported!")
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
@@ -1020,6 +1016,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     end_index = mb.add(x=actual_start_index, y=slice_sizes[operand_dim])
                     slice_start.append(actual_start_index)
                     slice_end.append(end_index)
+                elif operand_dim in dim_numbers.operand_batching_dims:
+                    batch_index = dim_numbers.operand_batching_dims.index(operand_dim)
+                    slice_batch = dim_numbers.start_indices_batching_dims[batch_index]
+                    start_index = mb.slice_by_size(x=slice_idx, begin=(slice_batch,), size=(1,))
+                    slice_start.append(start_index)
+                    slice_end.append(mb.add(x=start_index, y=1))
                 elif operand_dim in dim_numbers.collapsed_slice_dims:
                     slice_start.append(mb.reshape(x=0, shape=(1,)))
                     slice_end.append(mb.reshape(x=1, shape=(1,)))

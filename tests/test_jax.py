@@ -242,6 +242,61 @@ def test_gather():
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
 
+def test_complex_gather():
+    from jax.lax import GatherDimensionNumbers
+
+    def wrapped_gather(dimension_numbers, slice_sizes):
+        @jax.jit
+        def internal_gather(operand, start_indices):
+            return jax.lax.gather(
+                operand=operand,
+                start_indices=start_indices,
+                dimension_numbers=dimension_numbers,
+                slice_sizes=slice_sizes,
+            )
+        return internal_gather
+
+    start_indices = [
+                     [
+                      [[0, 0], [1, 0], [2, 1]],
+                      [[0, 1], [1, 1], [0, 9]]
+                     ],
+                     [
+                      [[0, 0], [2, 1], [2, 2]],
+                      [[1, 2], [0, 1], [1, 0]]
+                     ]
+                    ]
+    start_indices = jnp.array(start_indices, dtype=jnp.int32)
+
+    operand = jnp.arange(1, 25).reshape((3, 4, 2))
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(0,),
+        start_index_map=(1, 0),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 2, 2)), (operand, start_indices[0]))
+
+    operand = jnp.arange(1, 49).reshape((2, 3, 4, 2))
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(1,),
+        start_index_map=(2, 1),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
+
+    start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(),
+        operand_batching_dims=(0, 1),
+        start_indices_batching_dims=(0, 1),
+        start_index_map=(3, 2),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 1)), (operand, start_indices))
+
+
 def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((0, 0), (10, 5))), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((0, 10), (5, 0), (2, 1))), (jnp.zeros((10, 20, 15)),))
