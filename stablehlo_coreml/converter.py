@@ -10,6 +10,7 @@ from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_s
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
+from .sort_utils import match_sort
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -19,7 +20,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
+    FloorOp, CeilOp, SortOp, ClampOp, CaseOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -369,10 +371,113 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, result)
 
     @register_stablehlo_op
+    def op_rem(self, context: TranslationContext, op: RemOp):
+        self.__simple_binary_op(context, mb.mod, op)
+
+    @register_stablehlo_op
+    def op_floor(self, context: TranslationContext, op: FloorOp):
+        self.__simple_unary_op(context, mb.floor, op)
+
+    @register_stablehlo_op
+    def op_ceil(self, context: TranslationContext, op: CeilOp):
+        self.__simple_unary_op(context, mb.ceil, op)
+
+    @register_stablehlo_op
+    def op_clamp(self, context: TranslationContext, op: ClampOp):
+        min = context[op.min.get_name()]
+        max = context[op.max.get_name()]
+        operand = context[op.operand.get_name()]
+        result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
+        context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_sort(self, context: TranslationContext, op: SortOp):
+        # StableHLO defines sorting via a comparator region (a small function) that returns true if
+        # element A < element B. CoreML, however, uses high-level primitives.
+        # To bridge this gap, we must analyze the comparator's structure to reverse-engineer
+        # the sorting criteria (which keys to sort by and in what direction).
+        inputs = [context[operand.get_name()] for operand in op.inputs]
+        if op.is_stable and len(inputs) > 1:
+            raise ValueError("Stable sorting is not supported for multi-input sorting")
+
+        if len(op.comparator.blocks) != 1:
+            raise ValueError("Unsupported comparator format: must have exactly one block")
+
+        comparator_block = op.comparator.blocks[0]
+        return_op = comparator_block.operations[-1]
+
+        if not isinstance(return_op, ReturnOp):
+            raise ValueError("Unsupported comparator format: last operation must be a return")
+
+        # We start tracing from the return value of the comparator to understand the logic
+        comparator_root = return_op.operands[0].owner.opview
+        args = list(comparator_block.arguments)
+
+        # Try to match known sorting patterns
+        sort_keys = match_sort(comparator_root, args, inputs)
+        if sort_keys is None:
+            raise ValueError("Unrecognized comparator format")
+
+        # Apply the sort
+        sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
+        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+
+        # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
+        if len(sort_keys) > 1:
+            raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
+        # The following code would be used if CoreML had a stable argsort
+        # for key, ascending in sort_keys[-2::-1]:
+        #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
+        #     relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+        #     indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+
+        for i, tensor in enumerate(inputs):
+            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+
+    @register_stablehlo_op
+    def op_case(self, context: TranslationContext, op: CaseOp):
+        index = context[op.index.get_name()]
+
+        def params(i):
+            closure, args = [], []
+            for j in op.branches[i].blocks[0].operations:
+                for k in j.operands:
+                    if k.get_name() in context.variables[context.path()]:
+                        closure.append(k)
+                        args.append(context[k.get_name()])
+            return (closure, op.branches[i], args)
+
+        def build_branch(i):
+            if i == len(op.branches) - 1:
+                # Default/Last branch
+                return self.__invoke_hlo_function(context, "branch_default", *params(i))
+
+            def true_fn():
+                return self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
+
+            def false_fn():
+                return build_branch(i + 1)
+
+            return mb.cond(
+                pred=mb.equal(x=index, y=i),
+                _true_fn=true_fn,
+                _false_fn=false_fn
+            )
+
+        results = build_branch(0)
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        for i, result in enumerate(results):
+            context.add_result(op.results[i], result)
+
+    @register_stablehlo_op
     def op_reshape(self, context: TranslationContext, op: ReshapeOp):
         x = context[op.operand.get_name()]
         new_shape = op.result.type.shape
-        reshape_res = mb.reshape(x=x, shape=new_shape)
+        if len(new_shape) == 0:
+            reshape_res = mb.squeeze(x=x)
+        else:
+            reshape_res = mb.reshape(x=x, shape=new_shape)
         context.add_result(op.result, reshape_res)
 
     @register_stablehlo_op
@@ -436,7 +541,18 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
-        cml_op = cml_op_builder(x=lhs, y=rhs)
+        if types.is_bool(lhs.dtype):
+            if comparison_direction == "EQ":
+                cml_op = mb.logical_not(x=mb.logical_xor(x=lhs, y=rhs))
+            elif comparison_direction == "NE":
+                cml_op = mb.logical_xor(x=lhs, y=rhs)
+            else:
+                raise ValueError(
+                    f"Boolean comparison operations other than EQ and NE (such as GT, LT, GE, LE) are not supported! "
+                    f"Attempted operation: {comparison_direction}"
+                )
+        else:
+            cml_op = cml_op_builder(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
