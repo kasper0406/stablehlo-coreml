@@ -269,29 +269,29 @@ def test_complex_gather():
 
     operand = jnp.arange(1, 25).reshape((3, 4, 2))
     dimension_numbers = GatherDimensionNumbers(
-        offset_dims = (2, 3),
-        collapsed_slice_dims = (0,),
-        start_index_map = (1, 0),
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(0,),
+        start_index_map=(1, 0),
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 2, 2)), (operand, start_indices[0]))
 
     operand = jnp.arange(1, 49).reshape((2, 3, 4, 2))
     dimension_numbers = GatherDimensionNumbers(
-        offset_dims = (3, 4),
-        collapsed_slice_dims = (1,),
-        operand_batching_dims = (0,),
-        start_indices_batching_dims = (1,),
-        start_index_map = (2, 1),
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(1,),
+        start_index_map=(2, 1),
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
 
     start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
     dimension_numbers = GatherDimensionNumbers(
-        offset_dims = (3, 4),
-        collapsed_slice_dims = (),
-        operand_batching_dims = (0, 1),
-        start_indices_batching_dims = (0, 1),
-        start_index_map = (3, 2),
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(),
+        operand_batching_dims=(0, 1),
+        start_indices_batching_dims=(0, 1),
+        start_index_map=(3, 2),
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 1)), (operand, start_indices))
 
