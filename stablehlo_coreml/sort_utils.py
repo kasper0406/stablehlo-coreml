@@ -5,6 +5,87 @@ from jaxlib.mlir.dialects.stablehlo import (
 )
 from jax._src.lib.mlir.dialects import hlo
 
+from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import types
+
+
+# TODO: nan, inf, subnormals
+def ordered_fp_bitcast(x):
+    width = x.dtype.width
+    ieee754 = { 32: (8, 23), 16: (5, 10) }
+    assert types.is_float(x.dtype) and width in ieee754
+    exponent, fraction = ieee754[width]
+    e_bias = 2 ** (exponent - 1) - 1
+    split = width == 32
+
+    negative = mb.less(x=x, y=0.)
+    zero = mb.equal(x=x, y=0.)
+    x = mb.abs(x=x)
+    e_raw = mb.floor_div(x=mb.log(x=x), y=mb.log(x=2.))
+    e_shift = mb.cast(x=mb.add(x=e_raw, y=float(e_bias)), dtype="int32")
+    fractional = mb.sub(x=mb.real_div(x=x, y=mb.pow(x=2., y=e_raw)), y=1.)
+    mantissa = mb.cast(x=mb.floor(x=mb.mul(x=fractional, y=float(e_bias))), dtype="int32")
+    bits = mb.add(x=mb.mul(x=e_shift, y=e_bias), y=mantissa)
+
+    hi = mb.floor_div(x=bits, y=0x1_0000) if split else bits
+    hi = mb.select(cond=negative, a=mb.sub(x=0x7FFF, y=hi), b=mb.add(x=hi, y=0x8000))
+    hi = mb.select(cond=zero, a=0x8000, b=hi)
+    if not split:
+        return (hi,)
+
+    lo = mb.mod(x=bits, y=0x1_0000)
+    lo = mb.select(cond=negative, a=mb.sub(x=0xFFFF, y=lo), b=lo)
+    lo = mb.select(cond=zero, a=0, b=lo)
+    return (hi, lo)
+
+
+def ordered_int_bitcast(x):
+    width = x.dtype.width
+    assert types.is_int(x.dtype) and width in { 8, 16, 32 }
+    split, signed = width == 32, x.dtype.is_unsigned()
+    assert not split or not signed, "CoreML has no uint32 type"
+
+    negative = mb.less(x=x, y=0.) if signed else False
+    x = mb.abs(x=x) if signed else x
+    x = x if split else mb.cast(x=x, dtype="int32")
+
+    hi = mb.floor_div(x=x, y=0x1_0000) if split else x
+    hi = mb.select(cond=negative, a=mb.sub(x=0x7FFF, y=hi), b=mb.add(x=hi, y=0x8000)) if signed else hi
+    if not split:
+        return (hi,)
+
+    lo = mb.mod(x=x, y=0x1_0000)
+    lo = mb.select(cond=negative, a=mb.sub(x=0xFFFF, y=lo), b=lo) if signed else lo
+    return (hi, lo)
+
+
+def ordered_bitcast(x, n, ascending=True):
+    if types.is_int(x):
+        bits = ordered_int_bitcast(x)
+    elif types.is_float(x):
+        bits = ordered_fp_bitcast(x)
+    else:
+        raise TypeError("only int and float are supported for sorting")
+    if not ascending:
+        bits = tuple(mb.sub(x=0xFFFF, y=x) for x in bits)
+
+    # 0x7FFF_FFFF
+    #      0xFFFF -->     0x8000
+    # 0x7FF       -->  0x10_0000
+    #        0xFF --> 0x800_0000
+
+    if n < 0x8000:
+        # 16 bit operand mask, 15 bit index mask
+        return tuple(mb.mul(x=x, y=0x8000) for x in bits)
+    elif len(bits) == 2 and n < 0x10_0000:
+        # 11 bit operand mask, 20 bit index mask
+        raise NotImplementedError
+    elif n < 0x800_0000:
+        # 8 bit operand mask, 27 bit index mask
+        raise NotImplementedError
+    else:
+        raise ValueError("refusing to split stable argsort into more than 4 unstable argsorts")
+
 
 def match_sort(comparator_root, args, inputs):
     """
