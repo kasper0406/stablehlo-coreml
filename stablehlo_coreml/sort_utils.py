@@ -10,79 +10,79 @@ from coremltools.converters.mil.mil import types
 
 
 # TODO: nan, inf, subnormals
-def ordered_fp_bitcast(x):
+def bitcast_fp(x):
     width = x.dtype.width
     ieee754 = { 32: (8, 23), 16: (5, 10) }
     assert types.is_float(x.dtype) and width in ieee754
     exponent, fraction = ieee754[width]
     e_bias = 2 ** (exponent - 1) - 1
-    split = width == 32
+    e_offset = 2 ** fraction
 
-    negative = mb.less(x=x, y=0.)
+    positive = mb.greater_equal(x=x, y=0.)
     zero = mb.equal(x=x, y=0.)
     x = mb.abs(x=x)
     e_raw = mb.floor_div(x=mb.log(x=x), y=mb.log(x=2.))
-    e_shift = mb.cast(x=mb.add(x=e_raw, y=float(e_bias)), dtype="int32")
+    e_shifted = mb.cast(x=mb.add(x=e_raw, y=float(e_bias)), dtype="int32")
     fractional = mb.sub(x=mb.real_div(x=x, y=mb.pow(x=2., y=e_raw)), y=1.)
-    mantissa = mb.cast(x=mb.floor(x=mb.mul(x=fractional, y=float(e_bias))), dtype="int32")
-    bits = mb.add(x=mb.mul(x=e_shift, y=e_bias), y=mantissa)
-
-    hi = mb.floor_div(x=bits, y=0x1_0000) if split else bits
-    hi = mb.select(cond=negative, a=mb.sub(x=0x7FFF, y=hi), b=mb.add(x=hi, y=0x8000))
-    hi = mb.select(cond=zero, a=0x8000, b=hi)
-    if not split:
-        return (hi,)
-
-    lo = mb.mod(x=bits, y=0x1_0000)
-    lo = mb.select(cond=negative, a=mb.sub(x=0xFFFF, y=lo), b=lo)
-    lo = mb.select(cond=zero, a=0, b=lo)
-    return (hi, lo)
+    mantissa = mb.cast(x=mb.floor(x=mb.mul(x=fractional, y=float(e_offset))), dtype="int32")
+    bits = mb.add(x=mb.mul(x=e_shifted, y=e_offset), y=mantissa)
+    bits = mb.select(cond=zero, a=0, b=bits)
+    return positive, bits
 
 
-def ordered_int_bitcast(x):
+def bitcast_int(x):
     width = x.dtype.width
     assert types.is_int(x.dtype) and width in { 8, 16, 32 }
-    split, signed = width == 32, x.dtype.is_unsigned()
+    packed, signed = width == 32, x.dtype.is_unsigned()
     assert not split or not signed, "CoreML has no uint32 type"
 
-    negative = mb.less(x=x, y=0.) if signed else False
+    positive = mb.greater_equal(x=x, y=0) if signed else None
     x = mb.abs(x=x) if signed else x
-    x = x if split else mb.cast(x=x, dtype="int32")
-
-    hi = mb.floor_div(x=x, y=0x1_0000) if split else x
-    hi = mb.select(cond=negative, a=mb.sub(x=0x7FFF, y=hi), b=mb.add(x=hi, y=0x8000)) if signed else hi
-    if not split:
-        return (hi,)
-
-    lo = mb.mod(x=x, y=0x1_0000)
-    lo = mb.select(cond=negative, a=mb.sub(x=0xFFFF, y=lo), b=lo) if signed else lo
-    return (hi, lo)
+    x = x if packed else mb.cast(x=x, dtype="int32")
+    return positive, x
 
 
-def ordered_bitcast(x, n, ascending=True):
+def bitcast_split(x, mask=16, ascending=True):
+    width = x.dtype.width
     if types.is_int(x):
-        bits = ordered_int_bitcast(x)
+        sign, x = bitcast_int(x)
     elif types.is_float(x):
-        bits = ordered_fp_bitcast(x)
+        sign, x = bitcast_fp(x)
     else:
         raise TypeError("only int and float are supported for sorting")
-    if not ascending:
-        bits = tuple(mb.sub(x=0xFFFF, y=x) for x in bits)
 
-    # 0x7FFF_FFFF
-    #      0xFFFF -->     0x8000
-    # 0x7FF       -->  0x10_0000
-    #        0xFF --> 0x800_0000
+    splits = -(-width // mask) # ceil
+    results = []
+    for i in range(splits):
+        if i < splits - 1:
+            split = mb.mod(x=x, y=2 ** mask)
+            flipped = mb.sub(x=2 ** mask - 1, y=split)
+        else:
+            overflow_bit = 2 ** (mask - (0 if sign is None else 1))
+            flipped = mb.sub(x=overflow_bit - 1, y=x)
+            split = mb.add(x=x, y=overflow_bit)
 
-    if n < 0x8000:
+        if sign is None:
+            out = split if ascending else flipped
+        elif ascending:
+            out = mb.select(cond=sign, a=split, b=flipped)
+        else:
+            out = mb.select(cond=sign, a=flipped, b=split)
+        results.append(out)
+        x = mb.floor_div(x=x, y=2 ** mask)
+    return tuple(mb.mul(x=x, y=2 ** (31 - mask)) for x in reversed(results))
+
+
+def bitcast_window(x, n):
+    if n < 2 ** 15:
         # 16 bit operand mask, 15 bit index mask
-        return tuple(mb.mul(x=x, y=0x8000) for x in bits)
-    elif len(bits) == 2 and n < 0x10_0000:
+        return 16
+    elif x.dtype.width == 32 and n < 2 ** 20:
         # 11 bit operand mask, 20 bit index mask
-        raise NotImplementedError
-    elif n < 0x800_0000:
-        # 8 bit operand mask, 27 bit index mask
-        raise NotImplementedError
+        return 11
+    elif n < 2 ** 23:
+        # 8 bit operand mask, 23 bit index mask
+        return 8
     else:
         raise ValueError("refusing to split stable argsort into more than 4 unstable argsorts")
 
