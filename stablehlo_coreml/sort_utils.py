@@ -69,7 +69,7 @@ def bitcast_split(x, mask=16, ascending=True):
             out = mb.select(cond=sign, a=flipped, b=split)
         results.append(out)
         x = mb.floor_div(x=x, y=2 ** mask)
-    return tuple(mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)) for x in results)
+    return results
 
 
 def bitcast_window(x, n):
@@ -90,14 +90,11 @@ def stable_argsort(x, axis=-1, ascending=True):
     arange = np.indices(x.shape)[axis]
     mask = bitcast_window(x, x.shape[axis])
     splits = bitcast_split(x, mask, ascending)
-    indices = mb.argsort(x=mb.add(x=splits[0], y=arange), axis=axis, ascending=True)
+    shifted = lambda x: mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
+    indices = mb.argsort(x=shifted(splits[0]), axis=axis, ascending=True)
     for window in splits[1:]:
         gathered_key = mb.gather_along_axis(x=window, indices=indices, axis=axis)
-        return mb.concat(values=(
-                mb.slice_by_index(x=gathered_key, begin=(0,), end=(5,)),
-                mb.slice_by_index(x=window, begin=(5,), end=(x.shape[axis],))
-            ), axis=0)
-        relative_indices = mb.argsort(x=mb.add(x=gathered_key, y=arange), axis=axis, ascending=True)
+        relative_indices = mb.argsort(x=shifted(x=gathered_key), axis=axis, ascending=True)
         indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=axis)
     return indices
 

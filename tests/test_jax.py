@@ -356,7 +356,7 @@ def test_sort():
 
 
 def test_tmp():
-    # run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 0x1_0010, 10, 0x5_0000, 10, 5, 10, 0x1_0000, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 4.23, 10, -4.3, 10, -5, -10, 5], dtype=jnp.float16),))
