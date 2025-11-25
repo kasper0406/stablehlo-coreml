@@ -23,8 +23,12 @@ def bitcast_fp(x):
     x = mb.abs(x=x)
     e_raw = mb.floor_div(x=mb.log(x=x), y=np.log(width(2.)))
     e_shifted = mb.cast(x=mb.add(x=e_raw, y=width(e_bias)), dtype="int32")
-    fractional = mb.sub(x=mb.real_div(x=x, y=mb.pow(x=width(2.), y=e_raw)), y=width(1.))
-    mantissa = mb.cast(x=mb.floor(x=mb.mul(x=fractional, y=width(e_offset))), dtype="int32")
+    # mb.pow(2, e_raw) is unstable when e_raw is 0 (returns 0 instead of 1)
+    # use exp(e_raw * ln(2)) instead
+    pow_2_e_raw = mb.exp(x=mb.mul(x=e_raw, y=np.log(width(2.))))
+    fractional = mb.sub(x=mb.real_div(x=x, y=pow_2_e_raw), y=width(1.))
+    # mb.floor causes issues with cast in some cases, and mantissa is mathematically integer
+    mantissa = mb.cast(x=mb.mul(x=fractional, y=width(e_offset)), dtype="int32")
     bits = mb.add(x=mb.mul(x=e_shifted, y=e_offset), y=mantissa)
     bits = mb.select(cond=zero, a=0, b=bits)
     return positive, bits, exponent + fraction + 1
@@ -90,8 +94,6 @@ def stable_argsort(x, axis=-1, ascending=True):
     arange = np.indices(x.shape)[axis]
     mask = bitcast_window(x, x.shape[axis])
     splits = bitcast_split(x, mask, ascending)
-    # return splits[0]
-    # return splits[1]
     shifted = lambda x: mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
     indices = mb.argsort(x=shifted(splits[0]), axis=axis, ascending=True)
     for window in splits[1:]:
