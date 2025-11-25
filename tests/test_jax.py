@@ -355,6 +355,14 @@ def test_sort():
     run_and_compare_specific_input(jnp.sort, (data,))
 
 
+def test_tmp():
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 4.23, 10, -4.3, 10, -5, -10, 5], dtype=jnp.float16),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 4.23, 10, -4.3, 10, -5, -10, 5], dtype=jnp.float32),))
+
+
+
 def test_multikey_sort_fails_due_to_stability():
     # Test lexicographical sort with multiple keys
     def sort_dim_0(k1, k2):

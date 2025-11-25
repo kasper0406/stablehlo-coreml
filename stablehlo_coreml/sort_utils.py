@@ -21,7 +21,7 @@ def bitcast_fp(x):
     positive = mb.greater_equal(x=x, y=width(0.))
     zero = mb.equal(x=x, y=width(0.))
     x = mb.abs(x=x)
-    e_raw = mb.floor_div(x=mb.log(x=x), y=mb.log(x=width(2.)))
+    e_raw = mb.floor_div(x=mb.log(x=x), y=np.log(width(2.)))
     e_shifted = mb.cast(x=mb.add(x=e_raw, y=width(e_bias)), dtype="int32")
     fractional = mb.sub(x=mb.real_div(x=x, y=mb.pow(x=width(2.), y=e_raw)), y=width(1.))
     mantissa = mb.cast(x=mb.floor(x=mb.mul(x=fractional, y=width(e_offset))), dtype="int32")
@@ -36,9 +36,9 @@ def bitcast_int(x):
     packed, signed = width == 32, x.dtype.is_unsigned()
     assert not packed or not signed, "CoreML has no uint32 type"
 
+    x = x if packed else mb.cast(x=x, dtype="int32")
     positive = mb.greater_equal(x=x, y=0) if signed else None
     x = mb.abs(x=x) if signed else x
-    x = x if packed else mb.cast(x=x, dtype="int32")
     return positive, x, width
 
 
@@ -87,18 +87,15 @@ def bitcast_window(x, n):
 
 
 def stable_argsort(x, axis=-1, ascending=True):
-    x = mb.cast(x=np.array(3.1415), dtype="fp32")
-    y = mb.cast(x=np.array(3.1415), dtype="fp16")
-    z = mb.cast(x=np.array(31415), dtype="int32")
-    w = mb.cast(x=np.array(31415), dtype="int16")
-    v = mb.cast(x=np.array(31415), dtype="int8")
-    print(bitcast_split(x))
-    print(bitcast_split(x, 11))
-    print(bitcast_split(y))
-    print(bitcast_split(z))
-    print(bitcast_split(w))
-    print(bitcast_split(v))
-    breakpoint()
+    arange = np.indices(x.shape)[axis]
+    mask = bitcast_window(x, x.shape[axis])
+    splits = bitcast_split(x, mask, ascending)
+    indices = mb.argsort(x=mb.add(x=splits[-1], y=arange), axis=axis, ascending=True)
+    for window in splits[-2::-1]:
+        gathered_key = mb.gather_along_axis(x=window, indices=indices, axis=axis)
+        relative_indices = mb.argsort(x=mb.add(x=gathered_key, y=arange), axis=axis, ascending=True)
+        indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=axis)
+    return indices
 
 
 def match_sort(tracing, args, inputs):

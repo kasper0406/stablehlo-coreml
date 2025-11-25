@@ -418,7 +418,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Apply the sort
         sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
 
         for key, ascending in sort_keys[-2::-1]:
             gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
