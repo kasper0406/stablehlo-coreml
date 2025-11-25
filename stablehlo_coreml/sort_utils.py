@@ -33,8 +33,8 @@ def bitcast_fp(x):
 def bitcast_int(x):
     width = x.dtype.width
     assert types.is_int(x.dtype) and width in { 8, 16, 32 }
-    packed, signed = width == 32, x.dtype.is_unsigned()
-    assert not packed or not signed, "CoreML has no uint32 type"
+    packed, signed = width == 32, not x.dtype.is_unsigned()
+    assert not packed or signed, "CoreML has no uint32 type"
 
     x = x if packed else mb.cast(x=x, dtype="int32")
     positive = mb.greater_equal(x=x, y=0) if signed else None
@@ -69,7 +69,7 @@ def bitcast_split(x, mask=16, ascending=True):
             out = mb.select(cond=sign, a=flipped, b=split)
         results.append(out)
         x = mb.floor_div(x=x, y=2 ** mask)
-    return tuple(mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)) for x in reversed(results))
+    return tuple(mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)) for x in results)
 
 
 def bitcast_window(x, n):
@@ -90,9 +90,13 @@ def stable_argsort(x, axis=-1, ascending=True):
     arange = np.indices(x.shape)[axis]
     mask = bitcast_window(x, x.shape[axis])
     splits = bitcast_split(x, mask, ascending)
-    indices = mb.argsort(x=mb.add(x=splits[-1], y=arange), axis=axis, ascending=True)
-    for window in splits[-2::-1]:
+    indices = mb.argsort(x=mb.add(x=splits[0], y=arange), axis=axis, ascending=True)
+    for window in splits[1:]:
         gathered_key = mb.gather_along_axis(x=window, indices=indices, axis=axis)
+        return mb.concat(values=(
+                mb.slice_by_index(x=gathered_key, begin=(0,), end=(5,)),
+                mb.slice_by_index(x=window, begin=(5,), end=(x.shape[axis],))
+            ), axis=0)
         relative_indices = mb.argsort(x=mb.add(x=gathered_key, y=arange), axis=axis, ascending=True)
         indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=axis)
     return indices
