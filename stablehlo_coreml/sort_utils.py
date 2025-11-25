@@ -90,10 +90,14 @@ def stable_argsort(x, axis=-1, ascending=True):
     arange = np.indices(x.shape)[axis]
     mask = bitcast_window(x, x.shape[axis])
     splits = bitcast_split(x, mask, ascending)
+    # return splits[0]
+    # return splits[1]
     shifted = lambda x: mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
     indices = mb.argsort(x=shifted(splits[0]), axis=axis, ascending=True)
     for window in splits[1:]:
         gathered_key = mb.gather_along_axis(x=window, indices=indices, axis=axis)
+        # gather bit casts to int16 then value casts back, so fix the sign bit
+        gathered_key = mb.select(cond=mb.less(x=gathered_key, y=0), a=mb.add(x=gathered_key, y=0x1_0000), b=gathered_key)
         relative_indices = mb.argsort(x=shifted(x=gathered_key), axis=axis, ascending=True)
         indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=axis)
     return indices
