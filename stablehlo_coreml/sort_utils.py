@@ -1,5 +1,4 @@
 import numpy as np
-from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, SelectOp, ConstantOp, OrOp, AndOp
 )
@@ -11,7 +10,7 @@ from coremltools.converters.mil.mil import types
 
 def bitcast_fp(x):
     width = types.nptype_from_builtin(x.dtype)
-    ieee754 = { np.float32: (8, 23), np.float16: (5, 10) }
+    ieee754 = {np.float32: (8, 23), np.float16: (5, 10)}
     assert types.is_float(x.dtype) and width in ieee754
     exponent, fraction = ieee754[width]
     e_bias = 2 ** (exponent - 1) - 1
@@ -82,7 +81,7 @@ def bitcast_fp(x):
 
 def bitcast_int(x):
     width = x.dtype.width
-    assert types.is_int(x.dtype) and width in { 8, 16, 32 }
+    assert types.is_int(x.dtype) and width in {8, 16, 32}
     packed, signed = width == 32, not x.dtype.is_unsigned()
     assert not packed or signed, "CoreML has no uint32 type"
 
@@ -100,7 +99,7 @@ def bitcast_split(x, mask=16, ascending=True):
     else:
         raise TypeError("only int and float are supported for sorting")
 
-    splits = -(-width // mask) # ceil
+    splits = -(-width // mask)  # ceil
     results = []
     for i in range(splits):
         if i < splits - 1:
@@ -140,7 +139,8 @@ def stable_argsort(x, axis=-1, ascending=True):
     arange = np.indices(x.shape)[axis]
     mask = bitcast_window(x, x.shape[axis])
     splits = bitcast_split(x, mask, ascending)
-    shifted = lambda x: mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
+    def shifted(x):
+        return mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
     indices = mb.argsort(x=shifted(splits[0]), axis=axis, ascending=True)
     for window in splits[1:]:
         gathered_key = mb.gather_along_axis(x=window, indices=indices, axis=axis)
@@ -192,10 +192,10 @@ def verify_zero_nan(tracing, args):
                     return None
                 if not len(selecting) or not selecting.pop()(const.value):
                     return None
-                if len(selecting): # select CompareOp %cst_# (=NaN) SelectOp
+                if len(selecting):  # select CompareOp %cst_# (=NaN) SelectOp
                     remaining = tracing.operands[2].owner.opview
                     tracing = tracing.operands[0].owner.opview
-                else: # select CompareOp %cst_# (=0) %arg#
+                else:  # select CompareOp %cst_# (=0) %arg#
                     # we should know the arg index from the popped CompareOp
                     if idx is None or tracing.operands[2] != args[idx]:
                         return None
@@ -204,7 +204,7 @@ def verify_zero_nan(tracing, args):
                 direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
                 if not len(comparing) or direction != comparing.pop():
                     return None
-                if len(comparing): # `np.isnan` via `NE %arg# %arg#`
+                if len(comparing):  # `np.isnan` via `NE %arg# %arg#`
                     if tracing.lhs != tracing.rhs or tracing.lhs not in args:
                         return None
                     # ensure op types are interleaved as expected
@@ -213,7 +213,7 @@ def verify_zero_nan(tracing, args):
                         return None
                     idx = args.index(tracing.lhs)
                     tracing, remaining = remaining, None
-                else: # merge `-0` and `+0` via `EQ %arg# %cst_# (=0.)`
+                else:  # merge `-0` and `+0` via `EQ %arg# %cst_# (=0.)`
                     const = tracing.rhs.owner.opview
                     if not isinstance(const, ConstantOp):
                         return None

@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-import pytest
 
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
@@ -362,11 +361,16 @@ def test_sort():
 
 
 def test_argsort():
-    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
-    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, 10, 0x1_0010, 10, 0x5_0000, 10, 5, 10, 0x1_0000, 5], dtype=jnp.int32),))
-    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, 10, 0x1_0010, 10, 0x5_0000, 10, 5, 10, 0x1_0000, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array(range(-8, 17), dtype=jnp.float32),))
-    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array([-2, -1, -0.6, -0.5, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5, 0.6, 1], dtype=jnp.float32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([-2, -1, -0.6, -0.5, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5, 0.6, 1],
+                                              dtype=jnp.float32),))
 
 
 def test_multikey_sort():
