@@ -1,7 +1,6 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
-import pytest
 
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
@@ -351,29 +350,45 @@ def test_sort():
     # (or similar, depending on implementation, but it must be total)
     # Note: CoreML handles NaNs differently than JAX (CoreML puts them at the beginning, JAX at the end)
     # So we exclude NaNs from this test to ensure we test the rest of the total sort logic (signed zeros etc)
-    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf], dtype=jnp.float32)
+    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float32)
     run_and_compare_specific_input(jnp.sort, (data,))
 
+    # Test with subnormals
+    # Smallest normal float32 is 1.17549435e-38
+    # Largest subnormal float32 is 1.17549421e-38
+    subnormals = jnp.array([1.17549435e-38, 1.17549421e-38, -1.17549421e-38, 0.0], dtype=jnp.float32)
+    run_and_compare_specific_input(jnp.sort, (subnormals,))
 
-def test_multikey_sort_fails_due_to_stability():
+
+def test_argsort():
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, 10, 0x1_0010, 10, 0x5_0000, 10, 5, 10, 0x1_0000, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array(range(-8, 17), dtype=jnp.float32),))
+    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
+                                   (jnp.array([-2, -1, -0.6, -0.5, -0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3, 0.5, 0.6, 1],
+                                              dtype=jnp.float32),))
+
+
+def test_multikey_sort():
     # Test lexicographical sort with multiple keys
     def sort_dim_0(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
     k1 = jnp.array([1, 3, 2, 4], dtype=jnp.int32)
     k2 = jnp.array([3, 1, 2, 4], dtype=jnp.int32)
-    with pytest.raises(Exception):
-        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+    run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1 = jnp.array([1, 5, 1, 4, 3, 4, 4], dtype=jnp.int32)
     k2 = jnp.array([9, 4, 0, 4, 0, 2, 1], dtype=jnp.int32)
-    with pytest.raises(Exception):
-        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+    run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1 = jnp.array([1, 3, 1, 4, 3, 5, 4], dtype=jnp.int32)
     k2 = jnp.array([0, 4, 0, 4, 0, -21, -12], dtype=jnp.int32)
-    with pytest.raises(Exception):
-        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+    run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1_2d = jnp.array([[1, 2], [3, 4]], dtype=jnp.int32)
     k2_2d = jnp.array([[3, 1], [2, 4]], dtype=jnp.int32)
@@ -381,17 +396,14 @@ def test_multikey_sort_fails_due_to_stability():
     def sort_dim_1(k1, k2):
         return jax.lax.sort([k1, k2], dimension=1, num_keys=2)
 
-    with pytest.raises(Exception):
-        run_and_compare_specific_input(sort_dim_1, (k1_2d, k2_2d))
+    run_and_compare_specific_input(sort_dim_1, (k1_2d, k2_2d))
 
     # Larger random inputs
     def sort_dim_0_large(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
-    with pytest.raises(Exception):
-        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.int32), jnp.zeros((100, 50), dtype=jnp.int32)))
-    with pytest.raises(Exception):
-        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
+    run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.int32), jnp.zeros((100, 50), dtype=jnp.int32)))
+    run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
 
 
 def test_unstable_argsort():

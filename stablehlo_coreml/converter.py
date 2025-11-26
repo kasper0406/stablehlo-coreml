@@ -13,7 +13,7 @@ from .utils import (
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
-from .sort_utils import match_sort
+from .sort_utils import match_sort, stable_argsort
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -400,8 +400,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # To bridge this gap, we must analyze the comparator's structure to reverse-engineer
         # the sorting criteria (which keys to sort by and in what direction).
         inputs = [context[operand.get_name()] for operand in op.inputs]
-        if op.is_stable and len(inputs) > 1:
-            raise ValueError("Stable sorting is not supported for multi-input sorting")
 
         if len(op.comparator.blocks) != 1:
             raise ValueError("Unsupported comparator format: must have exactly one block")
@@ -421,21 +419,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if sort_keys is None:
             raise ValueError("Unrecognized comparator format")
 
+        def precast_gather(tensor, indices):
+            if tensor.dtype == types.int32:
+                # gather bit casts to int16 then value casts back, so we need to
+                # cast to int16 before gather to avoid overflow for negative values
+                tensor = mb.cast(x=tensor, dtype="int16")
+                res = mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim)
+                return mb.cast(x=res, dtype="int32")
+            else:
+                return mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim)
+
         # Apply the sort
         sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
 
-        # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
-        if len(sort_keys) > 1:
-            raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
-        # The following code would be used if CoreML had a stable argsort
-        # for key, ascending in sort_keys[-2::-1]:
-        #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
-        #     relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-        #     indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+        for key, ascending in sort_keys[-2::-1]:
+            gathered_key = precast_gather(key, indices)
+            relative_indices = stable_argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+            context.add_result(op.results[i], precast_gather(tensor, indices))
 
     @register_stablehlo_op
     def op_case(self, context: TranslationContext, op: CaseOp):
