@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from typing import List
 from functools import reduce
 import itertools
+import numpy as np
+from coremltools.converters.mil.mil import types
+from jaxlib.mlir import ir
 
 
 @dataclass
@@ -248,3 +251,56 @@ def inverse_permutation(perm):
     for i, j in enumerate(perm):
         inv[j] = i
     return inv
+
+
+def get_mil_type_from_ir(element_type):
+    if isinstance(element_type, ir.IntegerType):
+        match (element_type.width, element_type.is_unsigned):
+            case (32, False):
+                return types.int32
+            case (32, True):
+                return types.uint32
+            case (16, False):
+                return types.int16
+            case (16, True):
+                return types.uint16
+            case (8, False):
+                return types.int8
+            case (8, True):
+                return types.uint8
+            case (1, _):
+                return types.bool
+    if isinstance(element_type, ir.F16Type):
+        return types.fp16
+    if isinstance(element_type, ir.F32Type):
+        return types.fp32
+    raise ValueError(f"Unsupported type {element_type}")
+
+
+def get_mil_type(obj):
+    if isinstance(obj, ir.Type):
+        if hasattr(obj, 'element_type'):
+            return get_mil_type_from_ir(obj.element_type)
+        return get_mil_type_from_ir(obj)
+    if isinstance(obj, np.ndarray):
+        return types.numpy_type_to_builtin_type(obj.dtype)
+    return obj.dtype
+
+
+def get_numpy_type(obj):
+    return types.nptype_from_builtin(get_mil_type(obj))
+
+
+def dtype_str(type):
+    # TODO(knielsen): Add additional types
+    return {
+        types.int32: "int32",
+        types.uint32: "uint32",
+        types.int16: "int16",
+        types.uint16: "uint16",
+        types.int8: "int8",
+        types.uint8: "uint8",
+        types.fp16: "fp16",
+        types.fp32: "fp32",
+        types.bool: "bool",
+    }[type]
