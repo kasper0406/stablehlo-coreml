@@ -125,7 +125,7 @@ def bitcast_window(x, n):
     if n < 2 ** 15:
         # 16 bit operand mask, 15 bit index mask
         return 16
-    elif x.dtype.width == 32 and n < 2 ** 20:
+    elif types.nptype_from_builtin(x.dtype) in {np.int32, np.float32} and n < 2 ** 20:
         # 11 bit operand mask, 20 bit index mask
         return 11
     elif n < 2 ** 23:
