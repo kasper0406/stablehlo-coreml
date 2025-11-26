@@ -426,7 +426,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+            if tensor.dtype == types.int32:
+                # gather bit casts to int16 then value casts back, so we need to
+                # manually cast to int16 before gather to avoid overflow
+                tensor_val = mb.cast(x=tensor, dtype="int16")
+                res = mb.gather_along_axis(x=tensor_val, indices=indices, axis=sort_dim)
+                res = mb.cast(x=res, dtype="int32")
+            else:
+                res = mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim)
+            context.add_result(op.results[i], res)
 
     @register_stablehlo_op
     def op_case(self, context: TranslationContext, op: CaseOp):
