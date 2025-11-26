@@ -6,7 +6,10 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
+from .utils import (
+    index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
+    inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type
+)
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
@@ -72,7 +75,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 shape = [1]
 
             func_inputs[arg.get_name()] = mb.placeholder(
-                shape=shape, dtype=self.__get_dtype(arg.type.element_type)
+                shape=shape, dtype=get_mil_type_from_ir(arg.type.element_type)
             )
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
@@ -154,8 +157,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[op.rhs.get_name()]
 
         # From HLO constraints we know the base-types should line up
-        lhs_type = self.__resolve_type(lhs)
-        rhs_type = self.__resolve_type(rhs)
+        lhs_type = get_mil_type(lhs)
+        rhs_type = get_mil_type(rhs)
         if lhs_type != rhs_type:
             raise ValueError(f"Division not supported for different types. lhs type: {lhs_type}, rhs type: {rhs_type}")
         if types.is_complex(lhs_type):
@@ -174,7 +177,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_neg(self, context: TranslationContext, op: NegOp):
         # TODO(knielsen): Consider unsigned and more exotic types
         operand = context[op.operand.get_name()]
-        minus_one = np.array([-1], dtype=types.nptype_from_builtin(operand.dtype))
+        minus_one = np.array([-1], dtype=get_numpy_type(operand))
         cml_op = mb.mul(x=minus_one, y=operand)
         context.add_result(op.result, cml_op)
 
@@ -193,7 +196,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_log1p(self, context: TranslationContext, op: Log1pOp):
         operand = context[op.operand.get_name()]
-        one = np.array([1], dtype=types.nptype_from_builtin(self.__resolve_type(operand)))
+        one = np.array([1], dtype=get_numpy_type(operand))
         x_plus_one = mb.add(x=one, y=operand)
         cml_op = mb.log(x=x_plus_one)
         context.add_result(op.result, cml_op)
@@ -300,8 +303,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
 
         # Allocate memory of the correct type for the result
-        result_dtype = self.__get_dtype(op.result.type.element_type)
-        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
+        result_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=dtype_str(result_dtype)))
 
         def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
@@ -558,8 +561,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convert(self, context: TranslationContext, op: ConvertOp):
         x = context[op.operand.get_name()]
-        new_dtype = self.__get_dtype(op.result.type.element_type)
-        cml_op = mb.cast(x=x, dtype=self.__dtype_str(new_dtype))
+        new_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        cml_op = mb.cast(x=x, dtype=dtype_str(new_dtype))
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -844,7 +847,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_isfinite(self, context: TranslationContext, op: IsFiniteOp):
         x = context[op.x.get_name()]
         # All finite numbers will have abs(x) < inf
-        infinity = np.array(np.inf, dtype=types.nptype_from_builtin(self.__resolve_type(x)))
+        infinity = np.array(np.inf, dtype=get_numpy_type(x))
         mil_res = mb.less(x=mb.abs(x=x), y=infinity)
         context.add_result(op.result, mil_res)
 
@@ -953,7 +956,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result_types = [result.type for result in op.results]
         reduction_results = [
             mb.transpose(
-                x=np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type))),
+                x=np.zeros(result_type.shape, dtype=get_numpy_type(result_type.element_type)),
                 perm=permutation,
             )
             for result_type in result_types
@@ -972,7 +975,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         iota_dim = int(op.iota_dimension)
         tensor_shape = op.result.type.shape
         vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
-        dtype = types.nptype_from_builtin(self.__get_dtype(op.result.type.element_type))
+        dtype = get_numpy_type(op.result.type.element_type)
         res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
         context.add_result(op.result, res)
 
@@ -1049,8 +1052,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     update_slice_spec.append(slice(None))
             return [update_tensor_by_slice(partial_results, update_slice_spec, selected_slice)]
 
-        result_dtype = self.__get_dtype(op.result.type.element_type)
-        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
+        result_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=dtype_str(result_dtype)))
         result_iteration_shape = [result.shape[stack_axis] for stack_axis in result_iteration_axes]
         result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
@@ -1263,16 +1266,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 for acc, result in zip(partial_results, reduction_results)
             ]
 
-        def get_result_type(result_type):
-            if hasattr(result_type, 'dtype'):
-                return result_type.dtype
-            elif hasattr(result_type, 'element_type'):
-                return self.__get_dtype(result_type.element_type)
-            else:
-                raise ValueError("Unable to resolve result type dtype")
-
         mil_results = [
-            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(get_result_type(result_type)))
+            np.zeros(result_type.shape, dtype=get_numpy_type(result_type))
             for result_type in result_types
         ]
         mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
@@ -1328,45 +1323,3 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_types=result_types,
         )
         return reduction_results
-
-    def __resolve_type(self, obj):
-        if isinstance(obj, np.ndarray):
-            return types.numpy_type_to_builtin_type(obj.dtype)
-        return obj.dtype
-
-    def __dtype_str(self, type):
-        # TODO(knielsen): Add additional types
-        return {
-            types.int32: "int32",
-            types.uint32: "uint32",
-            types.int16: "int16",
-            types.uint16: "uint16",
-            types.int8: "int8",
-            types.uint8: "uint8",
-            types.fp16: "fp16",
-            types.fp32: "fp32",
-            types.bool: "bool",
-        }[type]
-
-    def __get_dtype(self, element_type):
-        if isinstance(element_type, ir.IntegerType):
-            match (element_type.width, element_type.is_unsigned):
-                case (32, False):
-                    return types.int32
-                case (32, True):
-                    return types.uint32
-                case (16, False):
-                    return types.int16
-                case (16, True):
-                    return types.uint16
-                case (8, False):
-                    return types.int8
-                case (8, True):
-                    return types.uint8
-                case (1, _):
-                    return types.bool
-        if isinstance(element_type, ir.F16Type):
-            return types.fp16
-        if isinstance(element_type, ir.F32Type):
-            return types.fp32
-        raise ValueError(f"Unsupported type {element_type}")
