@@ -9,7 +9,6 @@ from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
 
-# TODO: nan, inf, subnormals
 def bitcast_fp(x):
     width = types.nptype_from_builtin(x.dtype)
     ieee754 = { np.float32: (8, 23), np.float16: (5, 10) }
@@ -18,19 +17,66 @@ def bitcast_fp(x):
     e_bias = 2 ** (exponent - 1) - 1
     e_offset = 2 ** fraction
 
+    # Detect special values
+    # mb.is_nan/is_inf are not available, use comparisons
+    is_nan = mb.not_equal(x=x, y=x)
+    is_inf = mb.equal(x=mb.abs(x=x), y=width(float('inf')))
+    is_special = mb.logical_or(x=is_nan, y=is_inf)
+
+    # Determine sign
+    # Note: mb.greater_equal(-0.0, 0.0) is True, so we need a special check for -0.0
+    # We can check if 1/x is negative (1/-0.0 = -inf)
+    recip = mb.real_div(x=width(1.), y=x)
+    is_neg_zero = mb.logical_and(x=mb.equal(x=x, y=width(0.)), y=mb.less(x=recip, y=width(0.)))
+
     positive = mb.greater_equal(x=x, y=width(0.))
-    zero = mb.equal(x=x, y=width(0.))
-    x = mb.abs(x=x)
-    e_raw = mb.floor_div(x=mb.log(x=x), y=np.log(width(2.)))
+    positive = mb.select(cond=is_neg_zero, a=False, b=positive)
+    # Treat NaN as positive so it sorts to the end
+    positive = mb.select(cond=is_nan, a=True, b=positive)
+
+    x_abs = mb.abs(x=x)
+    zero = mb.equal(x=x_abs, y=width(0.))
+
+    # Avoid log(0) by replacing 0 with 1.0 (log(1) = 0)
+    x_safe = mb.select(cond=zero, a=width(1.), b=x_abs)
+
+    e_raw = mb.floor_div(x=mb.log(x=x_safe), y=np.log(width(2.)))
     e_shifted = mb.cast(x=mb.add(x=e_raw, y=width(e_bias)), dtype="int32")
-    # mb.pow(2, e_raw) is unstable when e_raw is 0 (returns 0 instead of 1)
-    # use exp(e_raw * ln(2)) instead
+
+    # Subnormal handling
+    # If e_shifted <= 0, it's subnormal (or zero, but zero is handled separately)
+    is_subnormal = mb.less_equal(x=e_shifted, y=0)
+    e_shifted = mb.select(cond=is_subnormal, a=0, b=e_shifted)
+
+    # Calculate mantissa
+    # Normal: (x / 2^e_raw - 1) * 2^fraction
+    # mb.pow(2, e_raw) is unstable when e_raw is 0, use exp(e_raw * ln(2))
     pow_2_e_raw = mb.exp(x=mb.mul(x=e_raw, y=np.log(width(2.))))
-    fractional = mb.sub(x=mb.real_div(x=x, y=pow_2_e_raw), y=width(1.))
-    # mb.floor causes issues with cast in some cases, and mantissa is mathematically integer
-    mantissa = mb.cast(x=mb.mul(x=fractional, y=width(e_offset)), dtype="int32")
+    fractional_normal = mb.sub(x=mb.real_div(x=x_safe, y=pow_2_e_raw), y=width(1.))
+    mantissa_normal = mb.cast(x=mb.mul(x=fractional_normal, y=width(e_offset)), dtype="int32")
+
+    # Subnormal: x * 2^(fraction + bias - 1)
+    # 2^(fraction + bias - 1) might overflow the float type (e.g. float32 max is ~2^128, but we need 2^149)
+    # So we split the multiplication: x * 2^fraction * 2^(bias - 1)
+    factor1 = width(2 ** fraction)
+    factor2 = width(2 ** (e_bias - 1))
+    mantissa_subnormal = mb.cast(x=mb.mul(x=mb.mul(x=x_safe, y=factor1), y=factor2), dtype="int32")
+
+    mantissa = mb.select(cond=is_subnormal, a=mantissa_subnormal, b=mantissa_normal)
+
+    # Handle Inf/NaN
+    max_exp = 2**exponent - 1
+    e_shifted = mb.select(cond=is_special, a=max_exp, b=e_shifted)
+
+    # Inf: mantissa = 0, NaN: mantissa = max (to sort after Inf)
+    mantissa_special = mb.select(cond=is_nan, a=e_offset - 1, b=0)
+    mantissa = mb.select(cond=is_special, a=mantissa_special, b=mantissa)
+
+    # Handle Zero (override everything)
+    e_shifted = mb.select(cond=zero, a=0, b=e_shifted)
+    mantissa = mb.select(cond=zero, a=0, b=mantissa)
+
     bits = mb.add(x=mb.mul(x=e_shifted, y=e_offset), y=mantissa)
-    bits = mb.select(cond=zero, a=0, b=bits)
     return positive, bits, exponent + fraction + 1
 
 

@@ -351,8 +351,14 @@ def test_sort():
     # (or similar, depending on implementation, but it must be total)
     # Note: CoreML handles NaNs differently than JAX (CoreML puts them at the beginning, JAX at the end)
     # So we exclude NaNs from this test to ensure we test the rest of the total sort logic (signed zeros etc)
-    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf], dtype=jnp.float32)
+    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float32)
     run_and_compare_specific_input(jnp.sort, (data,))
+
+    # Test with subnormals
+    # Smallest normal float32 is 1.17549435e-38
+    # Largest subnormal float32 is 1.17549421e-38
+    subnormals = jnp.array([1.17549435e-38, 1.17549421e-38, -1.17549421e-38, 0.0], dtype=jnp.float32)
+    run_and_compare_specific_input(jnp.sort, (subnormals,))
 
 
 def test_argsort():
