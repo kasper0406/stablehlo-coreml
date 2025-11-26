@@ -1,0 +1,6 @@
+[flake8]
+exclude = env
+max-line-length = 127
+count = true
+statistics = true
+show-source = true
