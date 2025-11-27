@@ -10,8 +10,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
-
+  test-core:
     runs-on: macos-26
     strategy:
       fail-fast: false
@@ -24,15 +23,6 @@ jobs:
       uses: actions/setup-python@v3
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Cache Hugging Face and Torch models
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/huggingface
-          ~/.cache/torch
-        key: ${{ runner.os }}-models-${{ hashFiles('tests/pytorch/test_pytorch.py') }}
-        restore-keys: |
-          ${{ runner.os }}-models-
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
@@ -47,6 +37,26 @@ jobs:
     - name: Test with hatch
       run: |
         hatch run +py=${{ matrix.python-version }} test:pytest -vv
+
+  test-pytorch:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install flake8 pytest
+    - name: Install Hatch
+      uses: pypa/hatch@install
     - name: Test pytorch export
       run: |
         hatch run +py=${{ matrix.python-version }} test-pytorch:pytest -vv tests/pytorch/
