@@ -64,10 +64,7 @@ def test_tensor_multiplication():
     run_and_compare(two_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
     run_and_compare(three_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
-
-    # Currently the `contract_all` test is failing, due to a runtime error in CoreML
-    # crashing Python entirely. Reported to Apple in https://feedbackassistant.apple.com/feedback/15643467
-    # run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
+    run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
 
     # # Test the full tensor product with a big dimensions, and ensure that the program gets handled by a dynamic loop
     run_and_compare(full_tensor_product, (jnp.zeros((10, 3)), jnp.zeros((15, 20, 3))))
