@@ -8,7 +8,8 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 )
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
-    inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type
+    inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
+    clamp_index
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -590,6 +591,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # TODO(knielsen): Overflow check?
         sizes = np.array(op.slice_sizes, dtype=np.int32)
 
+        # Clamp start indices to ensure they are within bounds: [0, operand_dim - slice_size]
+        # This is required by the StableHLO specification
+        shape = mb.shape(x=x)
+        begin = clamp_index(begin, shape, sizes)
+
         cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
         context.add_result(op.result, cml_op)
 
@@ -616,6 +622,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         start_indices = [context[i.get_name()] for i in op.start_indices]
         start_indices = mb.concat(values=start_indices, axis=0)
+
+        # Clamp start indices to ensure they are within bounds: [0, operand_dim - update_dim]
+        # This is required by the StableHLO specification
+        shape = mb.shape(x=x)
+        update_shape = mb.shape(x=updates)
+        start_indices = clamp_index(start_indices, shape, update_shape)
+
         end_indices = mb.add(x=start_indices, y=op.update.type.shape)
 
         update_res = mb.slice_update(
