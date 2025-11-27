@@ -21,7 +21,7 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
 
         # Simple matches are where the `hlo_body` is on the form
         #   return _generic_reduction_op_type_(`args`)
-        # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
+        # In that case, if MIL has an equivalent of `_generic_reduction_op_`, we simply delegate to that
         simple_matches = {
             MaxOp: (mb.reduce_max, mb.maximum),
             MinOp: (mb.reduce_min, mb.minimum),
