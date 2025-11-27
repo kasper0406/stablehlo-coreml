@@ -87,6 +87,7 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
     mil_results = iterate_indexes_in_shapes(compute_reduction_loop, [result_shape], mil_results, unroll_limit=5)
     return mil_results
 
+
 def compute_windowed_reduction(
     converter,
     context: TranslationContext,

@@ -1200,4 +1200,3 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[hlo_op.rhs.get_name()]
         cml_op = mil_op(x=lhs, y=rhs)
         context.add_result(hlo_op.result, cml_op)
-
