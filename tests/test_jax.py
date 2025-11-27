@@ -470,3 +470,36 @@ def test_compare_bool():
         jnp.array([True, False, True], dtype=jnp.bool_),
         jnp.array([True, True, False], dtype=jnp.bool_)
     ))
+
+
+def test_dynamic_slice_oob():
+    # Test dynamic slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - slice_size)
+    def dynamic_slice(operand, start_indices):
+        return jax.lax.dynamic_slice(operand, start_indices, slice_sizes=(2, 2))
+
+    operand = jnp.zeros((5, 5))
+    # Valid index
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([10, 10], dtype=jnp.int32)))
+
+
+def test_dynamic_update_slice_oob():
+    # Test dynamic update slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - update_dim)
+    def dynamic_update_slice(operand, update, start_indices):
+        return jax.lax.dynamic_update_slice(operand, update, start_indices)
+
+    operand = jnp.zeros((5, 5))
+    update = jnp.ones((2, 2))
+    # Valid index
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([10, 10], dtype=jnp.int32)))

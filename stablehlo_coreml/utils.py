@@ -304,3 +304,14 @@ def dtype_str(type):
         types.fp32: "fp32",
         types.bool: "bool",
     }[type]
+
+
+def clamp_index(index, shape, size):
+    """
+    Clamps start indices to ensure they are within bounds: [0, operand_dim - slice_size]
+    This is required by the StableHLO specification
+    """
+    max_start_indices = mb.sub(x=shape, y=size)
+    index = mb.minimum(x=index, y=max_start_indices)
+    index = mb.maximum(x=index, y=0)
+    return index
