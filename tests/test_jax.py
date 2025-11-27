@@ -313,6 +313,11 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
 
 
+def test_pad_int32():
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2)), constant_values=10), (jnp.zeros((5, 5), dtype=jnp.int32),))
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2))), (jnp.zeros((5, 5), dtype=jnp.int32),))
+
+
 def test_remainder():
     run_and_compare(jnp.remainder, (
         jnp.array([10, 20, 30], dtype=jnp.int32), jnp.array([3, 7, 11], dtype=jnp.int32)

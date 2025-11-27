@@ -15,6 +15,7 @@ from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from .sort_utils import match_sort
 from .reductions import compute_reduction, compute_windowed_reduction
+from .padding import pad_with_cast
 
 
 from jaxlib.mlir import ir
@@ -248,7 +249,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         )
 
         cml_padding_value = context[op.padding_value.get_name()]
-        cml_op = mb.pad(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
+        cml_op = pad_with_cast(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -735,7 +736,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     # Fill spatial padding starting at dimension 2
                     for i in range(len(pad_in)):
                         full_pad_in[4 + i] = pad_in[i]
-                    x = mb.pad(x=x, pad=full_pad_in)
+                    x = pad_with_cast(x=x, pad=full_pad_in)
 
                 if np.any(pad < 0):
                     raise ValueError("The case where the padding turns negative when translating to a "
@@ -887,7 +888,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                pad_with_cast(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
