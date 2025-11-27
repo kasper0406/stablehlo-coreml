@@ -52,6 +52,6 @@ For the Jax example to work, you will additionally need to install `absl-py` and
 For additional examples see the `tests` directory.
 
 ## Notes
-* `coremltools` supports up to python 3.12. Do not run hatch with a newer version.
-  Can be controlled using fx `export HATCH_PYTHON=python3.12`
+* `coremltools` supports up to python 3.13. Do not run hatch with a newer version.
+  Can be controlled using fx `export HATCH_PYTHON=python3.13`
 * Run tests using `hatch run test:pytest tests`
