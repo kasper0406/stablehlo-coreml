@@ -14,6 +14,8 @@ from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from .sort_utils import match_sort
+from .reductions import compute_reduction, compute_windowed_reduction
+
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -110,7 +112,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         func_name = op.callee.value
         hlo_func = self.func_index[op.callee.value]
         params = hlo_func.arguments
-        outputs = self.__invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
+        outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
 
         # Configure return value
         for result, output in zip(op.results, outputs):
@@ -453,10 +455,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         def build_branch(i):
             if i == len(op.branches) - 1:
                 # Default/Last branch
-                return self.__invoke_hlo_function(context, "branch_default", *params(i))
+                return self.invoke_hlo_function(context, "branch_default", *params(i))
 
             def true_fn():
-                return self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
+                return self.invoke_hlo_function(context, f"branch_{i}", *params(i))
 
             def false_fn():
                 return build_branch(i + 1)
@@ -513,7 +515,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_while(self, context: TranslationContext, op: WhileOp):
         def cond(*loop_args):
             params = [param for param in op.cond.blocks[0].arguments]
-            outputs = self.__invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
+            outputs = self.invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
             if len(outputs) != 1:
                 raise ValueError("The output of while_cond should always be a single boolean!")
             # TODO(knielsen): Add a check that the output is in fact a single boolean value
@@ -522,7 +524,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         def body(*body_args):
             params = [param for param in op.body.blocks[0].arguments]
-            return self.__invoke_hlo_function(context, "while_body", params, op.body, body_args)
+            return self.invoke_hlo_function(context, "while_body", params, op.body, body_args)
 
         loop_vars = [context[arg.get_name()] for arg in op.operands]
         while_results = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
@@ -862,7 +864,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
         result_types = [result.type for result in op.results]
 
-        mil_results = self.__compute_reduction(context, inputs, op.dimensions, op.body, init_values, result_types)
+        mil_results = compute_reduction(self, context, inputs, op.dimensions, op.body, init_values, result_types)
         for (res, mil_res) in zip(op.results, mil_results):
             context.add_result(res, mil_res)
 
@@ -937,7 +939,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     for result in idx_result_types
                 ]
 
-            results = self.__compute_windowed_reduction(
+            results = compute_windowed_reduction(
+                converter=self,
                 context=context,
                 inputs=idx_inputs,
                 window_dimensions=idx_window_dimensions,
@@ -1169,7 +1172,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         mil_res = mb.mul(x=0.5, y=log_res)
         return [mil_res]
 
-    def __invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
+    def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
         context.push_function(func_name)
 
@@ -1198,128 +1201,3 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         cml_op = mil_op(x=lhs, y=rhs)
         context.add_result(hlo_op.result, cml_op)
 
-    def __compute_reduction(self, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
-        def match_reduction_type(hlo_body):
-            if len(hlo_body.blocks) != 1:
-                return None, None
-            args = list(hlo_body.blocks[0].arguments)
-            ops = list(hlo_body.blocks[0].operations)
-
-            # Simple matches are where the `hlo_body` is on the form
-            #   return _generic_reduction_op_type_(`args`)
-            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
-            simple_matches = {
-                MaxOp: (mb.reduce_max, mb.maximum),
-                MinOp: (mb.reduce_min, mb.minimum),
-                AddOp: (mb.reduce_sum, mb.add),
-                MulOp: (mb.reduce_prod, mb.mul),
-            }
-
-            for generic_reduce_op_type, mil_equivalents in simple_matches.items():
-                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
-                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
-                        return mil_equivalents
-
-            return None, None
-
-        mil_reduction, mil_single_reduction = match_reduction_type(body)
-        if mil_reduction and mil_single_reduction and len(inputs) == 1:
-            res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
-            # Handle initial value
-            res = mil_single_reduction(x=res, y=init_values[0])
-            return [res]
-
-        # Fall back to loop implementation
-        logger.warning("Falling back to while-loop implementation for reduction. This may be slower than expected!")
-
-        input_rank = len(inputs[0].shape)
-        # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
-        # of the input rank. This is to make computing element indexes easier.
-        # When updating the result, we later pick out just the result indices
-        # we care about in the actual result.
-        reduce_shape = [inputs[0].shape[dim] if dim in dimensions else 1 for dim in range(input_rank)]
-        result_shape = [inputs[0].shape[dim] if dim not in dimensions else 1 for dim in range(input_rank)]
-
-        def compute_reduction(result_idx, *partial_results):
-            def compute_inner(element_idx, *acc):
-                element_idx = mb.add(x=result_idx, y=element_idx)
-                elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
-
-                args = list(acc) + elements
-                hlo_params = list(body.blocks[0].arguments)
-                outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, body, args)
-
-                return outputs
-
-            reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
-
-            # The result rank is likely less than the input shape.
-            # We need to pick the indexes in the result shape we want to update
-            result_indices = [dim for dim in range(input_rank) if dim not in dimensions]
-            if len(result_indices) != 0:
-                result_idx = [mb.gather(x=result_idx, indices=result_indices)]
-            else:
-                result_idx = []
-
-            return [
-                update_tensor_by_slice(acc, result_idx, result)
-                for acc, result in zip(partial_results, reduction_results)
-            ]
-
-        mil_results = [
-            np.zeros(result_type.shape, dtype=get_numpy_type(result_type))
-            for result_type in result_types
-        ]
-        mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
-        return mil_results
-
-    def __compute_windowed_reduction(
-        self,
-        context: TranslationContext,
-        inputs,
-        window_dimensions,
-        window_strides,
-        body,
-        init_values,
-        result_types
-    ):
-        def move_axis_last(arr, axis):
-            permutation = list(range(len(arr.shape)))
-            permutation.append(permutation.pop(axis))
-            return mb.transpose(x=arr, perm=permutation)
-
-        # First group all the dimensions being reduced over in a group at the end
-        inputs_rank = len(window_dimensions)
-        partitioned_inputs = []
-        for input in inputs:
-            transformed = mb.sliding_windows(
-                x=input,
-                axis=0,
-                size=window_dimensions[0],
-                stride=window_strides[0]
-            )
-            transformed = move_axis_last(transformed, 1)
-            for axis in range(1, inputs_rank):
-                transformed = mb.sliding_windows(
-                    x=transformed, axis=axis, size=window_dimensions[axis], stride=window_strides[axis])
-                transformed = move_axis_last(transformed, axis + 1)
-                # Contract the two last dimensions into one
-                transformed_rank = len(transformed.shape)
-                new_shape = mb.concat(values=[
-                    mb.slice_by_size(x=mb.shape(x=transformed), begin=[0], size=[transformed_rank - 2]),
-                    np.array([-1], dtype=np.int32)
-                ], axis=0)
-                transformed = mb.reshape(x=transformed, shape=new_shape)
-            partitioned_inputs.append(transformed)
-
-        # Then use the normal reduce implementation to compute the result
-        reduction_dimension = len(partitioned_inputs[0].shape) - 1
-        reduction_results = self.__compute_reduction(
-            context=context,
-            inputs=partitioned_inputs,
-            dimensions=[reduction_dimension],
-            body=body,
-            init_values=init_values,
-            result_types=result_types,
-        )
-        return reduction_results
