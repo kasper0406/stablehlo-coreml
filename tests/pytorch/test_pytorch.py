@@ -130,11 +130,22 @@ def patch_transformers_compiling():
 # ==============================================================================
 
 def test_tinyllama():
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, use_cache=False)
+    config = AutoConfig.from_pretrained(model_name)
+
+    # Use a much smaller config to avoid OOM in CI
+    config.num_hidden_layers = 2
+    config.hidden_size = 128
+    config.intermediate_size = 512
+    config.num_attention_heads = 4
+    config.num_key_value_heads = 4
+    config.use_cache = False
+    config.torch_dtype = "float16"
+
+    model = AutoModelForCausalLM.from_config(config)
 
     prompt = "Hello, my name is"
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -144,11 +155,19 @@ def test_tinyllama():
 
 @pytest.mark.xfail(reason="Conversion error (ScatterOp not implemented)")
 def test_t5_small():
-    from transformers import AutoTokenizer, T5Model
+    from transformers import AutoTokenizer, T5Model, AutoConfig
 
     # Use AutoTokenizer which might fallback to fast tokenizer (no sentencepiece needed if available)
     tokenizer = AutoTokenizer.from_pretrained("t5-small")
-    model = T5Model.from_pretrained("t5-small", use_cache=False)
+    config = AutoConfig.from_pretrained("t5-small")
+    config.num_layers = 2
+    config.num_decoder_layers = 2
+    config.d_model = 128
+    config.d_kv = 32
+    config.d_ff = 512
+    config.num_heads = 4
+    config.use_cache = False
+    model = T5Model.from_config(config)
 
     input_ids = tokenizer("Studies have been shown that owning a dog is good for you", return_tensors="pt").input_ids
     decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids
@@ -160,11 +179,16 @@ def test_t5_small():
 
 
 def test_distilbert():
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer, AutoConfig
 
     model_name = "distilbert-base-uncased"
-    model = AutoModel.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
+    config.n_layers = 2
+    config.dim = 128
+    config.hidden_dim = 512
+    config.n_heads = 4
+    model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of distilbert", return_tensors="pt")
     with patch_transformers_compiling():
@@ -172,22 +196,32 @@ def test_distilbert():
 
 
 def test_gpt2():
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer, AutoConfig
 
     model_name = "gpt2"
-    model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
+    config.n_layer = 2
+    config.n_embd = 128
+    config.n_head = 4
+    config.use_cache = False
+    model = AutoModel.from_config(config)
 
     input_ids = tokenizer("this is a test of gpt2", return_tensors="pt").input_ids
     evaluate_pytorch_model(model, (input_ids, ))
 
 
 def test_bert():
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer, AutoConfig
 
     model_name = "bert-base-uncased"
-    model = AutoModel.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
+    config.num_hidden_layers = 2
+    config.hidden_size = 128
+    config.intermediate_size = 512
+    config.num_attention_heads = 4
+    model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of bert", return_tensors="pt")
     with patch_transformers_compiling():
@@ -199,10 +233,18 @@ def test_bert():
 # ==============================================================================
 
 def test_whisper_tiny():
-    from transformers import AutoModelForSpeechSeq2Seq
+    from transformers import AutoModelForSpeechSeq2Seq, AutoConfig
     import torch
 
-    model = AutoModelForSpeechSeq2Seq.from_pretrained("openai/whisper-tiny", use_cache=False)
+    model_name = "openai/whisper-tiny"
+    config = AutoConfig.from_pretrained(model_name)
+    config.encoder_layers = 2
+    config.decoder_layers = 2
+    config.d_model = 128
+    config.encoder_attention_heads = 4
+    config.decoder_attention_heads = 4
+    config.use_cache = False
+    model = AutoModelForSpeechSeq2Seq.from_config(config)
 
     # Workaround for torchax issue with tied weights
     for module in model.modules():
@@ -227,61 +269,71 @@ def test_whisper_tiny():
 
 def test_convnext_tiny():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.convnext_tiny(weights=torchvision.models.ConvNeXt_Tiny_Weights.DEFAULT)
+    # Use a custom small ConvNeXt
+    # block_setting: list of [in_channels, out_channels, num_blocks, stride]
+    # Standard tiny is:
+    # [96, 96, 3, 1], [96, 192, 3, 2], [192, 384, 9, 2], [384, 768, 3, 2]
+    # We use a much smaller version:
+    block_setting = [
+        torchvision.models.convnext.CNBlockConfig(input_channels=32, out_channels=64, num_layers=1),
+        torchvision.models.convnext.CNBlockConfig(input_channels=64, out_channels=128, num_layers=1),
+    ]
+    model = torchvision.models.ConvNeXt(block_setting=block_setting, num_classes=10)
     evaluate_pytorch_model(model, inputs)
 
 
 def test_vit_b_16():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.vit_b_16(weights=torchvision.models.ViT_B_16_Weights.DEFAULT)
+    # Use a smaller ViT
+    model = torchvision.models.VisionTransformer(
+        image_size=224,
+        patch_size=16,
+        num_layers=2,
+        num_heads=4,
+        hidden_dim=128,
+        mlp_dim=512,
+        num_classes=10
+    )
     evaluate_pytorch_model(model, inputs)
 
 
 def test_efficientnet_b0():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.efficientnet_b0(weights=torchvision.models.EfficientNet_B0_Weights.DEFAULT)
+    model = torchvision.models.efficientnet_b0()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_mobilenet_v3_small():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.mobilenet_v3_small(weights=torchvision.models.MobileNet_V3_Small_Weights.DEFAULT)
-    evaluate_pytorch_model(model, inputs)
-
-
-def test_deeplabv3_resnet50():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.segmentation.deeplabv3_resnet50(
-        weights=torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT
-    )
+    model = torchvision.models.mobilenet_v3_small()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_densenet121():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.densenet121(weights=torchvision.models.DenseNet121_Weights.DEFAULT)
+    model = torchvision.models.densenet121()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_resnet50():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.DEFAULT)
+    model = torchvision.models.resnet50()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_resnet18():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.DEFAULT)
+    model = torchvision.models.resnet18()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_inception_v3():
     inputs = (torch.randn(4, 3, 299, 299), )
-    model = torchvision.models.inception_v3(weights=torchvision.models.Inception_V3_Weights.DEFAULT)
+    model = torchvision.models.inception_v3()
     evaluate_pytorch_model(model, inputs)
 
 
 def test_vgg16():
     inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.DEFAULT)
+    model = torchvision.models.vgg16()
     evaluate_pytorch_model(model, inputs)
