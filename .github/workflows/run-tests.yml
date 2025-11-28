@@ -39,7 +39,7 @@ jobs:
         hatch run +py=${{ matrix.python-version }} test:pytest -vv
 
   test-pytorch:
-    runs-on: self-hosted
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +51,15 @@ jobs:
       uses: actions/setup-python@v3
       with:
         python-version: ${{ matrix.python-version }}
+    - name: Cache Hugging Face and Torch models
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/huggingface
+          ~/.cache/torch
+        key: ${{ runner.os }}-models-${{ hashFiles('tests/pytorch/test_pytorch.py') }}
+        restore-keys: |
+          ${{ runner.os }}-models-
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
