@@ -18,7 +18,6 @@ from .sort_utils import match_sort
 from .reductions import compute_reduction, compute_windowed_reduction
 from .padding import pad_with_cast
 
-
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
