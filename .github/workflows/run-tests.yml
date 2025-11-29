@@ -36,7 +36,7 @@ jobs:
         flake8 . --count --show-source --statistics --max-line-length=127
     - name: Test with hatch
       run: |
-        hatch run +py=${{ matrix.python-version }} test:pytest -vv
+        hatch run +py=${{ matrix.python-version }} test:test-with-cov
 
   test-pytorch:
     runs-on: macos-26

@@ -14,10 +14,10 @@ def register_stablehlo_op(func):
     error_msg = "HLO op implementations should take parameters of exactly " \
                 "(context: TranscriptionContext, op: <HLO_OP_TYPE>)"
     if len(params) != 2:
-        raise TypeError(error_msg)
+        raise ValueError(error_msg)
 
     if not issubclass(params[0].annotation, TranslationContext):
-        raise TypeError(error_msg)
+        raise ValueError(error_msg)
 
     # We identify the function by the type of operation it implements
     func._implements_hlo_op = params[1].annotation
@@ -33,12 +33,12 @@ class StableHloOpsRegistry(type):
             op_type = getattr(method, '_implements_hlo_op', False)
             if callable(method) and op_type:
                 if op_type in cls._stablehlo_ops_registry:
-                    raise TypeError(f"StableHLO op {op_type} has been registered more than once!")
+                    raise ValueError(f"StableHLO op {op_type} has been registered more than once!")
                 cls._stablehlo_ops_registry[op_type] = method
 
     def _dispatch_op(cls, self, context: TranslationContext, op):
         if type(op) not in self._stablehlo_ops_registry:
-            raise TypeError(f"The StableHLO op {type(op)} has not been implemented!")
+            raise ValueError(f"The StableHLO op {type(op)} has not been implemented!")
 
         op_method = self._stablehlo_ops_registry[type(op)]
         return op_method(self, context, op)

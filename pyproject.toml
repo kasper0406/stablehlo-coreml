@@ -55,7 +55,11 @@ extra-dependencies = [
     "einops",
     "pillow",
     "equinox>=0.13.2",
+    "pytest-cov",
 ]
+
+[tool.hatch.envs.test.scripts]
+test-with-cov = "pytest --cov=stablehlo_coreml --cov-report=term-missing"
 
 [[tool.hatch.envs.test-pytorch.matrix]]
 python = ["3.12", "3.13"]
