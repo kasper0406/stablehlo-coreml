@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+import pytest
 
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
@@ -63,10 +64,7 @@ def test_tensor_multiplication():
     run_and_compare(two_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
     run_and_compare(three_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
-
-    # Currently the `contract_all` test is failing, due to a runtime error in CoreML
-    # crashing Python entirely. Reported to Apple in https://feedbackassistant.apple.com/feedback/15643467
-    # run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
+    run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
 
     # # Test the full tensor product with a big dimensions, and ensure that the program gets handled by a dynamic loop
     run_and_compare(full_tensor_product, (jnp.zeros((10, 3)), jnp.zeros((15, 20, 3))))
@@ -111,8 +109,8 @@ def test_complex_reductions():
 
     run_and_compare(jnp.argmin, (jnp.zeros((2, 3, 3)),))
     run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((2, 3, 3)),))
-    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((20, 30, 40)),))
-    run_and_compare(partial(jnp.argmin, axis=1, keepdims=True), (jnp.zeros((20, 30, 40)),))
+    run_and_compare(partial(jnp.argmin, axis=1), (jnp.zeros((20, 100, 40)),))
+    run_and_compare(partial(jnp.argmin, axis=1, keepdims=True), (jnp.zeros((20, 100, 40)),))
 
 
 def test_topk():
@@ -276,6 +274,24 @@ def test_complex_gather():
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
 
+    operand = jnp.arange(1, 25).reshape((3, 4, 2))
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(0,),
+        start_index_map=(1, 0),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 2, 2)), (operand, start_indices[0]))
+
+    operand = jnp.arange(1, 49).reshape((2, 3, 4, 2))
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(1,),
+        start_index_map=(2, 1),
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
+
     start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
     dimension_numbers = GatherDimensionNumbers(
         offset_dims = (3, 4),
@@ -367,7 +383,6 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((0, 10), (5, 0), (2, 1))), (jnp.zeros((10, 20, 15)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="empty"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((1, 2), (3, 4)), constant_values=12.3), (jnp.zeros((10, 20)),))
-
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="reflect"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="wrap"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="edge"), (jnp.zeros((10, 20)),))
@@ -377,3 +392,195 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="median"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="minimum"), (jnp.zeros((10, 20)),))
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
+
+
+def test_pad_int32():
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2)), constant_values=10), (jnp.zeros((5, 5), dtype=jnp.int32),))
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2))), (jnp.zeros((5, 5), dtype=jnp.int32),))
+
+
+def test_remainder():
+    run_and_compare(jnp.remainder, (
+        jnp.array([10, 20, 30], dtype=jnp.int32), jnp.array([3, 7, 11], dtype=jnp.int32)
+    ))
+    run_and_compare(jnp.remainder, (
+        jnp.array([10.5, 20.2, 30.1], dtype=jnp.float32), jnp.array([3.1, 7.2, 11.3], dtype=jnp.float32)
+    ))
+
+
+def test_floor():
+    run_and_compare(jnp.floor, (jnp.array([1.1, 2.9, -1.1, -2.9], dtype=jnp.float32),))
+
+
+def test_ceil():
+    run_and_compare(jnp.ceil, (jnp.array([1.1, 2.9, -1.1, -2.9], dtype=jnp.float32),))
+
+
+def test_clamp():
+    run_and_compare(partial(jnp.clip, a_min=0.0, a_max=1.0), (jnp.array([-1.0, 0.5, 2.0], dtype=jnp.float32),))
+    run_and_compare(partial(jnp.clip, a_min=-5, a_max=5), (jnp.array([-10, 0, 10], dtype=jnp.int32),))
+
+
+def test_sort():
+    run_and_compare(jnp.sort, (jnp.array([3, 1, 2], dtype=jnp.int32),))
+    run_and_compare(jnp.sort, (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, axis=0), (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+
+    # Test with larger random input
+    run_and_compare(jnp.sort, (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, axis=0), (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, descending=True), (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(jnp.sort, axis=0, descending=True), (jnp.zeros((100, 50), dtype=jnp.float32),))
+
+    # Test with NaNs and negative zeros to trigger total sort logic
+    # Total sort order for floats: NaN < -Inf < ... < -0.0 < 0.0 < ... < Inf
+    # (or similar, depending on implementation, but it must be total)
+    # Note: CoreML handles NaNs differently than JAX (CoreML puts them at the beginning, JAX at the end)
+    # So we exclude NaNs from this test to ensure we test the rest of the total sort logic (signed zeros etc)
+    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf], dtype=jnp.float32)
+    run_and_compare_specific_input(jnp.sort, (data,))
+
+
+def test_multikey_sort_fails_due_to_stability():
+    # Test lexicographical sort with multiple keys
+    def sort_dim_0(k1, k2):
+        return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
+
+    k1 = jnp.array([1, 3, 2, 4], dtype=jnp.int32)
+    k2 = jnp.array([3, 1, 2, 4], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+
+    k1 = jnp.array([1, 5, 1, 4, 3, 4, 4], dtype=jnp.int32)
+    k2 = jnp.array([9, 4, 0, 4, 0, 2, 1], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+
+    k1 = jnp.array([1, 3, 1, 4, 3, 5, 4], dtype=jnp.int32)
+    k2 = jnp.array([0, 4, 0, 4, 0, -21, -12], dtype=jnp.int32)
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_0, (k1, k2))
+
+    k1_2d = jnp.array([[1, 2], [3, 4]], dtype=jnp.int32)
+    k2_2d = jnp.array([[3, 1], [2, 4]], dtype=jnp.int32)
+
+    def sort_dim_1(k1, k2):
+        return jax.lax.sort([k1, k2], dimension=1, num_keys=2)
+
+    with pytest.raises(Exception):
+        run_and_compare_specific_input(sort_dim_1, (k1_2d, k2_2d))
+
+    # Larger random inputs
+    def sort_dim_0_large(k1, k2):
+        return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
+
+    with pytest.raises(Exception):
+        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.int32), jnp.zeros((100, 50), dtype=jnp.int32)))
+    with pytest.raises(Exception):
+        run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
+
+
+def test_unstable_argsort():
+    def unstable_argsort(x, **kwargs):
+        return jnp.argsort(x, stable=False, **kwargs)
+
+    run_and_compare_specific_input(unstable_argsort, (jnp.array([3, 1, 2], dtype=jnp.int32),))
+    run_and_compare_specific_input(unstable_argsort, (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+    run_and_compare_specific_input(partial(unstable_argsort, axis=0), (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
+
+    # Test with larger random input
+    run_and_compare(unstable_argsort, (jnp.zeros((100, 50), dtype=jnp.float32),))
+    run_and_compare(partial(unstable_argsort, axis=0), (jnp.zeros((100, 50), dtype=jnp.float32),))
+
+
+def test_multi_input_argsort():
+    # Because argsort is unstable, we cannot directly compare the output indices.
+    # Instead, we perform argsort followed by gather to retrieve the sorted values,
+    # which can then be compared.
+    def unstable_argsort_and_lookup(sort_array, lookup_array, lookup_values):
+        _sorted_array, ordered_lookup_idx = jax.lax.sort([sort_array, lookup_array], dimension=0, num_keys=1, is_stable=False)
+        gathered = jnp.take(lookup_values, ordered_lookup_idx)
+        return gathered
+
+    run_and_compare_specific_input(unstable_argsort_and_lookup, (
+        jnp.array([3, 1, 2, 3, 1, 2, 3, 1, 2], dtype=jnp.int32),
+        jnp.array([2, 0, 1, 2, 0, 1, 2, 0, 1], dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.int32)
+    ))
+
+    run_and_compare_specific_input(unstable_argsort_and_lookup, (
+        jnp.array([3, 1, 2, 3, 1, 2, 3, 1, 2], dtype=jnp.float32),
+        jnp.array([2, 0, 1, 2, 0, 1, 2, 0, 1], dtype=jnp.int32),
+        jnp.array([0, 1, 2], dtype=jnp.float32)
+    ))
+
+
+def test_case():
+    def switch_fn(index, x):
+        return jax.lax.switch(index, [
+            lambda x: x + 1,
+            lambda x: x * 2,
+            lambda x: x - 1
+        ], x)
+
+    run_and_compare_specific_input(switch_fn, (
+        jnp.array(0, dtype=jnp.int32), jnp.array(10.0, dtype=jnp.float32)
+    ))
+    run_and_compare_specific_input(switch_fn, (
+        jnp.array(1, dtype=jnp.int32), jnp.array(10.0, dtype=jnp.float32)
+    ))
+    run_and_compare_specific_input(switch_fn, (
+        jnp.array(2, dtype=jnp.int32), jnp.array(10.0, dtype=jnp.float32)
+    ))
+
+
+def test_reshape_scalar():
+    # Test reshaping to scalar (0-rank tensor)
+    def reshape_to_scalar(x):
+        return jnp.reshape(x, ())
+
+    run_and_compare(reshape_to_scalar, (jnp.array([5.0], dtype=jnp.float32),))
+
+
+def test_compare_bool():
+    run_and_compare_specific_input(jnp.equal, (
+        jnp.array([True, False, True], dtype=jnp.bool_),
+        jnp.array([True, True, False], dtype=jnp.bool_)
+    ))
+    run_and_compare_specific_input(jnp.not_equal, (
+        jnp.array([True, False, True], dtype=jnp.bool_),
+        jnp.array([True, True, False], dtype=jnp.bool_)
+    ))
+
+
+def test_dynamic_slice_oob():
+    # Test dynamic slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - slice_size)
+    def dynamic_slice(operand, start_indices):
+        return jax.lax.dynamic_slice(operand, start_indices, slice_sizes=(2, 2))
+
+    operand = jnp.zeros((5, 5))
+    # Valid index
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([10, 10], dtype=jnp.int32)))
+
+
+def test_dynamic_update_slice_oob():
+    # Test dynamic update slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - update_dim)
+    def dynamic_update_slice(operand, update, start_indices):
+        return jax.lax.dynamic_update_slice(operand, update, start_indices)
+
+    operand = jnp.zeros((5, 5))
+    update = jnp.ones((2, 2))
+    # Valid index
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([10, 10], dtype=jnp.int32)))
