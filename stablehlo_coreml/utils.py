@@ -9,7 +9,6 @@ from functools import reduce
 import itertools
 import numpy as np
 from coremltools.converters.mil.mil import types
-from jaxlib.mlir import ir
 
 
 @dataclass
@@ -19,10 +18,6 @@ class ResolvedSliceSpec:
     strides: List[int]
     shape: List[int]
 
-@dataclass
-class RankedSliceType:
-    shape: List[int]
-    element_type: ir.Type
 
 def index_by_slices(tensor, slice_spec):
     tensor = fix_scalar_tensor(tensor)

@@ -7,7 +7,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
 from .utils import (
-    RankedSliceType, index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
+    index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
     clamp_index
 )
@@ -15,7 +15,9 @@ from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from .sort_utils import match_sort
-from .reductions import compute_reduction, compute_windowed_reduction
+from .reductions import (
+    compute_reduction, compute_windowed_reduction, match_computation
+)
 from .padding import pad_with_cast
 
 from jaxlib.mlir import ir
@@ -379,10 +381,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result, = iterate_indexes_in_shapes(calculate_result_index, [lhs_shape, rhs_shape], [result])
 
         context.add_result(op.result, result)
-
-    @register_stablehlo_op
-    def op_rem(self, context: TranslationContext, op: RemOp):
-        self.__simple_binary_op(context, mb.mod, op)
 
     @register_stablehlo_op
     def op_floor(self, context: TranslationContext, op: FloorOp):
@@ -814,14 +812,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.minimum, op)
 
     @register_stablehlo_op
-    def op_floor(self, context: TranslationContext, op: FloorOp):
-        self.__simple_unary_op(context, mb.floor, op)
-
-    @register_stablehlo_op
-    def op_ceil(self, context: TranslationContext, op: CeilOp):
-        self.__simple_unary_op(context, mb.ceil, op)
-
-    @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
         self.__simple_unary_op(context, mb.rsqrt, op)
 
@@ -1027,13 +1017,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
+
         inferred_sizes = np.array([
             1 if i in dim_mapping or i in dim_batches else
-            operand.shape[i] for i in range(operand_rank)])
-        if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
+            operand.shape[i] for i in range(operand_rank)]
+        )
+        if not dim_batches and \
                 np.all(np.array(op.slice_sizes) == inferred_sizes):
             upper, lower = [operand.shape[i] - 1 for i in dim_mapping], [0] * len(dim_mapping)
-            broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
+
+            def broadcastable(x):
+                return np.array(x)[(None,) * (start_indices_rank - 1)]
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
             if len(dim_mapping) == 1:
@@ -1044,16 +1038,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 return
             elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
                 result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
-                window_outputs = [i for i in range(operand_rank) if i not in dim_batches and i not in dim_numbers.collapsed_slice_dims]
+                window_outputs = [
+                    i for i in range(operand_rank)
+                    if i not in dim_batches and i not in dim_numbers.collapsed_slice_dims
+                ]
                 window_outputs = [j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1]
-                result = mb.expand_dims(x=result, axes=window_outputs)
+                if window_outputs:
+                    result = mb.expand_dims(x=result, axes=window_outputs)
                 context.add_result(op.result, result)
                 return
-
-        if dim_numbers.operand_batching_dims != []:
-            raise ValueError("Batched operand dims gather is not supported!")
-        if dim_numbers.start_indices_batching_dims != []:
-            raise ValueError("Batched start indices gather is not supported!")
 
         result_rank = len(op.result.type.shape)
         slice_sizes = op.slice_sizes
@@ -1127,84 +1120,120 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         if len(dim_numbers.input_batching_dims) > 0:
             raise ValueError("Scatter batching index is not supported!")
-        if np.max(dim_mapping) >= len(dim_mapping):
-            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
         if len(op.inputs) != 1 or len(op.updates) != 1:
             raise ValueError("Scatter with multiple operands is not supported!")
+
+        scatter_indices_rank = len(scatter_indices.shape)
+        if scatter_indices_rank == 0 or 0 in scatter_indices.shape:
+            # Special case for empty scatter indices
+            context.add_result(op.results[0], operand)
+            return
+
+        if np.max(dim_mapping) >= len(dim_mapping):
+            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
         # MIL only supports scatter window update sizes that match the operand shape
         #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
         # [sic] via
         #     https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather.scatter_nd
-        if scatter_indices.shape != (1,) and updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
+        if scatter_indices.shape != (1,) and \
+                updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
             raise ValueError("Scatter windows that only partially fill dimensions are not supported!")
 
         # this can be done pre-emptively because of the constraint on scatter windows
         scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
 
         # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
-        # TODO: Consider refactoring. Can maybe be combined with the reduction type sniffing
-        def match_update_computation(hlo_body):
-            if len(hlo_body.blocks) != 1:
-                return None
-            args = list(hlo_body.blocks[0].arguments)
-            ops = list(hlo_body.blocks[0].operations)
-            if not isinstance(ops[-1], ReturnOp):
-                return None
-            if len(ops) == 1 and ops[0].operands[0] == args[1]:
-                return "update"
-            if len(ops) != 2 or \
-                    list(ops[0].operands) != args or \
-                    list(ops[1].operands) != list(ops[0].results):
-                return None
+        # We try to match the update computation to a known binary operation
+        _, mil_binary_op, mode = match_computation(op.update_computation)
 
-            mode_map = {
-                AddOp: "add",
-                SubtractOp: "sub",
-                MulOp: "mul",
-                DivOp: "div",
-                MaxOp: "max",
-                MinOp: "min",
-            }
-            return mode_map.get(type(ops[0]), None)
-
-        mode = match_update_computation(op.update_computation)
-        if mode is None:
+        if mil_binary_op is None:
             raise ValueError("Unsupported update mode for scatter operation")
 
-        upper_bound = np.array(operand.shape[:len(dim_mapping)])[(None,) * (scatter_indices.rank - 1)]
+        upper_bound = np.array(operand.shape[:len(dim_mapping)], dtype=np.int32)[(None,) * (scatter_indices_rank - 1)]
         valid = mb.logical_and(
-                x=mb.greater_equal(x=scatter_indices, y=0),
-                y=mb.less(x=scatter_indices, y=upper_bound))
-        along = lambda n: mb.slice_by_index(
-                x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
-                end=scatter_indices.shape[:-1] + (n + 1,))
+            x=mb.greater_equal(x=scatter_indices, y=0),
+            y=mb.less(x=scatter_indices, y=upper_bound)
+        )
 
-        # if there's too many axes to unroll reasonably, there's too many to use
+        def along(n):
+            return mb.slice_by_index(
+                x=valid, begin=(0,) * (scatter_indices_rank - 1) + (n,),
+                end=scatter_indices.shape[:-1] + (n + 1,)
+            )
+
         reduction = along(0)
         for i in range(1, scatter_indices.shape[-1]):
             reduction = mb.logical_and(x=reduction, y=along(i))
-        reduction = mb.squeeze(x=reduction, axes=(scatter_indices.rank - 1,))
+        reduction = mb.squeeze(x=reduction, axes=(scatter_indices_rank - 1,))
 
+        # Special handling for rank-0 reduction (single index update).
+        # This is required because:
+        # 1. It supports updating a window that is a subset of the dimension (partial update),
+        #    which `scatter_nd` does not support (it only supports full slice updates).
+        # 2. It allows using `mil_binary_op` directly, supporting any binary operation,
+        #    whereas `scatter_nd` is limited to specific modes.
         if reduction.rank == 0:
             assert scatter_indices.shape == (1,), \
                     f"unexpected input shape for scatter indices of {scatter_indices.shape}"
             assert updates.rank == operand.rank
 
-            update_bound = scatter_indices
-            axis0 = lambda operand, bound: bound if operand.rank <= 1 else mb.concat(
-                    values=(bound, operand.shape[1:]), axis=0)
-            before = mb.slice_by_index(x=operand, begin=(0,) * operand.rank, end=axis0(operand, update_bound))
+            # The index to update
+            update_index = scatter_indices
 
-            update_bound = mb.minimum(x=mb.add(x=scatter_indices, y=updates.shape[:1]), y=operand.shape[:1])
-            after = mb.slice_by_index(x=operand, begin=update_bound, end=axis0(operand, update_bound))
+            # Helper to construct end indices for slicing
+            # If rank <= 1, it's just the bound. Otherwise, it's [bound, dim1, dim2, ...]
+            def get_end_indices(operand, bound):
+                if operand.rank <= 1:
+                    return bound
+                return mb.concat(values=(bound, operand.shape[1:]), axis=0)
 
-            update_bound = mb.sub(x=update_bound, y=scatter_indices)
-            updates = mb.slice_by_index(x=updates, begin=(0,) * updates.rank, end=axis0(updates, update_bound))
+            # 1. Slice before the update index
+            # operand[:update_index]
+            before = mb.slice_by_index(
+                x=operand,
+                begin=(0,) * operand.rank,
+                end=get_end_indices(operand, update_index)
+            )
 
+            # 2. Slice after the update index
+            # operand[update_index+window_size:]
+            # We need to clamp the start index for 'after' to be at most operand.shape[0]
+            # to avoid out of bounds.
+            update_window_size = updates.shape[0]
+            update_end_index = mb.minimum(
+                x=mb.add(x=update_index, y=update_window_size),
+                y=operand.shape[0]
+            )
+            after = mb.slice_by_index(
+                x=operand,
+                begin=get_end_indices(operand, update_end_index),
+                end=operand.shape
+            )
+
+            # 3. The update value itself
+            # We need to extract the current value at the update index to apply the update operation
+            # operand[update_index:update_index+window_size]
+            current_value_slice = mb.slice_by_index(
+                x=operand,
+                begin=get_end_indices(operand, update_index),
+                end=get_end_indices(operand, update_end_index)
+            )
+
+            # Apply the update computation (add, mul, etc.)
+            new_value_slice = mil_binary_op(x=current_value_slice, y=updates)
+
+            # 4. Concatenate parts to form the result
+            # [before, new_value, after]
+            # We only do this if the index is valid (reduction condition)
+            # 'reduction' here is actually a boolean scalar indicating if the index is valid
+            is_valid_index = reduction
+
+            result_if_valid = mb.concat(values=(before, new_value_slice, after), axis=0)
             result = mb.select(
-                    cond=reduction,
-                    a=mb.concat(values=(before, updates, after), axis=0),
-                    b=operand)
+                cond=is_valid_index,
+                a=result_if_valid,
+                b=operand
+            )
         else:
             where = mb.non_zero(x=reduction)
             scatter_indices = mb.gather_nd(x=scatter_indices, indices=where)

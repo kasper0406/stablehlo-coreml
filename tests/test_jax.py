@@ -266,11 +266,11 @@ def test_complex_gather():
     start_indices = jnp.array(start_indices, dtype=jnp.int32)
     operand = jnp.arange(1, 49).reshape((2, 3, 4, 2))
     dimension_numbers = GatherDimensionNumbers(
-        offset_dims = (3, 4),
-        collapsed_slice_dims = (1,),
-        operand_batching_dims = (0,),
-        start_indices_batching_dims = (0,),
-        start_index_map = (2, 1),
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(1,),
+        operand_batching_dims=(0,),
+        start_indices_batching_dims=(0,),
+        start_index_map=(2, 1),
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 2)), (operand, start_indices))
 
@@ -294,14 +294,55 @@ def test_complex_gather():
 
     start_indices = jnp.concatenate((start_indices, start_indices[::-1, 1:]), 1)
     dimension_numbers = GatherDimensionNumbers(
-        offset_dims = (3, 4),
-        collapsed_slice_dims = (),
-        operand_batching_dims = (0, 1),
-        start_indices_batching_dims = (0, 1),
-        start_index_map = (3, 2),
+        offset_dims=(3, 4),
+        collapsed_slice_dims=(),
+        operand_batching_dims=(0, 1),
+        start_indices_batching_dims=(0, 1),
+        start_index_map=(3, 2),
     )
-    result = wrapped_gather(dimension_numbers, (1, 1, 1, 1))(operand, start_indices)
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 1, 1)), (operand, start_indices))
+
+
+def test_large_gather():
+    # Test gather with large indices to verify if optimization is necessary
+    # and if it works correctly.
+    from jax.lax import GatherDimensionNumbers
+
+    def wrapped_gather(dimension_numbers, slice_sizes):
+        @jax.jit
+        def internal_gather(operand, start_indices):
+            return jax.lax.gather(
+                operand=operand,
+                start_indices=start_indices,
+                dimension_numbers=dimension_numbers,
+                slice_sizes=slice_sizes,
+            )
+        return internal_gather
+
+    # Create a large operand and indices
+    # Operand: (10, 20, 30)
+    operand = jnp.reshape(jnp.arange(6000), (10, 20, 30))
+
+    # Indices: (100, 2) -> gathering 100 slices
+    # We want enough indices to potentially trigger unroll limits if not optimized
+    num_indices = 100
+    start_indices = jnp.zeros((num_indices, 2), dtype=jnp.int32)
+    # Fill with some valid indices
+    for i in range(num_indices):
+        start_indices = start_indices.at[i, 0].set(i % 10)
+        start_indices = start_indices.at[i, 1].set(i % 20)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(1,),
+        collapsed_slice_dims=(0, 1),
+        start_index_map=(0, 1)
+    )
+
+    # slice_sizes: (1, 1, 30)
+    # We gather from dim 0 and 1. Dim 2 is kept.
+    # Result shape: (100, 30)
+
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 30)), (operand, start_indices))
 
 
 def test_simple_scatter():
@@ -348,7 +389,7 @@ def test_simple_scatter():
     run_and_compare(scatter_min, (jnp.zeros((30,)),))
 
 
-def test_scatter():
+def test_scatter_with_dimension_numbers():
     from jax.lax import ScatterDimensionNumbers
 
     def wrapped_scatter_add(dimension_numbers):
@@ -370,12 +411,189 @@ def test_scatter():
     operand = jnp.arange(1, 25).reshape((3, 4, 2))
     update = jnp.ones((2, 3, 2), dtype=jnp.int32)
     dimension_numbers = ScatterDimensionNumbers(
-        update_window_dims = (2,),
-        inserted_window_dims = (0, 1),
-        scatter_dims_to_operand_dims = (1, 0),
+        update_window_dims=(2,),
+        inserted_window_dims=(0, 1),
+        scatter_dims_to_operand_dims=(1, 0),
     )
 
     run_and_compare_specific_input(wrapped_scatter_add(dimension_numbers), (operand, scatter_indices, update))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y, z, dnums: jax.lax.scatter_add(x, y, z, dnums), "add"),
+    (lambda x, y, z, dnums: jax.lax.scatter_mul(x, y, z, dnums), "mul"),
+    (lambda x, y, z, dnums: jax.lax.scatter_min(x, y, z, dnums), "min"),
+    (lambda x, y, z, dnums: jax.lax.scatter_max(x, y, z, dnums), "max"),
+    # scatter_apply (set) is slightly different in JAX, usually just scatter
+    (lambda x, y, z, dnums: jax.lax.scatter(x, y, z, dnums), "set"),
+], ids=["add", "mul", "min", "max", "set"])
+def test_scatter_middle_update_rank1(op_fn, op_name):
+    # Update a slice in the middle, leaving the end untouched.
+    # Operand: [0, 1, 2, 3, 4]
+    # Indices: [1] (shape (1,))
+    # Updates: [10, 11] (shape (2,))
+    # Expected (add): [0, 11, 13, 3, 4]
+
+    def scatter_func(operand, indices, updates):
+        dnums = jax.lax.ScatterDimensionNumbers(
+            update_window_dims=(0,),
+            inserted_window_dims=(),
+            scatter_dims_to_operand_dims=(0,)
+        )
+        return op_fn(operand, indices, updates, dnums)
+
+    operand = jnp.array([0, 1, 2, 3, 4], dtype=jnp.float32)
+    indices = jnp.array([1], dtype=jnp.int32)  # Shape (1,)
+    updates = jnp.array([10, 11], dtype=jnp.float32)  # Shape (2,)
+
+    run_and_compare_specific_input(scatter_func, (operand, indices, updates))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y: x.at[y].set, "set"),
+    (lambda x, y: x.at[y].add, "add"),
+    (lambda x, y: x.at[y].subtract, "subtract"),
+    (lambda x, y: x.at[y].multiply, "multiply"),
+    (lambda x, y: x.at[y].divide, "divide"),
+    (lambda x, y: x.at[y].max, "max"),
+    (lambda x, y: x.at[y].min, "min"),
+], ids=["set", "add", "subtract", "multiply", "divide", "max", "min"])
+@pytest.mark.parametrize("shape", [
+    (30,),
+    (10, 3),
+    (5, 2, 3),
+], ids=["rank1", "rank2", "rank3"])
+def test_scatter(op_fn, op_name, shape):
+    arr = jnp.zeros(shape)
+
+    axis_len = arr.shape[0]
+    indices = jnp.arange(axis_len // 2) * 2
+    updates_shape = (indices.shape[0],) + arr.shape[1:]
+    updates = jnp.arange(jnp.prod(jnp.array(updates_shape))).reshape(updates_shape)
+
+    def scatter_op(arr):
+        return op_fn(arr, indices)(updates)
+
+    run_and_compare(scatter_op, (arr,))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y: x.at[y].set, "set"),
+    (lambda x, y: x.at[y].add, "add"),
+    (lambda x, y: x.at[y].subtract, "subtract"),
+    (lambda x, y: x.at[y].multiply, "multiply"),
+    (lambda x, y: x.at[y].divide, "divide"),
+    (lambda x, y: x.at[y].max, "max"),
+    (lambda x, y: x.at[y].min, "min"),
+], ids=["set", "add", "subtract", "multiply", "divide", "max", "min"])
+def test_scatter_2d_indices(op_fn, op_name):
+    arr = jnp.zeros((5, 5))
+
+    indices = jnp.array([
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [4, 0],
+    ])
+    updates = jnp.arange(arr.shape[1])
+
+    def scatter_op(arr):
+        return op_fn(arr, indices)(updates)
+
+    run_and_compare(scatter_op, (arr,))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y: x.at[y].set, "set"),
+    (lambda x, y: x.at[y].add, "add"),
+    (lambda x, y: x.at[y].subtract, "subtract"),
+    (lambda x, y: x.at[y].multiply, "multiply"),
+    (lambda x, y: x.at[y].divide, "divide"),
+    (lambda x, y: x.at[y].max, "max"),
+    (lambda x, y: x.at[y].min, "min"),
+], ids=["set", "add", "subtract", "multiply", "divide", "max", "min"])
+def test_scatter_3d_indices(op_fn, op_name):
+    arr = jnp.zeros((4, 3, 2))
+
+    indices = jnp.array([
+        [0, 0, 0],
+        [1, 1, 1],
+        [2, 2, 0],
+        [3, 0, 1],
+    ])
+    updates = jnp.arange(arr.shape[2])
+
+    def scatter_op(arr):
+        return op_fn(arr, indices)(updates)
+
+    run_and_compare(scatter_op, (arr,))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y: x.at[y].set, "set"),
+    (lambda x, y: x.at[y].add, "add"),
+    (lambda x, y: x.at[y].subtract, "subtract"),
+    (lambda x, y: x.at[y].multiply, "multiply"),
+    (lambda x, y: x.at[y].divide, "divide"),
+    (lambda x, y: x.at[y].max, "max"),
+    (lambda x, y: x.at[y].min, "min"),
+], ids=["set", "add", "subtract", "multiply", "divide", "max", "min"])
+def test_scatter_replace_vector(op_fn, op_name):
+    arr = jnp.zeros((3, 4, 5, 6))
+
+    indices = jnp.array([
+        [0, 1, 3],
+        [1, 2, 4],
+    ])
+
+    updates = jnp.reshape(jnp.arange(arr.shape[3] * indices.shape[0]), (indices.shape[0], 1, 1, 1, arr.shape[3]))
+
+    def scatter_op(arr):
+        return op_fn(arr, indices)(updates)
+
+    run_and_compare(scatter_op, (arr,))
+
+
+@pytest.mark.parametrize("op_fn,op_name", [
+    (lambda x, y: x.at[y].set, "set"),
+    (lambda x, y: x.at[y].add, "add"),
+    (lambda x, y: x.at[y].subtract, "subtract"),
+    (lambda x, y: x.at[y].multiply, "multiply"),
+    (lambda x, y: x.at[y].divide, "divide"),
+    (lambda x, y: x.at[y].max, "max"),
+    (lambda x, y: x.at[y].min, "min"),
+], ids=["set", "add", "subtract", "multiply", "divide", "max", "min"])
+def test_scatter_replace_matrix(op_fn, op_name):
+    arr = jnp.zeros((3, 4, 5, 6))
+
+    indices = jnp.array([
+        [0, 1],
+        [1, 2],
+    ])
+
+    updates = jnp.arange(arr.shape[2])[None, :] @ jnp.arange(arr.shape[2])[:, None]
+
+    def scatter_op(arr):
+        return op_fn(arr, indices)(updates)
+
+    run_and_compare(scatter_op, (arr,))
+
+
+def test_scatter_empty_indices():
+    def scatter_add(operand, indices, updates):
+        dnums = jax.lax.ScatterDimensionNumbers(
+            update_window_dims=(1,),
+            inserted_window_dims=(0,),
+            scatter_dims_to_operand_dims=(0,),
+        )
+        return jax.lax.scatter_add(operand, indices, updates, dnums)
+
+    operand = jnp.zeros((4, 4), dtype=jnp.float32)
+    indices = jnp.zeros((0, 1), dtype=jnp.int32)
+    updates = jnp.ones((0, 4), dtype=jnp.float32)
+
+    run_and_compare_specific_input(scatter_add, (operand, indices, updates))
 
 
 def test_pad():
