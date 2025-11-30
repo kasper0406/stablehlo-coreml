@@ -1018,6 +1018,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
 
+        # Handle simple gather cases directly, avoiding the while-loop below
         inferred_sizes = np.array([
             1 if i in dim_mapping or i in dim_batches else
             operand.shape[i] for i in range(operand_rank)]
@@ -1167,11 +1168,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         reduction = mb.squeeze(x=reduction, axes=(scatter_indices_rank - 1,))
 
         # Special handling for rank-0 reduction (single index update).
-        # This is required because:
-        # 1. It supports updating a window that is a subset of the dimension (partial update),
-        #    which `scatter_nd` does not support (it only supports full slice updates).
-        # 2. It allows using `mil_binary_op` directly, supporting any binary operation,
-        #    whereas `scatter_nd` is limited to specific modes.
+        # It supports updating a window that is a subset of the dimension (partial update),
+        # which `scatter_nd` does not support (it only supports full slice updates).
         if reduction.rank == 0:
             assert scatter_indices.shape == (1,), \
                     f"unexpected input shape for scatter indices of {scatter_indices.shape}"
