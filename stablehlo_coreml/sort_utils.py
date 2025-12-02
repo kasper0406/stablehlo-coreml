@@ -75,10 +75,11 @@ def bitcast_fp(x):
 
 def bitcast_int(x):
     width = x.dtype.width
-    assert types.is_int(x.dtype) and width in {8, 16, 32}, (
-        f"Stable argsort recieved unexpected integer dtype width of {width} bits which is unsupported because "
-        "MIL's gather op only supports integer sizes of 8, 16, and 32 bits"
-    )
+    if not types.is_int(x.dtype) or width not in {8, 16, 32}:
+        raise ValueError(
+            f"Stable argsort recieved unexpected integer dtype width of {width} bits which is unsupported because "
+            "MIL's gather op only supports integer sizes of 8, 16, and 32 bits"
+        )
     packed, signed = width == 32, not x.dtype.is_unsigned()
     assert not packed or signed, "CoreML has no uint32 type"
 
