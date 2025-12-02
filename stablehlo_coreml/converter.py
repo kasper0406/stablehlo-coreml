@@ -422,7 +422,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if types.is_int(key.dtype):
                 indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
             else:
-                # MIL puts NaN just above -inf instead of above +inf like StableHLO
+                # MIL puts NaN as equal to -inf instead of above +inf like StableHLO
                 nans = mb.not_equal(x=key, y=key)
                 inf_masking_nans = mb.select(cond=nans, a=np.inf, b=key)
                 indices = mb.argsort(x=inf_masking_nans, axis=sort_dim, ascending=ascending)
