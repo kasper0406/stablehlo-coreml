@@ -348,11 +348,7 @@ def test_sort():
     # Test with NaNs and negative zeros to trigger total sort logic
     # Total sort order for floats: -Inf < ... < -0.0 == 0.0 < ... < Inf < NaN
     # Note: CoreML handles NaNs differently than JAX (CoreML puts them at the beginning, JAX at the end)
-    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float32)
-    run_and_compare_specific_input(jnp.sort, (data,))
-    run_and_compare_specific_input(jnp.argsort, (data,))
-
-    data = jnp.array([jnp.nan, 0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf], dtype=jnp.float32)
+    data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.nan, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float32)
     run_and_compare_specific_input(jnp.sort, (data,))
     run_and_compare_specific_input(jnp.argsort, (data,))
 
