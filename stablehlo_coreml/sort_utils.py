@@ -9,38 +9,31 @@ from coremltools.converters.mil.mil import types
 
 
 def bitcast_fp(x):
-    width = types.nptype_from_builtin(x.dtype)
+    fp_dtype = types.nptype_from_builtin(x.dtype)
     ieee754 = {np.float32: (8, 23), np.float16: (5, 10)}
-    assert types.is_float(x.dtype) and width in ieee754
-    exponent, fraction = ieee754[width]
+    assert types.is_float(x.dtype) and fp_dtype in ieee754
+    exponent, fraction = ieee754[fp_dtype]
     e_bias = 2 ** (exponent - 1) - 1
     e_offset = 2 ** fraction
 
     # Detect special values
     # mb.is_nan/is_inf are not available, use comparisons
     is_nan = mb.not_equal(x=x, y=x)
-    is_inf = mb.equal(x=mb.abs(x=x), y=width(float('inf')))
+    is_inf = mb.equal(x=mb.abs(x=x), y=fp_dtype(np.inf))
     is_special = mb.logical_or(x=is_nan, y=is_inf)
 
-    # Determine sign
-    # Note: mb.greater_equal(-0.0, 0.0) is True, so we need a special check for -0.0
-    # We can check if 1/x is negative (1/-0.0 = -inf)
-    recip = mb.real_div(x=width(1.), y=x)
-    is_neg_zero = mb.logical_and(x=mb.equal(x=x, y=width(0.)), y=mb.less(x=recip, y=width(0.)))
-
-    positive = mb.greater_equal(x=x, y=width(0.))
-    positive = mb.select(cond=is_neg_zero, a=False, b=positive)
+    positive = mb.greater_equal(x=x, y=fp_dtype(0.))
     # Treat NaN as positive so it sorts to the end
     positive = mb.select(cond=is_nan, a=True, b=positive)
 
     x_abs = mb.abs(x=x)
-    zero = mb.equal(x=x_abs, y=width(0.))
+    zero = mb.equal(x=x_abs, y=fp_dtype(0.))
 
     # Avoid log(0) by replacing 0 with 1.0 (log(1) = 0)
-    x_safe = mb.select(cond=zero, a=width(1.), b=x_abs)
+    x_safe = mb.select(cond=zero, a=fp_dtype(1.), b=x_abs)
 
-    e_raw = mb.floor_div(x=mb.log(x=x_safe), y=np.log(width(2.)))
-    e_shifted = mb.cast(x=mb.add(x=e_raw, y=width(e_bias)), dtype="int32")
+    e_raw = mb.floor_div(x=mb.log(x=x_safe), y=np.log(fp_dtype(2.)))
+    e_shifted = mb.cast(x=mb.add(x=e_raw, y=fp_dtype(e_bias)), dtype="int32")
 
     # Subnormal handling
     # If e_shifted <= 0, it's subnormal (or zero, but zero is handled separately)
@@ -50,15 +43,16 @@ def bitcast_fp(x):
     # Calculate mantissa
     # Normal: (x / 2^e_raw - 1) * 2^fraction
     # mb.pow(2, e_raw) is unstable when e_raw is 0, use exp(e_raw * ln(2))
-    pow_2_e_raw = mb.exp(x=mb.mul(x=e_raw, y=np.log(width(2.))))
-    fractional_normal = mb.sub(x=mb.real_div(x=x_safe, y=pow_2_e_raw), y=width(1.))
-    mantissa_normal = mb.cast(x=mb.mul(x=fractional_normal, y=width(e_offset)), dtype="int32")
+    # https://github.com/apple/coremltools/issues/2628
+    pow_2_e_raw = mb.exp(x=mb.mul(x=e_raw, y=np.log(fp_dtype(2.))))
+    fractional_normal = mb.sub(x=mb.real_div(x=x_safe, y=pow_2_e_raw), y=fp_dtype(1.))
+    mantissa_normal = mb.cast(x=mb.mul(x=fractional_normal, y=fp_dtype(e_offset)), dtype="int32")
 
     # Subnormal: x * 2^(fraction + bias - 1)
     # 2^(fraction + bias - 1) might overflow the float type (e.g. float32 max is ~2^128, but we need 2^149)
     # So we split the multiplication: x * 2^fraction * 2^(bias - 1)
-    factor1 = width(2 ** fraction)
-    factor2 = width(2 ** (e_bias - 1))
+    factor1 = fp_dtype(2 ** fraction)
+    factor2 = fp_dtype(2 ** (e_bias - 1))
     mantissa_subnormal = mb.cast(x=mb.mul(x=mb.mul(x=x_safe, y=factor1), y=factor2), dtype="int32")
 
     mantissa = mb.select(cond=is_subnormal, a=mantissa_subnormal, b=mantissa_normal)

@@ -346,12 +346,11 @@ def test_sort():
     run_and_compare(partial(jnp.sort, axis=0, descending=True), (jnp.zeros((100, 50), dtype=jnp.float32),))
 
     # Test with NaNs and negative zeros to trigger total sort logic
-    # Total sort order for floats: NaN < -Inf < ... < -0.0 < 0.0 < ... < Inf
-    # (or similar, depending on implementation, but it must be total)
-    # Note: CoreML handles NaNs differently than JAX (CoreML puts them at the beginning, JAX at the end)
-    # So we exclude NaNs from this test to ensure we test the rest of the total sort logic (signed zeros etc)
+    # Total sort order for floats: -Inf < ... < -0.0 == 0.0 < ... < Inf < NaN
+    # Note: CoreML handles NaNs differently than JAX (CoreML puts them just after -Inf, JAX at the end)
     data = jnp.array([0.0, -0.0, 1.0, -1.0, jnp.inf, -jnp.inf, jnp.nan], dtype=jnp.float32)
     run_and_compare_specific_input(jnp.sort, (data,))
+    run_and_compare_specific_input(jnp.argsort, (data,))
 
     # Test with subnormals
     # Smallest normal float32 is 1.17549435e-38

@@ -418,7 +418,24 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Apply the sort
         sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
+        if len(inputs) == 1:
+            if types.is_int(key.dtype):
+                indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+            else:
+                # MIL puts NaN just above -inf instead of above +inf like StableHLO
+                nans = mb.not_equal(x=key, y=key)
+                inf_masking_nans = mb.select(cond=nans, a=np.inf, b=key)
+                indices = mb.argsort(x=inf_masking_nans, axis=sort_dim, ascending=ascending)
+                gathered_key = mb.gather_along_axis(x=inf_masking_nans, indices=indices, axis=sort_dim)
+                n_masked = mb.reduce_sum(x=mb.cast(x=nans, dtype="int32"), axes=(sort_dim,), keep_dims=True)
+                arange = np.indices(key.shape)[sort_dim]
+                nan_mask = mb.greater_equal(x=arange, y=mb.sub(x=key.shape[sort_dim], y=n_masked))
+                nan_full = np.full(key.shape, np.nan)
+                res = mb.add(x=gathered_key, y=mb.select(cond=nan_mask, a=nan_full, b=0.))
+                context.add_result(op.results[0], res)
+                return
+        else:
+            indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
 
         for key, ascending in sort_keys[-2::-1]:
             gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
