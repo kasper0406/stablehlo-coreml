@@ -416,27 +416,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if sort_keys is None:
             raise ValueError("Unrecognized comparator format")
 
-        def precast_gather(tensor, indices):
-            if tensor.dtype == types.int32:
-                # gather bit casts to int16 then value casts back, so we need to
-                # cast to int16 before gather to avoid overflow for negative values
-                tensor = mb.cast(x=tensor, dtype="int16")
-                res = mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim)
-                return mb.cast(x=res, dtype="int32")
-            else:
-                return mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim)
-
         # Apply the sort
         sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
         indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
 
         for key, ascending in sort_keys[-2::-1]:
-            gathered_key = precast_gather(key, indices)
+            gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
             relative_indices = stable_argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
             indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], precast_gather(tensor, indices))
+            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
 
     @register_stablehlo_op
     def op_case(self, context: TranslationContext, op: CaseOp):
