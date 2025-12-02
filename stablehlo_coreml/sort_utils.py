@@ -58,7 +58,7 @@ def bitcast_fp(x):
     mantissa = mb.select(cond=is_subnormal, a=mantissa_subnormal, b=mantissa_normal)
 
     # Handle Inf/NaN
-    max_exp = 2**exponent - 1
+    max_exp = 2 ** exponent - 1
     e_shifted = mb.select(cond=is_special, a=max_exp, b=e_shifted)
 
     # Inf: mantissa = 0, NaN: mantissa = max (to sort after Inf)
@@ -75,7 +75,10 @@ def bitcast_fp(x):
 
 def bitcast_int(x):
     width = x.dtype.width
-    assert types.is_int(x.dtype) and width in {8, 16, 32}
+    assert types.is_int(x.dtype) and width in {8, 16, 32}, (
+        f"Stable argsort recieved unexpected integer dtype width of {width} bits which is unsupported because "
+        "MIL's gather op only supports integer sizes of 8, 16, and 32 bits"
+    )
     packed, signed = width == 32, not x.dtype.is_unsigned()
     assert not packed or signed, "CoreML has no uint32 type"
 
