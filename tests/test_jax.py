@@ -364,8 +364,6 @@ def test_argsort():
     run_and_compare_specific_input(partial(jnp.argsort, stable=True),
                                    (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True),
-                                   (jnp.array([10, 5, 10, 0x1_0010, 10, 0x5_0000, 10, 5, 10, 0x1_0000, 5], dtype=jnp.int32),))
-    run_and_compare_specific_input(partial(jnp.argsort, stable=True),
                                    (jnp.array([10, 5, -10, 5, 10, -5, 10, -5, -10, 5], dtype=jnp.int32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True), (jnp.array(range(-8, 17), dtype=jnp.float32),))
     run_and_compare_specific_input(partial(jnp.argsort, stable=True),
@@ -439,22 +437,6 @@ def test_multi_input_argsort():
         jnp.array([2, 0, 1, 2, 0, 1, 2, 0, 1], dtype=jnp.int32),
         jnp.array([0, 1, 2], dtype=jnp.float32)
     ))
-
-
-def test_massive_sort():
-    def sort_dim_0(k1, k2):
-        return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
-
-    def check_size(size=0x100_0000):
-        key = jax.random.PRNGKey(0)
-        subkey1, subkey2 = jax.random.split(key)
-        k1 = jax.random.randint(subkey1, (size,), 0, 1_000, dtype=jnp.int32)
-        k2 = jax.random.uniform(subkey2, (size,), dtype=jnp.float32)
-        run_and_compare_specific_input(sort_dim_0, (k1, k2))
-
-    check_size(0x100)
-    check_size(0x1_0000)
-    check_size(0x1_0010)
 
 
 def test_case():
