@@ -63,10 +63,7 @@ def test_tensor_multiplication():
     run_and_compare(two_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
     run_and_compare(three_contractions_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
     run_and_compare(full_tensor_product, (jnp.zeros((2, 3)), jnp.zeros((2, 4, 3))))
-
-    # Currently the `contract_all` test is failing, due to a runtime error in CoreML
-    # crashing Python entirely. Reported to Apple in https://feedbackassistant.apple.com/feedback/15643467
-    # run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
+    run_and_compare(contract_all, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 3, 5))))
 
     # # Test the full tensor product with a big dimensions, and ensure that the program gets handled by a dynamic loop
     run_and_compare(full_tensor_product, (jnp.zeros((10, 3)), jnp.zeros((15, 20, 3))))
@@ -312,6 +309,11 @@ def test_pad():
     run_and_compare(partial(jnp.pad, pad_width=((5, 10), (10, 5)), mode="symmetric"), (jnp.zeros((10, 20)),))
 
 
+def test_pad_int32():
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2)), constant_values=10), (jnp.zeros((5, 5), dtype=jnp.int32),))
+    run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2))), (jnp.zeros((5, 5), dtype=jnp.int32),))
+
+
 def test_remainder():
     run_and_compare(jnp.remainder, (
         jnp.array([10, 20, 30], dtype=jnp.int32), jnp.array([3, 7, 11], dtype=jnp.int32)
@@ -492,3 +494,36 @@ def test_compare_bool():
         jnp.array([True, False, True], dtype=jnp.bool_),
         jnp.array([True, True, False], dtype=jnp.bool_)
     ))
+
+
+def test_dynamic_slice_oob():
+    # Test dynamic slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - slice_size)
+    def dynamic_slice(operand, start_indices):
+        return jax.lax.dynamic_slice(operand, start_indices, slice_sizes=(2, 2))
+
+    operand = jnp.zeros((5, 5))
+    # Valid index
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_slice, (operand, jnp.array([10, 10], dtype=jnp.int32)))
+
+
+def test_dynamic_update_slice_oob():
+    # Test dynamic update slice with out of bounds indices
+    # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
+    # start_index = clamp(start_index, 0, operand_dim - update_dim)
+    def dynamic_update_slice(operand, update, start_indices):
+        return jax.lax.dynamic_update_slice(operand, update, start_indices)
+
+    operand = jnp.zeros((5, 5))
+    update = jnp.ones((2, 2))
+    # Valid index
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([1, 1], dtype=jnp.int32)))
+    # Out of bounds index (too large) -> should be clamped to 5-2 = 3
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([4, 4], dtype=jnp.int32)))
+    # Out of bounds index (negative) -> should be clamped to 0
+    run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([10, 10], dtype=jnp.int32)))
