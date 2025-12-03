@@ -1163,7 +1163,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 end=scatter_indices.shape[:-1] + (n + 1,)
             )
 
-
         # unrolling O(scatter_indices.rank)
         reduction = along(0)
         for i in range(1, scatter_indices.shape[-1]):
