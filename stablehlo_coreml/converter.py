@@ -6,10 +6,7 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import (
-    RankedSliceType, index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
-    inverse_permutation
-)
+from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
@@ -23,7 +20,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
-    ScatterOp, SortOp, RemOp, FloorOp, CeilOp, ClampOp, CaseOp,
+    ScatterOp, RemOp, FloorOp, CeilOp, ClampOp, CaseOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -743,20 +740,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
-        def pad_maybe_int(*, x, pad, constant_val):
-            if types.is_float(x.dtype):
-                return mb.pad(x=x, pad=pad, constant_val=constant_val)
-            for i, (before, after) in enumerate(zip(pad[::2], pad[1::2])):
-                before = mb.fill(shape=x.shape[:i] + (before,) + x.shape[i + 1:], value=constant_val)
-                after = mb.fill(shape=x.shape[:i] + (after,) + x.shape[i + 1:], value=constant_val)
-                x = mb.concat(values=(before, x, after), axis=i)
-            return x
-
         # Pad the inputs if required
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                pad_maybe_int(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
@@ -808,7 +796,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     for result in idx_result_types
                 ]
 
-            mock_result_types = [RankedSliceType(i.shape, j.element_type) for i, j in zip(idx_result_types, result_types)]
             results = self.__compute_windowed_reduction(
                 context=context,
                 inputs=idx_inputs,
@@ -816,7 +803,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 window_strides=idx_window_strides,
                 body=op.body,
                 init_values=init_values,
-                result_types=mock_result_types,
+                result_types=idx_result_types,
             )
 
             result_rank = inputs_rank - loop_shape_rank
@@ -912,8 +899,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             slice_end = []
 
             for operand_dim in range(operand_rank):
-                if operand_dim in dim_mapping:
-                    start_index_dim = dim_mapping.index(operand_dim)
+                if operand_dim in dim_numbers.start_index_map:
+                    start_index_dim = dim_numbers.start_index_map.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
                     start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
@@ -1051,97 +1038,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             updates = mb.gather_nd(x=updates, indices=where)
             result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
         context.add_result(op.results[0], result)
-
-    @register_stablehlo_op
-    def op_sort(self, context: TranslationContext, op: SortOp):
-        inputs = [context[operand.get_name()] for operand in op.inputs]
-        if len(tracing := op.comparator.blocks) != 1 or not isinstance(tracing := tracing[0].operations[-1], ReturnOp):
-            raise ValueError("Unsupported comparator format!")
-        tracing = tracing.operands[0].owner.opview
-        args = list(op.comparator.blocks[0].arguments)
-        selecting = any(isinstance(i, SelectOp) for i in op.comparator.blocks[0].operations)
-        priorities = self.__verify_totalsort(tracing, args, inputs) \
-                if selecting else self.__verify_lexsort(tracing, args, inputs)
-        if priorities is None:
-            raise ValueError("Unrecognized comparator format; only lexsort and float sort are supported!")
-
-        sort_dim, (key, ascending) = op.dimension.value, priorities[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
-        for key, ascending in priorities[-2::-1]:
-            gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
-            relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
-
-        for i, tensor in enumerate(inputs):
-            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
-
-    def __verify_lexsort(self, tracing, args, inputs):
-        remaining, expecting, priorities = None, None, []
-        while tracing:
-            match tracing:
-                case CompareOp():
-                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
-                    if tracing.lhs not in args or tracing.rhs not in args:
-                        return None
-                    lhs, rhs = args.index(tracing.lhs), args.index(tracing.rhs)
-                    if (direction != "EQ" or expecting not in ((lhs, rhs), (rhs, lhs))) if expecting else (
-                            direction not in ("LT", "GT") or lhs // 2 != rhs // 2 or lhs + 1 != rhs):
-                        return None
-                    if not expecting:
-                        priorities.append((inputs[lhs // 2], direction == "LT"))
-                    expecting = None if expecting else (lhs, rhs)
-                    tracing, remaining = remaining, None
-                case OrOp() if not expecting:
-                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
-                case AndOp() if expecting:
-                    tracing, remaining = tracing.lhs.owner.opview, tracing.rhs.owner.opview
-                case _:
-                    return None
-        return priorities
-
-    def __verify_totalsort(self, tracing, args, inputs):
-        if not isinstance(tracing, CompareOp) or len(args) > 2 or len(inputs) > 1:
-            return None
-        direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
-        lhs = self.__verify_zero_nan(tracing.lhs.owner.opview, args)
-        rhs = self.__verify_zero_nan(tracing.rhs.owner.opview, args)
-        if direction not in ("LT", "GT") or lhs is None or rhs is None or lhs == rhs:
-            return None
-        return [(inputs[lhs], direction == "LT")]
-
-    def __verify_zero_nan(self, tracing, args):
-        remaining, idx = None, None
-        selecting, comparing = [lambda x: np.array(x) == 0, np.isnan], ["EQ", "NE"]
-        while tracing:
-            match tracing:
-                case SelectOp():
-                    const = tracing.operands[1].owner.opview.value
-                    if not len(selecting) or not selecting.pop()(const):
-                        return None
-                    if len(selecting):
-                        remaining = tracing.operands[2].owner.opview
-                        tracing = tracing.operands[0].owner.opview
-                    else:
-                        if idx is None or tracing.operands[2] != args[idx]:
-                            return None
-                        tracing, remaining = tracing.operands[0].owner.opview, None
-                case CompareOp():
-                    direction = hlo.ComparisonDirectionAttr(tracing.comparison_direction).value
-                    if not len(comparing) or direction != comparing.pop():
-                        return None
-                    if len(comparing):
-                        if tracing.lhs != tracing.rhs or tracing.lhs not in args or len(selecting) != 1:
-                            return None
-                        idx = args.index(tracing.lhs)
-                        tracing, remaining = remaining, None
-                    else:
-                        const = np.array(tracing.rhs.owner.opview.value)
-                        if const != 0 or tracing.lhs != args[idx]:
-                            return None
-                        tracing = None
-                case _:
-                    return None
-        return idx
 
     @register_stablehlo_op
     def op_clamp(self, context: TranslationContext, op: ClampOp):

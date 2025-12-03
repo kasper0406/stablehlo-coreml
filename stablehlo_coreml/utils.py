@@ -1,8 +1,6 @@
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.var import Var
 
-from jaxlib.mlir import ir
-
 from dataclasses import dataclass
 from typing import List
 from functools import reduce
@@ -15,11 +13,6 @@ class ResolvedSliceSpec:
     end_indices: List[int] | Var
     strides: List[int]
     shape: List[int]
-
-@dataclass
-class RankedSliceType:
-    shape: List[int]
-    element_type: ir.Type
 
 def index_by_slices(tensor, slice_spec):
     tensor = fix_scalar_tensor(tensor)
