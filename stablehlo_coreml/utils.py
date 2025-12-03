@@ -17,6 +17,7 @@ class ResolvedSliceSpec:
     strides: List[int]
     shape: List[int]
 
+
 def index_by_slices(tensor, slice_spec):
     tensor = fix_scalar_tensor(tensor)
     resolved_slices = _resolve_slice_spec(tensor, slice_spec)

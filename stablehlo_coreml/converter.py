@@ -151,10 +151,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.sub, op)
 
     @register_stablehlo_op
-    def op_rem(self, context: TranslationContext, op: RemOp):
-        self.__simple_binary_op(context, mb.mod, op)
-
-    @register_stablehlo_op
     def op_mul(self, context: TranslationContext, op: MulOp):
         self.__simple_binary_op(context, mb.mul, op)
 
@@ -814,14 +810,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.minimum, op)
 
     @register_stablehlo_op
-    def op_floor(self, context: TranslationContext, op: FloorOp):
-        self.__simple_unary_op(context, mb.floor, op)
-
-    @register_stablehlo_op
-    def op_ceil(self, context: TranslationContext, op: CeilOp):
-        self.__simple_unary_op(context, mb.ceil, op)
-
-    @register_stablehlo_op
     def op_rsqrt(self, context: TranslationContext, op: RsqrtOp):
         self.__simple_unary_op(context, mb.rsqrt, op)
 
@@ -1021,21 +1009,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         operand_rank = len(operand.shape)
         start_indices_rank = len(start_indices.shape)
 
+        def broadcastable(x):
+            return np.array(x)[(None,) * (start_indices_rank - 1)]
+
         dim_numbers = hlo.GatherDimensionNumbers(op.dimension_numbers)
         dim_mapping = dim_numbers.start_index_map
         dim_batches = dim_numbers.operand_batching_dims
 
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
-        if dim_batches != dim_numbers.start_indices_batching_dims:  # TODO: restriction only applies to native
-            raise ValueError("Operand and index batch dimensions are only supported if they match")
         inferred_sizes = np.array([
             1 if i in dim_mapping or i in dim_batches else
             operand.shape[i] for i in range(operand_rank)])
-        if (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
+        if dim_batches == dim_numbers.start_indices_batching_dims and \
+                (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
                 np.all(np.array(op.slice_sizes) == inferred_sizes):
             upper, lower = [operand.shape[i] - 1 for i in dim_mapping], [0] * len(dim_mapping)
-            broadcastable = lambda x: np.array(x)[(None,) * (start_indices_rank - 1)]
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
             if len(dim_mapping) == 1:
@@ -1046,7 +1035,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 return
             elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
                 result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
-                window_outputs = [i for i in range(operand_rank) if i not in dim_batches and i not in dim_numbers.collapsed_slice_dims]
+                window_outputs = [i for i in range(operand_rank) if i not in dim_batches + dim_numbers.collapsed_slice_dims]
                 window_outputs = [j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1]
                 result = mb.expand_dims(x=result, axes=window_outputs)
                 context.add_result(op.result, result)
@@ -1132,7 +1121,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
         # [sic] via
         #     https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather.scatter_nd
-        if scatter_indices.shape != (1,) and updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
+        expected_update_shape = scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]
+        if scatter_indices.shape != (1,) and updates.shape != expected_update_shape:
             raise ValueError("Scatter windows that only partially fill dimensions are not supported!")
 
         # this can be done pre-emptively because of the constraint on scatter windows
@@ -1172,11 +1162,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         valid = mb.logical_and(
                 x=mb.greater_equal(x=scatter_indices, y=0),
                 y=mb.less(x=scatter_indices, y=upper_bound))
-        along = lambda n: mb.slice_by_index(
-                x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
-                end=scatter_indices.shape[:-1] + (n + 1,))
 
-        # if there's too many axes to unroll reasonably, there's too many to use
+        def along(n):
+            return mb.slice_by_index(
+                x=valid, begin=(0,) * (scatter_indices.rank - 1) + (n,),
+                end=scatter_indices.shape[:-1] + (n + 1,)
+            )
+
+        # unrolling O(scatter_indices.rank)
         reduction = along(0)
         for i in range(1, scatter_indices.shape[-1]):
             reduction = mb.logical_and(x=reduction, y=along(i))
@@ -1187,9 +1180,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     f"unexpected input shape for scatter indices of {scatter_indices.shape}"
             assert updates.rank == operand.rank
 
+            def axis0(operand, bound):
+                return bound if operand.rank <= 1 else mb.concat(values=(bound, operand.shape[1:]), axis=0)
+
             update_bound = scatter_indices
-            axis0 = lambda operand, bound: bound if operand.rank <= 1 else mb.concat(
-                    values=(bound, operand.shape[1:]), axis=0)
             before = mb.slice_by_index(x=operand, begin=(0,) * operand.rank, end=axis0(operand, update_bound))
 
             update_bound = mb.minimum(x=mb.add(x=scatter_indices, y=updates.shape[:1]), y=operand.shape[:1])
@@ -1208,38 +1202,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             updates = mb.gather_nd(x=updates, indices=where)
             result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
         context.add_result(op.results[0], result)
-
-    @register_stablehlo_op
-    def op_clamp(self, context: TranslationContext, op: ClampOp):
-        min = context[op.min.get_name()]
-        max = context[op.max.get_name()]
-        operand = context[op.operand.get_name()]
-        result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
-        context.add_result(op.results[0], result)
-
-    @register_stablehlo_op
-    def op_case(self, context: TranslationContext, op: CaseOp):
-        index = context[op.index.get_name()]
-
-        def params(i):
-            closure, args = [], []
-            for j in op.branches[i].blocks[0].operations:
-                for k in j.operands:
-                    if k.get_name() in context.variables[context.path()]:
-                        closure.append(k)
-                        args.append(context[k.get_name()])
-            return (closure, op.branches[i], args)
-
-        # TODO: the branches should only be invoked inside the _true_fn and _false_fn
-        remaining = self.__invoke_hlo_function(context, "branch_default", *params(-1))
-        for i in reversed(range(len(op.branches) - 1)):
-            current = self.__invoke_hlo_function(context, f"branch_{i}", *params(i))
-            remaining = mb.cond(
-                    pred=mb.equal(x=index, y=i),
-                    _true_fn=(lambda x: lambda: x)(current),
-                    _false_fn=(lambda x: lambda: x)(remaining))
-        for i, result in enumerate(remaining):
-            context.add_result(op.results[i], result)
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):

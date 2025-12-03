@@ -360,9 +360,9 @@ def test_scatter():
     operand = jnp.arange(1, 25).reshape((3, 4, 2))
     update = jnp.ones((2, 3, 2), dtype=jnp.int32)
     dimension_numbers = ScatterDimensionNumbers(
-        update_window_dims = (2,),
-        inserted_window_dims = (0, 1),
-        scatter_dims_to_operand_dims = (1, 0),
+        update_window_dims=(2,),
+        inserted_window_dims=(0, 1),
+        scatter_dims_to_operand_dims=(1, 0),
     )
 
     run_and_compare_specific_input(wrapped_scatter_add(dimension_numbers), (operand, scatter_indices, update))
