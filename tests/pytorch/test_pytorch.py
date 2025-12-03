@@ -153,7 +153,6 @@ def test_tinyllama():
     evaluate_pytorch_model(model, (inputs.input_ids, ))
 
 
-@pytest.mark.xfail(reason="Conversion error (ScatterOp not implemented)")
 def test_t5_small():
     from transformers import AutoTokenizer, T5Model, AutoConfig
 
@@ -167,7 +166,7 @@ def test_t5_small():
     config.d_ff = 512
     config.num_heads = 4
     config.use_cache = False
-    model = T5Model.from_config(config)
+    model = T5Model(config)
 
     input_ids = tokenizer("Studies have been shown that owning a dog is good for you", return_tensors="pt").input_ids
     decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids
