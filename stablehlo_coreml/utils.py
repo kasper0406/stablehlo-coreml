@@ -7,6 +7,7 @@ from functools import reduce
 import itertools
 import numpy as np
 from coremltools.converters.mil.mil import types
+from jaxlib.mlir import ir
 
 
 @dataclass

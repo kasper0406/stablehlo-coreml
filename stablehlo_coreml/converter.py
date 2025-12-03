@@ -379,6 +379,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, result)
 
     @register_stablehlo_op
+    def op_rem(self, context: TranslationContext, op: RemOp):
+        self.__simple_binary_op(context, mb.mod, op)
+
+    @register_stablehlo_op
     def op_floor(self, context: TranslationContext, op: FloorOp):
         self.__simple_unary_op(context, mb.floor, op)
 
