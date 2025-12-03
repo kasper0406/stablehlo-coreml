@@ -1037,7 +1037,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 result = mb.gather_nd(x=operand, indices=clamped_indices, batch_dims=len(dim_batches))
                 window_outputs = [i for i in range(operand_rank) if i not in dim_batches + dim_numbers.collapsed_slice_dims]
                 window_outputs = [j for i, j in zip(window_outputs, dim_numbers.offset_dims) if op.slice_sizes[i] == 1]
-                result = mb.expand_dims(x=result, axes=window_outputs)
+                if window_outputs:
+                    result = mb.expand_dims(x=result, axes=window_outputs)
                 context.add_result(op.result, result)
                 return
 
