@@ -2,7 +2,7 @@ from coremltools import _logger as logger
 from coremltools.converters.mil.mil import Builder as mb
 import numpy as np
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, MulOp, MinOp, MaxOp, ReturnOp
+    AddOp, MulOp, MinOp, MaxOp, ReturnOp, SubtractOp, DivOp
 )
 
 from .utils import (
@@ -12,31 +12,44 @@ from .utils import (
 from .translation_context import TranslationContext
 
 
+def match_computation(hlo_body):
+    if len(hlo_body.blocks) != 1:
+        return None, None, None
+    args = list(hlo_body.blocks[0].arguments)
+    ops = list(hlo_body.blocks[0].operations)
+
+    # Check for the special "update" mode (overwrite)
+    # This corresponds to returning the second argument (the update value)
+    if len(ops) == 1 and isinstance(ops[0], ReturnOp) and ops[0].operands[0] == args[1]:
+        # This is the "update" mode: return args[1] (the update value)
+        # We define a lambda that just returns the update value
+        def mil_binary_op(x, y):
+            return y
+        mode = "update"
+        return None, mil_binary_op, mode
+
+    # Simple matches are where the `hlo_body` is on the form
+    #   return _generic_reduction_op_type_(`args`)
+    # In that case, if MIL has an equivalent of `_generic_reduction_op_`, we simply delegate to that
+    simple_matches = {
+        MaxOp: (mb.reduce_max, mb.maximum, "max"),
+        MinOp: (mb.reduce_min, mb.minimum, "min"),
+        AddOp: (mb.reduce_sum, mb.add, "add"),
+        MulOp: (mb.reduce_prod, mb.mul, "mul"),
+        SubtractOp: (None, mb.sub, "sub"),
+        DivOp: (None, mb.real_div, "div"),
+    }
+
+    for generic_reduce_op_type, mil_equivalents in simple_matches.items():
+        if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
+            if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
+                return mil_equivalents
+
+    return None, None, None
+
+
 def compute_reduction(converter, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
-    def match_reduction_type(hlo_body):
-        if len(hlo_body.blocks) != 1:
-            return None, None
-        args = list(hlo_body.blocks[0].arguments)
-        ops = list(hlo_body.blocks[0].operations)
-
-        # Simple matches are where the `hlo_body` is on the form
-        #   return _generic_reduction_op_type_(`args`)
-        # In that case, if MIL has an equivalent of `_generic_reduction_op_`, we simply delegate to that
-        simple_matches = {
-            MaxOp: (mb.reduce_max, mb.maximum),
-            MinOp: (mb.reduce_min, mb.minimum),
-            AddOp: (mb.reduce_sum, mb.add),
-            MulOp: (mb.reduce_prod, mb.mul),
-        }
-
-        for generic_reduce_op_type, mil_equivalents in simple_matches.items():
-            if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
-                if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
-                    return mil_equivalents
-
-        return None, None
-
-    mil_reduction, mil_single_reduction = match_reduction_type(body)
+    mil_reduction, mil_single_reduction, _ = match_computation(body)
     if mil_reduction and mil_single_reduction and len(inputs) == 1:
         res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
         # Handle initial value
