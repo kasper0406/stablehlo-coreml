@@ -659,6 +659,7 @@ def test_clamp():
 
 def test_sort():
     run_and_compare(jnp.sort, (jnp.array([3, 1, 2], dtype=jnp.int32),))
+    run_and_compare(jnp.argsort, (jnp.array([3, 1, 2, 0x8002], dtype=jnp.uint16),))
     run_and_compare(jnp.sort, (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
     run_and_compare(partial(jnp.sort, axis=0), (jnp.array([[3, 1, 2], [6, 5, 4]], dtype=jnp.float32),))
 
@@ -768,7 +769,7 @@ def test_sort_int16_casting():
     def sort_dim_0(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
-    def check_size(size=0x100_0000):
+    def check_size(size):
         key = jax.random.PRNGKey(0)
         subkey1, subkey2 = jax.random.split(key)
         k1 = jax.random.randint(subkey1, (size,), 0, 1_000, dtype=jnp.int32)
@@ -777,6 +778,7 @@ def test_sort_int16_casting():
 
     check_size(0x100)
     check_size(0x1_0010)
+    check_size(0x40_0000)
 
 
 def test_case():
