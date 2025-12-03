@@ -153,10 +153,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.sub, op)
 
     @register_stablehlo_op
-    def op_rem(self, context: TranslationContext, op: RemOp):
-        self.__simple_binary_op(context, mb.mod, op)
-
-    @register_stablehlo_op
     def op_mul(self, context: TranslationContext, op: MulOp):
         self.__simple_binary_op(context, mb.mul, op)
 
@@ -1023,7 +1019,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             1 if i in dim_mapping or i in dim_batches else
             operand.shape[i] for i in range(operand_rank)]
         )
-        if not dim_batches and \
+        if dim_batches == dim_numbers.start_indices_batching_dims and \
+                (not dim_batches or np.max(dim_batches) < len(dim_batches)) and \
                 np.all(np.array(op.slice_sizes) == inferred_sizes):
             upper, lower = [operand.shape[i] - 1 for i in dim_mapping], [0] * len(dim_mapping)
 
@@ -1162,6 +1159,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 end=scatter_indices.shape[:-1] + (n + 1,)
             )
 
+
+        # unrolling O(scatter_indices.rank)
         reduction = along(0)
         for i in range(1, scatter_indices.shape[-1]):
             reduction = mb.logical_and(x=reduction, y=along(i))
