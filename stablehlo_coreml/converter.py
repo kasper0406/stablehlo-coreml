@@ -1112,12 +1112,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         scatter_indices = context[op.scatter_indices.get_name()]
         updates = context[op.updates[0].get_name()]
 
-        if len(dim_numbers.input_batching_dims) > 0:
-            raise ValueError("Scatter batching index is not supported!")
-        if np.max(dim_mapping) >= len(dim_mapping):
-            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
         if len(op.inputs) != 1 or len(op.updates) != 1:
             raise ValueError("Scatter with multiple operands is not supported!")
+        if len(dim_numbers.input_batching_dims) > 0:
+            raise ValueError("Scatter batching index is not supported!")
+
+        if scatter_indices.shape == (0,):
+            context.add_result(op.results[0], operand)
+            return
+        if np.max(dim_mapping) >= len(dim_mapping):
+            raise ValueError("Scatter windows are only supported with dimension numbers contiguous with the rank!")
+
         # MIL only supports scatter window update sizes that match the operand shape
         #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
         # [sic] via
