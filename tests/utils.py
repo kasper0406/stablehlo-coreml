@@ -1,4 +1,5 @@
 import jax
+import jax.numpy as jnp
 from jax.export import export as _jax_export
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
@@ -33,7 +34,12 @@ def jax_export(jax_func, input_spec):
 def generate_random_from_shape(input_spec, key=jax.random.PRNGKey):
     shape = input_spec.shape
     dtype = input_spec.dtype
-    output = jax.random.uniform(key=key, shape=shape, dtype=dtype, minval=-10, maxval=10)
+    if jnp.issubdtype(dtype, jnp.integer):
+        output = jax.random.randint(key=key, shape=shape, minval=-100, maxval=100, dtype=dtype)
+    elif jnp.issubdtype(dtype, jnp.bool_):
+        output = jax.random.bernoulli(key=key, shape=shape).astype(dtype)
+    else:
+        output = jax.random.normal(key=key, shape=shape, dtype=dtype)
     return output
 
 
@@ -94,7 +100,15 @@ def _count_program_complexity(mil_program: Program):
     return total_complexity
 
 
-def run_and_compare_hlo_module(hlo_module, inputs, expected_outputs, max_complexity: int = 10_000):
+def run_and_compare_hlo_module(
+    hlo_module,
+    inputs,
+    expected_outputs,
+    *,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+):
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
     program_complexity = _count_program_complexity(mil_program)
     if program_complexity > max_complexity:
@@ -115,6 +129,7 @@ def run_and_compare_hlo_module(hlo_module, inputs, expected_outputs, max_complex
         source="milinternal",
         minimum_deployment_target=ct.target.iOS18,
         pass_pipeline=pipeline,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
     )
 
     # Generate random inputs that matches cml_model input spec
@@ -131,7 +146,7 @@ def run_and_compare_hlo_module(hlo_module, inputs, expected_outputs, max_complex
     for output_name, output_value in zip(cml_model.output_description, flatten(expected_outputs)):
         cml_expected_outputs[output_name] = np.asarray(output_value)
 
-    compare_backend(cml_model, cml_input_key_values, cml_expected_outputs)
+    compare_backend(cml_model, cml_input_key_values, cml_expected_outputs, atol=atol, rtol=rtol)
 
     return cml_model
 

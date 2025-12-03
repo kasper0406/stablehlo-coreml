@@ -6,10 +6,17 @@ from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes, inverse_permutation
+from .utils import (
+    index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
+    inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
+    clamp_index
+)
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
+from .sort_utils import match_sort
+from .reductions import compute_reduction, compute_windowed_reduction
+from .padding import pad_with_cast
 
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
@@ -19,10 +26,10 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp,
-    ScatterOp, RemOp, FloorOp, CeilOp, ClampOp, CaseOp,
+    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp,
 )
-from jaxlib.mlir.dialects.mhlo import (TopKOp)
+from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
@@ -71,7 +78,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 shape = [1]
 
             func_inputs[arg.get_name()] = mb.placeholder(
-                shape=shape, dtype=self.__get_dtype(arg.type.element_type)
+                shape=shape, dtype=get_mil_type_from_ir(arg.type.element_type)
             )
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
@@ -106,7 +113,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         func_name = op.callee.value
         hlo_func = self.func_index[op.callee.value]
         params = hlo_func.arguments
-        outputs = self.__invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
+        outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
 
         # Configure return value
         for result, output in zip(op.results, outputs):
@@ -157,8 +164,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[op.rhs.get_name()]
 
         # From HLO constraints we know the base-types should line up
-        lhs_type = self.__resolve_type(lhs)
-        rhs_type = self.__resolve_type(rhs)
+        lhs_type = get_mil_type(lhs)
+        rhs_type = get_mil_type(rhs)
         if lhs_type != rhs_type:
             raise ValueError(f"Division not supported for different types. lhs type: {lhs_type}, rhs type: {rhs_type}")
         if types.is_complex(lhs_type):
@@ -177,7 +184,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_neg(self, context: TranslationContext, op: NegOp):
         # TODO(knielsen): Consider unsigned and more exotic types
         operand = context[op.operand.get_name()]
-        minus_one = np.array([-1], dtype=types.nptype_from_builtin(operand.dtype))
+        minus_one = np.array([-1], dtype=get_numpy_type(operand))
         cml_op = mb.mul(x=minus_one, y=operand)
         context.add_result(op.result, cml_op)
 
@@ -196,7 +203,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_log1p(self, context: TranslationContext, op: Log1pOp):
         operand = context[op.operand.get_name()]
-        one = np.array([1], dtype=types.nptype_from_builtin(self.__resolve_type(operand)))
+        one = np.array([1], dtype=get_numpy_type(operand))
         x_plus_one = mb.add(x=one, y=operand)
         cml_op = mb.log(x=x_plus_one)
         context.add_result(op.result, cml_op)
@@ -246,7 +253,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         )
 
         cml_padding_value = context[op.padding_value.get_name()]
-        cml_op = mb.pad(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
+        cml_op = pad_with_cast(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -303,8 +310,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_shape = [1]
 
         # Allocate memory of the correct type for the result
-        result_dtype = self.__get_dtype(op.result.type.element_type)
-        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
+        result_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=dtype_str(result_dtype)))
 
         def calculate_result_index(lhs_idx, rhs_idx, acc):
             contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
@@ -374,6 +381,106 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, result)
 
     @register_stablehlo_op
+    def op_rem(self, context: TranslationContext, op: RemOp):
+        self.__simple_binary_op(context, mb.mod, op)
+
+    @register_stablehlo_op
+    def op_floor(self, context: TranslationContext, op: FloorOp):
+        self.__simple_unary_op(context, mb.floor, op)
+
+    @register_stablehlo_op
+    def op_ceil(self, context: TranslationContext, op: CeilOp):
+        self.__simple_unary_op(context, mb.ceil, op)
+
+    @register_stablehlo_op
+    def op_clamp(self, context: TranslationContext, op: ClampOp):
+        min = context[op.min.get_name()]
+        max = context[op.max.get_name()]
+        operand = context[op.operand.get_name()]
+        result = mb.minimum(x=mb.maximum(x=operand, y=min), y=max)
+        context.add_result(op.results[0], result)
+
+    @register_stablehlo_op
+    def op_sort(self, context: TranslationContext, op: SortOp):
+        # StableHLO defines sorting via a comparator region (a small function) that returns true if
+        # element A < element B. CoreML, however, uses high-level primitives.
+        # To bridge this gap, we must analyze the comparator's structure to reverse-engineer
+        # the sorting criteria (which keys to sort by and in what direction).
+        inputs = [context[operand.get_name()] for operand in op.inputs]
+        if op.is_stable and len(inputs) > 1:
+            raise ValueError("Stable sorting is not supported for multi-input sorting")
+
+        if len(op.comparator.blocks) != 1:
+            raise ValueError("Unsupported comparator format: must have exactly one block")
+
+        comparator_block = op.comparator.blocks[0]
+        return_op = comparator_block.operations[-1]
+
+        if not isinstance(return_op, ReturnOp):
+            raise ValueError("Unsupported comparator format: last operation must be a return")
+
+        # We start tracing from the return value of the comparator to understand the logic
+        comparator_root = return_op.operands[0].owner.opview
+        args = list(comparator_block.arguments)
+
+        # Try to match known sorting patterns
+        sort_keys = match_sort(comparator_root, args, inputs)
+        if sort_keys is None:
+            raise ValueError("Unrecognized comparator format")
+
+        # Apply the sort
+        sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
+        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+
+        # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
+        if len(sort_keys) > 1:
+            raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
+        # The following code would be used if CoreML had a stable argsort
+        # for key, ascending in sort_keys[-2::-1]:
+        #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
+        #     relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+        #     indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+
+        for i, tensor in enumerate(inputs):
+            context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
+
+    @register_stablehlo_op
+    def op_case(self, context: TranslationContext, op: CaseOp):
+        index = context[op.index.get_name()]
+
+        def params(i):
+            closure, args = [], []
+            for j in op.branches[i].blocks[0].operations:
+                for k in j.operands:
+                    if k.get_name() in context.variables[context.path()]:
+                        closure.append(k)
+                        args.append(context[k.get_name()])
+            return (closure, op.branches[i], args)
+
+        def build_branch(i):
+            if i == len(op.branches) - 1:
+                # Default/Last branch
+                return self.invoke_hlo_function(context, "branch_default", *params(i))
+
+            def true_fn():
+                return self.invoke_hlo_function(context, f"branch_{i}", *params(i))
+
+            def false_fn():
+                return build_branch(i + 1)
+
+            return mb.cond(
+                pred=mb.equal(x=index, y=i),
+                _true_fn=true_fn,
+                _false_fn=false_fn
+            )
+
+        results = build_branch(0)
+        if not isinstance(results, (list, tuple)):
+            results = [results]
+        for i, result in enumerate(results):
+            context.add_result(op.results[i], result)
+
+    @register_stablehlo_op
     def op_reshape(self, context: TranslationContext, op: ReshapeOp):
         x = context[op.operand.get_name()]
         new_shape = op.result.type.shape
@@ -413,7 +520,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_while(self, context: TranslationContext, op: WhileOp):
         def cond(*loop_args):
             params = [param for param in op.cond.blocks[0].arguments]
-            outputs = self.__invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
+            outputs = self.invoke_hlo_function(context, "while_cond", params, op.cond, loop_args)
             if len(outputs) != 1:
                 raise ValueError("The output of while_cond should always be a single boolean!")
             # TODO(knielsen): Add a check that the output is in fact a single boolean value
@@ -422,7 +529,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         def body(*body_args):
             params = [param for param in op.body.blocks[0].arguments]
-            return self.__invoke_hlo_function(context, "while_body", params, op.body, body_args)
+            return self.invoke_hlo_function(context, "while_body", params, op.body, body_args)
 
         loop_vars = [context[arg.get_name()] for arg in op.operands]
         while_results = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
@@ -450,7 +557,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             elif comparison_direction == "NE":
                 cml_op = mb.logical_xor(x=lhs, y=rhs)
             else:
-                raise ValueError("Boolean inequalities are not supported!")
+                raise ValueError(
+                    f"Boolean comparison operations other than EQ and NE (such as GT, LT, GE, LE) are not supported! "
+                    f"Attempted operation: {comparison_direction}"
+                )
         else:
             cml_op = cml_op_builder(x=lhs, y=rhs)
         context.add_result(op.result, cml_op)
@@ -458,8 +568,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convert(self, context: TranslationContext, op: ConvertOp):
         x = context[op.operand.get_name()]
-        new_dtype = self.__get_dtype(op.result.type.element_type)
-        cml_op = mb.cast(x=x, dtype=self.__dtype_str(new_dtype))
+        new_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        cml_op = mb.cast(x=x, dtype=dtype_str(new_dtype))
         context.add_result(op.result, cml_op)
 
     @register_stablehlo_op
@@ -483,6 +593,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # This is not supported by MIL, so we convert it to a MIL int32 type
         # TODO(knielsen): Overflow check?
         sizes = np.array(op.slice_sizes, dtype=np.int32)
+
+        # Clamp start indices to ensure they are within bounds: [0, operand_dim - slice_size]
+        # This is required by the StableHLO specification
+        shape = mb.shape(x=x)
+        begin = clamp_index(begin, shape, sizes)
 
         cml_op = mb.slice_by_size(x=x, begin=begin, size=sizes)
         context.add_result(op.result, cml_op)
@@ -510,6 +625,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         start_indices = [context[i.get_name()] for i in op.start_indices]
         start_indices = mb.concat(values=start_indices, axis=0)
+
+        # Clamp start indices to ensure they are within bounds: [0, operand_dim - update_dim]
+        # This is required by the StableHLO specification
+        shape = mb.shape(x=x)
+        update_shape = mb.shape(x=updates)
+        start_indices = clamp_index(start_indices, shape, update_shape)
+
         end_indices = mb.add(x=start_indices, y=op.update.type.shape)
 
         update_res = mb.slice_update(
@@ -584,8 +706,54 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     output_shape=output_shape
                 )
 
-                # We need to subtract 1 from the padding to make the dimensions line up
-                pad -= 1
+                # Calculate the padding for the transposed convolution
+                # We need to invert the padding: p_transpose = K - 1 - p_original
+                # If the target padding is negative, we need to pad the input x
+                kernel_spatial_dims = dim_spec.kernel_spatial_dimensions
+                raw_weight_shape = context[op.rhs.get_name()].shape
+                kernel_sizes = [raw_weight_shape[d] for d in kernel_spatial_dims]
+
+                new_pad_out = []
+                pad_in = []
+
+                for i in range(len(kernel_sizes)):
+                    k = kernel_sizes[i]
+                    s = strides[i]
+                    d = kernel_dilation[i] if kernel_dilation is not None else 1
+                    k_eff = (k - 1) * d + 1
+
+                    p_low = pad[2*i]
+                    p_high = pad[2*i+1]
+
+                    # Target crop
+                    t_low = k_eff - 1 - p_low
+                    t_high = k_eff - 1 - p_high
+
+                    # Calculate input padding needed to satisfy non-negative crop
+                    # pad_in >= ceil(-t / s)
+                    pi_low = max(0, (-t_low + s - 1) // s)
+                    pi_high = max(0, (-t_high + s - 1) // s)
+
+                    # Calculate output crop
+                    po_low = t_low + pi_low * s
+                    po_high = t_high + pi_high * s
+
+                    new_pad_out.extend([po_low, po_high])
+                    pad_in.extend([pi_low, pi_high])
+
+                pad = np.array(new_pad_out, dtype=np.int32)
+                pad_in = np.array(pad_in, dtype=np.int32)
+
+                if np.any(pad_in > 0):
+                    # Apply padding to x
+                    # x is [batch, channel, spatial...]
+                    x_rank = len(x.shape)
+                    full_pad_in = np.zeros(2 * x_rank, dtype=np.int32)
+                    # Fill spatial padding starting at dimension 2
+                    for i in range(len(pad_in)):
+                        full_pad_in[4 + i] = pad_in[i]
+                    x = pad_with_cast(x=x, pad=full_pad_in)
+
                 if np.any(pad < 0):
                     raise ValueError("The case where the padding turns negative when translating to a "
                                      "transposed convolution is not supported.")
@@ -706,7 +874,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_isfinite(self, context: TranslationContext, op: IsFiniteOp):
         x = context[op.x.get_name()]
         # All finite numbers will have abs(x) < inf
-        infinity = np.array(np.inf, dtype=types.nptype_from_builtin(self.__resolve_type(x)))
+        infinity = np.array(np.inf, dtype=get_numpy_type(x))
         mil_res = mb.less(x=mb.abs(x=x), y=infinity)
         context.add_result(op.result, mil_res)
 
@@ -721,7 +889,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
         result_types = [result.type for result in op.results]
 
-        mil_results = self.__compute_reduction(context, inputs, op.dimensions, op.body, init_values, result_types)
+        mil_results = compute_reduction(self, context, inputs, op.dimensions, op.body, init_values, result_types)
         for (res, mil_res) in zip(op.results, mil_results):
             context.add_result(res, mil_res)
 
@@ -744,7 +912,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
-                mb.pad(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                pad_with_cast(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 
@@ -796,7 +964,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     for result in idx_result_types
                 ]
 
-            results = self.__compute_windowed_reduction(
+            results = compute_windowed_reduction(
+                converter=self,
                 context=context,
                 inputs=idx_inputs,
                 window_dimensions=idx_window_dimensions,
@@ -815,7 +984,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result_types = [result.type for result in op.results]
         reduction_results = [
             mb.transpose(
-                x=np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type))),
+                x=np.zeros(result_type.shape, dtype=get_numpy_type(result_type.element_type)),
                 perm=permutation,
             )
             for result_type in result_types
@@ -834,7 +1003,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         iota_dim = int(op.iota_dimension)
         tensor_shape = op.result.type.shape
         vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
-        dtype = types.nptype_from_builtin(self.__get_dtype(op.result.type.element_type))
+        dtype = get_numpy_type(op.result.type.element_type)
         res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
         context.add_result(op.result, res)
 
@@ -858,7 +1027,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         if dim_numbers.index_vector_dim != start_indices_rank - 1:
             raise ValueError("The `index_vector_dim` is only supported to be the last dimension")
-        if dim_batches != dim_numbers.start_indices_batching_dims:
+        if dim_batches != dim_numbers.start_indices_batching_dims:  # TODO: restriction only applies to native
             raise ValueError("Operand and index batch dimensions are only supported if they match")
         inferred_sizes = np.array([
             1 if i in dim_mapping or i in dim_batches else
@@ -883,11 +1052,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 context.add_result(op.result, result)
                 return
 
-        if dim_numbers.operand_batching_dims != []:
-            raise ValueError("Batched operand dims gather is not supported!")
-        if dim_numbers.start_indices_batching_dims != []:
-            raise ValueError("Batched start indices gather is not supported!")
-
         result_rank = len(op.result.type.shape)
         slice_sizes = op.slice_sizes
         result_iteration_axes = [axis for axis in range(result_rank) if axis not in dim_numbers.offset_dims]
@@ -910,6 +1074,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     end_index = mb.add(x=actual_start_index, y=slice_sizes[operand_dim])
                     slice_start.append(actual_start_index)
                     slice_end.append(end_index)
+                elif operand_dim in dim_numbers.operand_batching_dims:
+                    batch_index = dim_numbers.operand_batching_dims.index(operand_dim)
+                    slice_batch = dim_numbers.start_indices_batching_dims[batch_index]
+                    start_index = mb.slice_by_size(x=slice_idx, begin=(slice_batch,), size=(1,))
+                    slice_start.append(start_index)
+                    slice_end.append(mb.add(x=start_index, y=1))
                 elif operand_dim in dim_numbers.collapsed_slice_dims:
                     slice_start.append(mb.reshape(x=0, shape=(1,)))
                     slice_end.append(mb.reshape(x=1, shape=(1,)))
@@ -937,8 +1107,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                     update_slice_spec.append(slice(None))
             return [update_tensor_by_slice(partial_results, update_slice_spec, selected_slice)]
 
-        result_dtype = self.__get_dtype(op.result.type.element_type)
-        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=self.__dtype_str(result_dtype)))
+        result_dtype = get_mil_type_from_ir(op.result.type.element_type)
+        result = mb.fill(shape=op.result.type.shape, value=mb.cast(x=0, dtype=dtype_str(result_dtype)))
         result_iteration_shape = [result.shape[stack_axis] for stack_axis in result_iteration_axes]
         result, = iterate_indexes_in_shapes(compute_index_slice, [result_iteration_shape], [result], unroll_limit=5)
 
@@ -1080,6 +1250,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 case "mhlo.topk":
                     mapped_op = TopKOp
                     op_impl = self._op_mhlo_topk
+                case "mhlo.asin":
+                    mapped_op = AsinOp
+                    op_impl = self._op_mhlo_asin
+                case "mhlo.sinh":
+                    mapped_op = SinhOp
+                    op_impl = self._op_mhlo_sinh
+                case "mhlo.asinh":
+                    mapped_op = AsinhOp
+                    op_impl = self._op_mhlo_asinh
+                case "mhlo.acos":
+                    mapped_op = AcosOp
+                    op_impl = self._op_mhlo_acos
+                case "mhlo.cosh":
+                    mapped_op = CoshOp
+                    op_impl = self._op_mhlo_cosh
+                case "mhlo.acosh":
+                    mapped_op = AcoshOp
+                    op_impl = self._op_mhlo_acosh
+                case "mhlo.atanh":
+                    mapped_op = AtanhOp
+                    op_impl = self._op_mhlo_atanh
 
             if not mapped_op:
                 raise ValueError(f"mhlo op '{op.call_target_name.value}' is not implemented")
@@ -1110,7 +1301,57 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
         return mil_res
 
-    def __invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
+    def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.asin(x=x)
+        return [mil_res]
+
+    def _op_mhlo_sinh(self, context: TranslationContext, op: SinhOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.sinh(x=x)
+        return [mil_res]
+
+    def _op_mhlo_asinh(self, context: TranslationContext, op: AsinhOp):
+        x = context[op.operand.get_name()]
+        # asinh(x) = log(x + sqrt(x^2 + 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
+        sqrt_part = mb.sqrt(x=x_sq_plus_1)
+        log_arg = mb.add(x=x, y=sqrt_part)
+        mil_res = mb.log(x=log_arg)
+        return [mil_res]
+
+    def _op_mhlo_acos(self, context: TranslationContext, op: AcosOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.acos(x=x)
+        return [mil_res]
+
+    def _op_mhlo_cosh(self, context: TranslationContext, op: CoshOp):
+        x = context[op.operand.get_name()]
+        mil_res = mb.cosh(x=x)
+        return [mil_res]
+
+    def _op_mhlo_acosh(self, context: TranslationContext, op: AcoshOp):
+        x = context[op.operand.get_name()]
+        # acosh(x) = log(x + sqrt(x^2 - 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
+        sqrt_part = mb.sqrt(x=x_sq_minus_1)
+        log_arg = mb.add(x=x, y=sqrt_part)
+        mil_res = mb.log(x=log_arg)
+        return [mil_res]
+
+    def _op_mhlo_atanh(self, context: TranslationContext, op: AtanhOp):
+        x = context[op.operand.get_name()]
+        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
+        one_plus_x = mb.add(x=1.0, y=x)
+        one_minus_x = mb.sub(x=1.0, y=x)
+        div_res = mb.real_div(x=one_plus_x, y=one_minus_x)
+        log_res = mb.log(x=div_res)
+        mil_res = mb.mul(x=0.5, y=log_res)
+        return [mil_res]
+
+    def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
         context.push_function(func_name)
 
@@ -1138,171 +1379,3 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs = context[hlo_op.rhs.get_name()]
         cml_op = mil_op(x=lhs, y=rhs)
         context.add_result(hlo_op.result, cml_op)
-
-    def __compute_reduction(self, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
-        def match_reduction_type(hlo_body):
-            if len(hlo_body.blocks) != 1:
-                return None, None
-            args = list(hlo_body.blocks[0].arguments)
-            ops = list(hlo_body.blocks[0].operations)
-
-            # Simple matches are where the `hlo_body` is on the form
-            #   return _generic_reduction_op_type_(`args`)
-            # In that case, if MIL has an equvalent of `_generic_reduction_op_`, we simply delegate to that
-            simple_matches = {
-                MaxOp: (mb.reduce_max, mb.maximum),
-                MinOp: (mb.reduce_min, mb.minimum),
-                AddOp: (mb.reduce_sum, mb.add),
-                MulOp: (mb.reduce_prod, mb.mul),
-            }
-
-            for generic_reduce_op_type, mil_equivalents in simple_matches.items():
-                if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
-                    if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
-                        return mil_equivalents
-
-            return None, None
-
-        mil_reduction, mil_single_reduction = match_reduction_type(body)
-        if mil_reduction and mil_single_reduction and len(inputs) == 1:
-            res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
-            # Handle initial value
-            res = mil_single_reduction(x=res, y=init_values[0])
-            return [res]
-
-        # Fall back to loop implementation
-        logger.warning("Falling back to while-loop implementation for reduction. This may be slower than expected!")
-
-        input_rank = len(inputs[0].shape)
-        # Notice for the loops we treat both `reduce_shape` and `result_shape` as being
-        # of the input rank. This is to make computing element indexes easier.
-        # When updating the result, we later pick out just the result indices
-        # we care about in the actual result.
-        reduce_shape = [inputs[0].shape[dim] if dim in dimensions else 1 for dim in range(input_rank)]
-        result_shape = [inputs[0].shape[dim] if dim not in dimensions else 1 for dim in range(input_rank)]
-
-        def compute_reduction(result_idx, *partial_results):
-            def compute_inner(element_idx, *acc):
-                element_idx = mb.add(x=result_idx, y=element_idx)
-                elements = [mb.reshape(x=index_by_slices(input, [element_idx]), shape=(1,)) for input in inputs]
-
-                args = list(acc) + elements
-                hlo_params = list(body.blocks[0].arguments)
-                outputs = self.__invoke_hlo_function(context, "reduce_body", hlo_params, body, args)
-
-                return outputs
-
-            reduction_results = iterate_indexes_in_shapes(compute_inner, [reduce_shape], init_values)
-
-            # The result rank is likely less than the input shape.
-            # We need to pick the indexes in the result shape we want to update
-            result_indices = [dim for dim in range(input_rank) if dim not in dimensions]
-            if len(result_indices) != 0:
-                result_idx = [mb.gather(x=result_idx, indices=result_indices)]
-            else:
-                result_idx = []
-
-            return [
-                update_tensor_by_slice(acc, result_idx, result)
-                for acc, result in zip(partial_results, reduction_results)
-            ]
-
-        mil_results = [
-            np.zeros(result_type.shape, dtype=types.nptype_from_builtin(self.__get_dtype(result_type.element_type)))
-            for result_type in result_types
-        ]
-        mil_results = iterate_indexes_in_shapes(compute_reduction, [result_shape], mil_results, unroll_limit=5)
-        return mil_results
-
-    def __compute_windowed_reduction(
-        self,
-        context: TranslationContext,
-        inputs,
-        window_dimensions,
-        window_strides,
-        body,
-        init_values,
-        result_types
-    ):
-        def move_axis_last(arr, axis):
-            permutation = list(range(len(arr.shape)))
-            permutation.append(permutation.pop(axis))
-            return mb.transpose(x=arr, perm=permutation)
-
-        # First group all the dimensions being reduced over in a group at the end
-        inputs_rank = len(window_dimensions)
-        partitioned_inputs = []
-        for input in inputs:
-            transformed = mb.sliding_windows(
-                x=input,
-                axis=0,
-                size=window_dimensions[0],
-                stride=window_strides[0]
-            )
-            transformed = move_axis_last(transformed, 1)
-            for axis in range(1, inputs_rank):
-                transformed = mb.sliding_windows(
-                    x=transformed, axis=axis, size=window_dimensions[axis], stride=window_strides[axis])
-                transformed = move_axis_last(transformed, axis + 1)
-                # Contract the two last dimensions into one
-                transformed_rank = len(transformed.shape)
-                new_shape = mb.concat(values=[
-                    mb.slice_by_size(x=mb.shape(x=transformed), begin=[0], size=[transformed_rank - 2]),
-                    np.array([-1], dtype=np.int32)
-                ], axis=0)
-                transformed = mb.reshape(x=transformed, shape=new_shape)
-            partitioned_inputs.append(transformed)
-
-        # Then use the normal reduce implementation to compute the result
-        reduction_dimension = len(partitioned_inputs[0].shape) - 1
-        reduction_results = self.__compute_reduction(
-            context=context,
-            inputs=partitioned_inputs,
-            dimensions=[reduction_dimension],
-            body=body,
-            init_values=init_values,
-            result_types=result_types,
-        )
-        return reduction_results
-
-    def __resolve_type(self, obj):
-        if isinstance(obj, np.ndarray):
-            return types.numpy_type_to_builtin_type(obj.dtype)
-        return obj.dtype
-
-    def __dtype_str(self, type):
-        # TODO(knielsen): Add additional types
-        return {
-            types.int32: "int32",
-            types.uint32: "uint32",
-            types.int16: "int16",
-            types.uint16: "uint16",
-            types.int8: "int8",
-            types.uint8: "uint8",
-            types.fp16: "fp16",
-            types.fp32: "fp32",
-            types.bool: "bool",
-        }[type]
-
-    def __get_dtype(self, element_type):
-        if isinstance(element_type, ir.IntegerType):
-            match (element_type.width, element_type.is_unsigned):
-                case (32, False):
-                    return types.int32
-                case (32, True):
-                    return types.uint32
-                case (16, False):
-                    return types.int16
-                case (16, True):
-                    return types.uint16
-                case (8, False):
-                    return types.int8
-                case (8, True):
-                    return types.uint8
-                case (1, _):
-                    return types.bool
-        if isinstance(element_type, ir.F16Type):
-            return types.fp16
-        if isinstance(element_type, ir.F32Type):
-            return types.fp32
-        raise ValueError(f"Unsupported type {element_type}")

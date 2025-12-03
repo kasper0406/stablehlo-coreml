@@ -218,8 +218,9 @@ def test_1d_polling():
     run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3), (jnp.zeros((channels, 41, )), ))
     run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3, stride=2), (jnp.zeros((channels, 41, )), ))
     run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3, stride=3), (jnp.zeros((channels, 41, )), ))
+    run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3, stride=4), (jnp.zeros((channels, 41, )), ))
 
-    run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3, padding=3), (jnp.zeros((channels, 41, )), ))
+    run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=4, padding=3), (jnp.zeros((channels, 41, )), ))
     run_and_compare_eqx(eqx.nn.MaxPool1d(kernel_size=3, stride=3, padding=2), (jnp.zeros((channels, 41, )), ))
 
     run_and_compare_eqx(eqx.nn.AdaptiveAvgPool1d(target_shape=4), (jnp.zeros((channels, 41, )), ))
