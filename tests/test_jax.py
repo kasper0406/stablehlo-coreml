@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+import pytest
 
 from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
 
