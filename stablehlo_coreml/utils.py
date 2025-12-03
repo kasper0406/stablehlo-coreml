@@ -1,8 +1,6 @@
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil.var import Var
 
-from jaxlib.mlir import ir
-
 from dataclasses import dataclass
 from typing import List
 from functools import reduce

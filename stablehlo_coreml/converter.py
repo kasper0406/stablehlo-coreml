@@ -1060,8 +1060,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             slice_end = []
 
             for operand_dim in range(operand_rank):
-                if operand_dim in dim_mapping:
-                    start_index_dim = dim_mapping.index(operand_dim)
+                if operand_dim in dim_numbers.start_index_map:
+                    start_index_dim = dim_numbers.start_index_map.index(operand_dim)
                     elements = operand.shape[operand_dim]
 
                     start_index = index_by_slices(start_indices, [slice_idx] + [start_index_dim])
