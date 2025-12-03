@@ -696,8 +696,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 # Convolution with input dilation d is equivalent to transposed convolution with stride d
                 strides = lhs_dilations
 
-                output_shape = op.result.type.shape
-                output_shape.append(output_shape.pop(1))  # Match the format of MIL
+                output_shape = [op.result.type.shape[dim_spec.output_batch_dimension],
+                                op.result.type.shape[dim_spec.output_feature_dimension]]
+                for d in dim_spec.output_spatial_dimensions:
+                    output_shape.append(op.result.type.shape[d])
 
                 conv_type = partial(
                     mb.conv_transpose,

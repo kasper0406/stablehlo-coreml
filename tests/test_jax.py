@@ -11,6 +11,24 @@ def test_addition():
     run_and_compare(jnp.add, (jnp.zeros((2, 2, 2)), jnp.zeros((2, 2, 2))))
 
 
+def test_div():
+    run_and_compare(jnp.divide, (jnp.float32(1), jnp.float32(1)))
+
+    dim_size = 20
+    run_and_compare(jnp.divide, (jnp.zeros((dim_size, dim_size)), jnp.zeros((dim_size, dim_size))))
+    run_and_compare(jnp.divide, (jnp.zeros((dim_size, dim_size)), jnp.float32(1)))
+    run_and_compare(jnp.divide, (jnp.float32(1), jnp.zeros((dim_size, dim_size))))
+    run_and_compare(jnp.divide, (jnp.zeros((dim_size, dim_size)), jnp.zeros((dim_size, dim_size))))
+
+    run_and_compare(jnp.divide, (jnp.int32(1), jnp.int32(1)))
+    run_and_compare(jnp.divide, (
+        jnp.zeros((dim_size, dim_size), dtype=jnp.int32),
+        jnp.zeros((dim_size, dim_size), dtype=jnp.int32)
+    ))
+    run_and_compare(jnp.divide, (jnp.zeros((dim_size, dim_size), dtype=jnp.int32), jnp.int32(1)))
+    run_and_compare(jnp.divide, (jnp.int32(1), jnp.zeros((dim_size, dim_size), dtype=jnp.int32)))
+
+
 def test_tensor_multiplication():
     def scalar_product(lhs, rhs):
         return jnp.einsum("a,a", lhs, rhs)
@@ -771,6 +789,14 @@ def test_compare_bool():
     ))
 
 
+def test_logical_not():
+    run_and_compare(jnp.logical_not, (jnp.array([True, False]),))
+
+
+def test_power():
+    run_and_compare(jnp.power, (jnp.array([2.0, 3.0]), jnp.array([3.0, 2.0])))
+
+
 def test_dynamic_slice_oob():
     # Test dynamic slice with out of bounds indices
     # StableHLO spec requires that the start indices are clamped to ensure the slice remains within bounds
@@ -802,3 +828,20 @@ def test_dynamic_update_slice_oob():
     run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([4, 4], dtype=jnp.int32)))
     # Out of bounds index (negative) -> should be clamped to 0
     run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([10, 10], dtype=jnp.int32)))
+
+
+def test_transposed_conv_large_padding():
+    input_shape = (1, 1, 4, 4)
+    kernel_shape = (1, 1, 3, 3)
+
+    def transposed_conv(img, kernel):
+        return jax.lax.conv_general_dilated(
+            lhs=img,
+            rhs=kernel,
+            window_strides=(1, 1),
+            padding=((3, 3), (3, 3)),
+            lhs_dilation=(2, 2),
+            dimension_numbers=('NCHW', 'OIHW', 'NCHW')
+        )
+
+    run_and_compare(transposed_conv, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
