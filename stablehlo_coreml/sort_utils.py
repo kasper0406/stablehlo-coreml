@@ -7,6 +7,8 @@ from jax._src.lib.mlir.dialects import hlo
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
+from .utils import get_mil_type_bit_width
+
 
 def bitcast_fp(x):
     fp_dtype = types.nptype_from_builtin(x.dtype)
@@ -74,7 +76,7 @@ def bitcast_fp(x):
 
 
 def bitcast_int(x):
-    width = x.dtype.width
+    width = get_mil_type_bit_width(x)
     if not types.is_int(x.dtype) or width not in {8, 16, 32}:
         raise ValueError(
             f"Stable argsort recieved unexpected integer dtype width of {width} bits which is unsupported because "
@@ -139,7 +141,7 @@ def stable_argsort(x, axis=-1, ascending=True):
     splits = bitcast_split(x, mask, ascending)
 
     def shifted(x):
-        return mb.add(x=mb.mul(x=x, y=2 ** (x.dtype.width - 1 - mask)), y=arange)
+        return mb.add(x=mb.mul(x=x, y=2 ** (get_mil_type_bit_width(x) - 1 - mask)), y=arange)
 
     indices = mb.argsort(x=shifted(splits[0]), axis=axis, ascending=True)
     for window in splits[1:]:
