@@ -683,6 +683,14 @@ def test_sort():
     run_and_compare_specific_input(jnp.sort, (subnormals,))
 
 
+def test_sort_fp16_ln_bitcast():
+    vals = [jnp.float16(2**-11)]
+    for _ in range(7):
+        vals.append(jnp.nextafter(vals[-1], jnp.float16(0.0)))
+    data = jnp.array(vals, dtype=jnp.float16)
+    run_and_compare_specific_input(jnp.argsort, (data,))
+
+
 def test_argsort():
     run_and_compare_specific_input(partial(jnp.argsort, stable=True),
                                    (jnp.array([10, 5, 10, 5, 10, 5, 10, 5, 10, 5], dtype=jnp.int32),))
