@@ -291,6 +291,10 @@ def get_numpy_type(obj):
     return types.nptype_from_builtin(get_mil_type(obj))
 
 
+def get_mil_type_bit_width(obj):
+    return get_numpy_type(obj)().itemsize * 8
+
+
 def dtype_str(type):
     # TODO(knielsen): Add additional types
     return {
