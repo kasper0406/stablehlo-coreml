@@ -64,7 +64,7 @@ def bitcast_fp(x):
     e_shifted = mb.select(cond=is_special, a=max_exp, b=e_shifted)
 
     # Inf: mantissa = 0, NaN: mantissa = max (to sort after Inf)
-    mantissa_special = mb.select(cond=is_nan, a=e_offset - 1, b=0)
+    mantissa_special = mb.select(cond=is_nan, a=e_offset - 1, b=np.zeros(is_nan.shape, dtype=np.int32))
     mantissa = mb.select(cond=is_special, a=mantissa_special, b=mantissa)
 
     # Handle Zero (override everything)
