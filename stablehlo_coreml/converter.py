@@ -995,8 +995,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         iota_dim = int(op.iota_dimension)
         tensor_shape = op.result.type.shape
         vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
+        vec_reps = [1 if dim == iota_dim else tensor_shape[dim] for dim in range(len(tensor_shape))]
         dtype = get_numpy_type(op.result.type.element_type)
-        res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
+        res = mb.reshape(x=mb.range_1d(start=dtype(0), end=dtype(tensor_shape[iota_dim]), step=dtype(1)), shape=vec_shape)
+        res = mb.tile(x=res, reps=vec_reps)
         context.add_result(op.result, res)
 
     @register_stablehlo_op
