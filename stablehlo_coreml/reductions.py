@@ -94,8 +94,10 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
         ]
 
     mil_results = [
-        np.zeros(result_type.shape, dtype=get_numpy_type(result_type))
-        for result_type in result_types
+        mb.tile(
+            x=np.zeros((1,) * len(result_type.shape), dtype=get_numpy_type(result_type)),
+            reps=result_type.shape
+        ) for result_type in result_types
     ]
     mil_results = iterate_indexes_in_shapes(compute_reduction_loop, [result_shape], mil_results, unroll_limit=5)
     return mil_results
