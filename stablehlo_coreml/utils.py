@@ -317,6 +317,7 @@ def clamp_index(index, shape, size):
     return index
 
 def range_along_dim(shape, axis, dtype):
+    axis = len(shape) + axis if axis < 0 else axis
     vec_shape = [shape[dim] if dim == axis else 1 for dim in range(len(shape))]
     vec_reps = [1 if dim == axis else shape[dim] for dim in range(len(shape))]
     arange = mb.range_1d(start=dtype(0), end=dtype(shape[axis]), step=dtype(1))
