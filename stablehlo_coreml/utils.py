@@ -316,6 +316,7 @@ def clamp_index(index, shape, size):
     index = mb.maximum(x=index, y=0)
     return index
 
+
 def range_along_dim(shape, axis, dtype):
     axis = len(shape) + axis if axis < 0 else axis
     vec_shape = [shape[dim] if dim == axis else 1 for dim in range(len(shape))]
