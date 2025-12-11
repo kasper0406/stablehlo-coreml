@@ -9,7 +9,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index
+    clamp_index, range_along_dim
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -1003,11 +1003,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_iota(self, context: TranslationContext, op: IotaOp):
-        iota_dim = int(op.iota_dimension)
-        tensor_shape = op.result.type.shape
-        vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
-        dtype = get_numpy_type(op.result.type.element_type)
-        res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
+        res = range_along_dim(op.result.type.shape, int(op.iota_dimension), get_numpy_type(op.result.type.element_type))
         context.add_result(op.result, res)
 
     @register_stablehlo_op
