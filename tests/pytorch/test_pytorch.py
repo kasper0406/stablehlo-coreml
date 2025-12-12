@@ -98,9 +98,9 @@ def evaluate_pytorch_model(model, inputs):
             raise ValueError(f"Output {i} has insanely large values (max: {abs_max:.2e}). "
                              "This likely means the model has uninitialized weights (batch norm explosion)")
 
-        rg = out.max() - out.min()
-        if rg < 1e-5 and out.size > 1:
-            raise ValueError(f"Output {i} has effectively zero range (range: {rg:.2e}). "
+        output_range = out.max() - out.min()
+        if output_range < 1e-5 and out.size > 1:
+            raise ValueError(f"Output {i} has effectively zero range (range: {output_range:.2e}). "
                              "This likely means the model has uninitialized weights")
 
     # These models are quite big, so tolerances are relaxed
