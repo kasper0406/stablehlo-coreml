@@ -2,6 +2,7 @@ import pytest
 from contextlib import contextmanager
 
 import jax
+import numpy as np
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 
@@ -89,6 +90,18 @@ def evaluate_pytorch_model(model, inputs):
             in flatten(expected_outputs)
             if isinstance(output_tensor, torch.Tensor)
         ]
+
+    # Sanity check expected outputs to catch uninitialized weights issues
+    for i, out in enumerate(expected_outputs):
+        abs_max = np.abs(out).max()
+        if abs_max > 1e9:
+            raise ValueError(f"Output {i} has insanely large values (max: {abs_max:.2e}). "
+                             "This likely means the model has uninitialized weights (batch norm explosion)")
+
+        output_range = out.max() - out.min()
+        if output_range < 1e-5 and out.size > 1:
+            raise ValueError(f"Output {i} has effectively zero range (range: {output_range:.2e}). "
+                             "This likely means the model has uninitialized weights")
 
     # These models are quite big, so tolerances are relaxed
     run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000, atol=5e-01, rtol=5e-02)
@@ -267,50 +280,32 @@ def test_whisper_tiny():
 # ==============================================================================
 
 def test_convnext_tiny():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    # Use a custom small ConvNeXt
-    # block_setting: list of [in_channels, out_channels, num_blocks, stride]
-    # Standard tiny is:
-    # [96, 96, 3, 1], [96, 192, 3, 2], [192, 384, 9, 2], [384, 768, 3, 2]
-    # We use a much smaller version:
-    block_setting = [
-        torchvision.models.convnext.CNBlockConfig(input_channels=32, out_channels=64, num_layers=1),
-        torchvision.models.convnext.CNBlockConfig(input_channels=64, out_channels=128, num_layers=1),
-    ]
-    model = torchvision.models.ConvNeXt(block_setting=block_setting, num_classes=10)
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.convnext_tiny(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
 def test_vit_b_16():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    # Use a smaller ViT
-    model = torchvision.models.VisionTransformer(
-        image_size=224,
-        patch_size=16,
-        num_layers=2,
-        num_heads=4,
-        hidden_dim=128,
-        mlp_dim=512,
-        num_classes=10
-    )
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.vit_b_16(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
 def test_efficientnet_b0():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.efficientnet_b0()
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.efficientnet_b0(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
 def test_mobilenet_v3_small():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.mobilenet_v3_small()
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.mobilenet_v3_small(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
 def test_densenet121():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.densenet121()
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.densenet121(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
@@ -321,18 +316,18 @@ def test_resnet50():
 
 
 def test_resnet18():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.resnet18()
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.resnet18(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
 def test_inception_v3():
-    inputs = (torch.randn(4, 3, 299, 299), )
-    model = torchvision.models.inception_v3()
+    inputs = (torch.randn(2, 3, 299, 299), )
+    model = torchvision.models.inception_v3(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
 
 
-def test_vgg16():
-    inputs = (torch.randn(4, 3, 224, 224), )
-    model = torchvision.models.vgg16()
+def test_vgg11():
+    inputs = (torch.randn(1, 3, 224, 224), )
+    model = torchvision.models.vgg11(weights="DEFAULT")
     evaluate_pytorch_model(model, inputs)
