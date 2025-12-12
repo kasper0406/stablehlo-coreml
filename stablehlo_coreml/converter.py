@@ -9,12 +9,12 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index
+    clamp_index, range_along_dim
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
-from .sort_utils import match_sort
+from .sort_utils import match_sort, stable_argsort
 from .reductions import (
     compute_reduction, compute_windowed_reduction, match_computation
 )
@@ -405,8 +405,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # To bridge this gap, we must analyze the comparator's structure to reverse-engineer
         # the sorting criteria (which keys to sort by and in what direction).
         inputs = [context[operand.get_name()] for operand in op.inputs]
-        if op.is_stable and len(inputs) > 1:
-            raise ValueError("Stable sorting is not supported for multi-input sorting")
 
         if len(op.comparator.blocks) != 1:
             raise ValueError("Unsupported comparator format: must have exactly one block")
@@ -428,16 +426,29 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Apply the sort
         sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+        if len(inputs) == 1:
+            if types.is_int(key.dtype):
+                indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
+            else:
+                # MIL puts NaN as equal to -inf instead of above +inf like StableHLO
+                nans = mb.not_equal(x=key, y=key)
+                inf_masking_nans = mb.select(cond=nans, a=np.inf, b=key)
+                indices = mb.argsort(x=inf_masking_nans, axis=sort_dim, ascending=ascending)
+                gathered_key = mb.gather_along_axis(x=inf_masking_nans, indices=indices, axis=sort_dim)
+                n_masked = mb.reduce_sum(x=mb.cast(x=nans, dtype="int32"), axes=(sort_dim,), keep_dims=True)
+                arange = np.indices(key.shape)[sort_dim]
+                nan_mask = mb.greater_equal(x=arange, y=mb.sub(x=key.shape[sort_dim], y=n_masked))
+                nan_full = np.full(key.shape, np.nan)
+                res = mb.add(x=gathered_key, y=mb.select(cond=nan_mask, a=nan_full, b=0.))
+                context.add_result(op.results[0], res)
+                return
+        else:
+            indices = stable_argsort(x=key, axis=sort_dim, ascending=ascending)
 
-        # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
-        if len(sort_keys) > 1:
-            raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
-        # The following code would be used if CoreML had a stable argsort
-        # for key, ascending in sort_keys[-2::-1]:
-        #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
-        #     relative_indices = mb.argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
-        #     indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
+        for key, ascending in sort_keys[-2::-1]:
+            gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
+            relative_indices = stable_argsort(x=gathered_key, axis=sort_dim, ascending=ascending)
+            indices = mb.gather_along_axis(x=indices, indices=relative_indices, axis=sort_dim)
 
         for i, tensor in enumerate(inputs):
             context.add_result(op.results[i], mb.gather_along_axis(x=tensor, indices=indices, axis=sort_dim))
@@ -992,11 +1003,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_iota(self, context: TranslationContext, op: IotaOp):
-        iota_dim = int(op.iota_dimension)
-        tensor_shape = op.result.type.shape
-        vec_shape = [tensor_shape[dim] if dim == iota_dim else 1 for dim in range(len(tensor_shape))]
-        dtype = get_numpy_type(op.result.type.element_type)
-        res = np.reshape(np.arange(tensor_shape[iota_dim], dtype=dtype), vec_shape) * np.ones(tensor_shape, dtype=dtype)
+        res = range_along_dim(op.result.type.shape, int(op.iota_dimension), get_numpy_type(op.result.type.element_type))
         context.add_result(op.result, res)
 
     @register_stablehlo_op
