@@ -119,8 +119,11 @@ def run_and_compare_hlo_module(
 
     pipeline = DEFAULT_HLO_PIPELINE
     # We temporarily avoid fp16 conversions in tests because of https://github.com/apple/coremltools/issues/2324
+    # We avoid int16 conversions in tests at least until merge/release of https://github.com/apple/coremltools/pull/2626
+    # Removing int16 conversions is prerequisite for `test_sort_int16_casting`
     passes_to_remove = [
-         'common::add_fp16_cast'
+         'common::add_fp16_cast',
+         'common::add_int16_cast',
     ]
     pipeline.remove_passes(passes_to_remove)
 
