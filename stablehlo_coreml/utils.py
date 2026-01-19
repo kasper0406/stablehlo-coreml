@@ -327,7 +327,7 @@ def range_along_dim(shape, axis, dtype):
 
 def auto_cast_bool(target_dtype="int32"):
     """
-    Unfortunately scatter/gather operation in CoreML do not support boolean inputs.
+    Unfortunately scatter/gather operations in CoreML do not support boolean inputs.
     It is fixed by automatically casting boolean inputs to `target_dtype` (e.g. int32)
     before passing them to the operation, and casting the results back to boolean
     if needed.
