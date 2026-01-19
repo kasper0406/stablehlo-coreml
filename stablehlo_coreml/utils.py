@@ -341,6 +341,12 @@ def auto_cast_bool(target_dtype="int32"):
         @wraps(func)
         def wrapper(self, context, op):
             class CastingContext:
+                """
+                Transparent wrapper around TranslationContext that automatically casts
+                boolean values when accessing context variables and when adding results.
+                This enables scatter/gather operations to work with boolean inputs/outputs
+                by converting them to/from compatible integer types.
+                """
                 def __init__(self, wrapped_context):
                     self._wrapped = wrapped_context
 
@@ -354,7 +360,9 @@ def auto_cast_bool(target_dtype="int32"):
 
                 def add_result(self, hlo_result, result):
                     expected_type = get_mil_type_from_ir(hlo_result.type.element_type)
-                    if expected_type == types.bool and result.dtype != types.bool:
+                    # Use get_mil_type for consistent type checking
+                    result_mil_type = get_mil_type(result)
+                    if expected_type == types.bool and not types.is_bool(result_mil_type):
                         result = mb.cast(x=result, dtype="bool")
                     self._wrapped.add_result(hlo_result, result)
 
