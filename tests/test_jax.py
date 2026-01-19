@@ -845,3 +845,28 @@ def test_transposed_conv_large_padding():
         )
 
     run_and_compare(transposed_conv, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
+
+
+def test_boolean_gather():
+    """Test gather operation with boolean inputs"""
+    def gather_bool(arr, indices):
+        return arr[indices]
+    
+    # Create a boolean array and gather specific elements
+    arr = jnp.array([True, False, True, False], dtype=jnp.bool_)
+    indices = jnp.array([0, 3], dtype=jnp.int32)
+    
+    run_and_compare_specific_input(gather_bool, (arr, indices))
+
+
+def test_boolean_scatter():
+    """Test scatter operation with boolean inputs"""
+    def scatter_bool(arr):
+        indices = jnp.array([1, 3], dtype=jnp.int32)
+        updates = jnp.array([True, True], dtype=jnp.bool_)
+        return arr.at[indices].set(updates)
+    
+    # Create a boolean operand and scatter boolean updates
+    arr = jnp.array([True, False, True, False], dtype=jnp.bool_)
+    
+    run_and_compare(scatter_bool, (arr,))
