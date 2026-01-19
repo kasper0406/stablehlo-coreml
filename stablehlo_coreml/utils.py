@@ -3,7 +3,7 @@ from coremltools.converters.mil.mil.var import Var
 
 from dataclasses import dataclass
 from typing import List
-from functools import reduce
+from functools import reduce, wraps
 import itertools
 import numpy as np
 from coremltools.converters.mil.mil import types
@@ -323,3 +323,38 @@ def range_along_dim(shape, axis, dtype):
     vec_reps = [1 if dim == axis else shape[dim] for dim in range(len(shape))]
     arange = mb.range_1d(start=dtype(0), end=dtype(shape[axis]), step=dtype(1))
     return mb.tile(x=mb.reshape(x=arange, shape=vec_shape), reps=vec_reps)
+
+
+def auto_cast_bool(target_dtype="int32"):
+    """
+    Unfortunately scatter/gather operations in CoreML do not support boolean inputs.
+    It is fixed by automatically casting boolean inputs to `target_dtype` (e.g. int32)
+    before passing them to the operation, and casting the results back to boolean
+    if needed.
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, context, op):
+            class CastingContext:
+                def __init__(self, wrapped_context):
+                    self._wrapped = wrapped_context
+
+                def __getitem__(self, name):
+                    val = self._wrapped[name]
+                    if val.dtype == types.bool:
+                        return mb.cast(x=val, dtype=target_dtype)
+                    return val
+
+                def add_result(self, hlo_result, result):
+                    # Check if the expected result type is bool
+                    expected_type = get_mil_type_from_ir(hlo_result.type.element_type)
+                    if expected_type == types.bool and result.dtype != types.bool:
+                        result = mb.cast(x=result, dtype="bool")
+                    self._wrapped.add_result(hlo_result, result)
+
+                def __getattr__(self, name):
+                    return getattr(self._wrapped, name)
+
+            return func(self, CastingContext(context), op)
+        return wrapper
+    return decorator
