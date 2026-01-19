@@ -9,7 +9,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim
+    clamp_index, range_along_dim, auto_cast_bool
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -996,6 +996,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, res)
 
     @register_stablehlo_op
+    @auto_cast_bool(target_dtype="uint8")
     def op_gather(self, context: TranslationContext, op: GatherOp):
         """
         Calculates special cases of the GatherOp. Assumes no backing dims, and
@@ -1111,6 +1112,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, result)
 
     @register_stablehlo_op
+    @auto_cast_bool(target_dtype="int32")
     def op_scatter(self, context: TranslationContext, op: ScatterOp):
         dim_numbers = hlo.ScatterDimensionNumbers(op.scatter_dimension_numbers)
         dim_mapping = dim_numbers.scattered_dims_to_operand_dims

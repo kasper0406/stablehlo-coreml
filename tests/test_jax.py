@@ -363,6 +363,12 @@ def test_large_gather():
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 1, 30)), (operand, start_indices))
 
 
+def test_boolean_gather():
+    arr = jnp.array([True, False, True, False])
+    indices = jnp.array([0, 3])
+    run_and_compare(lambda a, i: a[i], (arr, indices))
+
+
 def test_simple_scatter():
     def scatter_set(arr):
         indices = jnp.arange(arr.shape[0] // 2) * 2
@@ -612,6 +618,17 @@ def test_scatter_empty_indices():
     updates = jnp.ones((0, 4), dtype=jnp.float32)
 
     run_and_compare_specific_input(scatter_add, (operand, indices, updates))
+
+
+def test_boolean_scatter():
+    operand = jnp.array([True, False, True, False])
+    indices = jnp.array([1, 3])
+    updates = jnp.array([True, True])
+
+    def scatter_fn(op, idx, up):
+        return op.at[idx].set(up)
+
+    run_and_compare(scatter_fn, (operand, indices, updates))
 
 
 def test_pad():
