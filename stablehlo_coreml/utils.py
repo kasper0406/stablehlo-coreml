@@ -346,7 +346,9 @@ def auto_cast_bool(target_dtype="int32"):
 
                 def __getitem__(self, name):
                     val = self._wrapped[name]
-                    if val.dtype == types.bool:
+                    # Use get_mil_type to handle both Var and numpy array types
+                    mil_dtype = get_mil_type(val)
+                    if types.is_bool(mil_dtype):
                         return mb.cast(x=val, dtype=target_dtype)
                     return val
 
