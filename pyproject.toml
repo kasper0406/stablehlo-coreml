@@ -74,7 +74,7 @@ extra-dependencies = [
     "torchvision",
     "torchax",
     "flax", # torchax wants flax to be installed
-    "transformers==5.0.0rc3",
+    "transformers>=5.0.0",
 ]
 
 [project.urls]
