@@ -1,5 +1,4 @@
 import pytest
-from contextlib import contextmanager
 
 import jax
 import numpy as np
@@ -12,6 +11,13 @@ torch = pytest.importorskip("torch")
 torchvision = pytest.importorskip("torchvision")
 tx = pytest.importorskip("torchax")
 tx_export = pytest.importorskip("torchax.export")
+
+
+def _torchax_workaround_tied_weights(model):
+    # Workaround for torchax issue with tied weights
+    for module in model.modules():
+        if hasattr(module, 'weight') and isinstance(module.weight, torch.nn.Parameter):
+            module.weight = torch.nn.Parameter(module.weight.clone())
 
 
 def export_to_stablehlo_module(pytorch_model, inputs):
@@ -107,37 +113,6 @@ def evaluate_pytorch_model(model, inputs):
     run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000, atol=5e-01, rtol=5e-02)
 
 
-@contextmanager
-def patch_transformers_compiling():
-    # Currently the transformers package is not aware of torchax static compilation / tracing.
-    # This causes the jax-export to fail: https://github.com/google/torchax/issues/56
-    # For now, we patch the transformers package to indicate that we are compiling.
-    from unittest.mock import patch
-    patches = []
-    targets = [
-        "transformers.modeling_attn_mask_utils.is_torchdynamo_compiling",
-        "transformers.utils.is_torchdynamo_compiling",
-        "transformers.modeling_utils.is_torchdynamo_compiling",
-    ]
-
-    for target in targets:
-        try:
-            # Check if module exists before patching
-            module_name = target.rsplit(".", 1)[0]
-            __import__(module_name)
-            p = patch(target, return_value=True)
-            p.start()
-            patches.append(p)
-        except (ImportError, AttributeError):
-            pass
-
-    try:
-        yield
-    finally:
-        for p in patches:
-            p.stop()
-
-
 # ==============================================================================
 # LLM / NLP Models
 # ==============================================================================
@@ -180,14 +155,14 @@ def test_t5_small():
     config.num_heads = 4
     config.use_cache = False
     model = T5Model(config)
+    _torchax_workaround_tied_weights(model)
 
     input_ids = tokenizer("Studies have been shown that owning a dog is good for you", return_tensors="pt").input_ids
     decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids
     attention_mask = torch.ones_like(input_ids)
 
     # T5Model forward: (input_ids, attention_mask, decoder_input_ids, ...)
-    with patch_transformers_compiling():
-        evaluate_pytorch_model(model, (input_ids, attention_mask, decoder_input_ids))
+    evaluate_pytorch_model(model, (input_ids, attention_mask, decoder_input_ids))
 
 
 def test_distilbert():
@@ -203,8 +178,7 @@ def test_distilbert():
     model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of distilbert", return_tensors="pt")
-    with patch_transformers_compiling():
-        evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
+    evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
 
 
 def test_gpt2():
@@ -236,8 +210,7 @@ def test_bert():
     model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of bert", return_tensors="pt")
-    with patch_transformers_compiling():
-        evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
+    evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
 
 
 # ==============================================================================
@@ -257,11 +230,7 @@ def test_whisper_tiny():
     config.decoder_attention_heads = 4
     config.use_cache = False
     model = AutoModelForSpeechSeq2Seq.from_config(config)
-
-    # Workaround for torchax issue with tied weights
-    for module in model.modules():
-        if hasattr(module, 'weight') and isinstance(module.weight, torch.nn.Parameter):
-            module.weight = torch.nn.Parameter(module.weight.clone())
+    _torchax_workaround_tied_weights(model)
 
     # Generate dummy audio input
     # Whisper expects input_features of shape (batch, feature_size, sequence_length)
@@ -271,8 +240,7 @@ def test_whisper_tiny():
     attention_mask = torch.ones((1, 3000))
 
     # Whisper forward: (input_features, attention_mask, decoder_input_ids, ...)
-    with patch_transformers_compiling():
-        evaluate_pytorch_model(model, (input_features, attention_mask, decoder_input_ids))
+    evaluate_pytorch_model(model, (input_features, attention_mask, decoder_input_ids))
 
 
 # ==============================================================================
