@@ -262,7 +262,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_constant(self, context: TranslationContext, op: ConstantOp):
         constant = np.array(op.value)
         constant = np.reshape(constant, op.result.type.shape)
-        context.add_result(op.result, constant)
+        context.add_result(op.result, mb.const(val=constant))
 
     @register_stablehlo_op
     def op_dot_general(self, context: TranslationContext, op: DotGeneralOp):
