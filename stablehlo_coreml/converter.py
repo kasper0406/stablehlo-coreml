@@ -582,10 +582,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 cml_op = mb.logical_not(x=mb.logical_xor(x=lhs, y=rhs))
             elif comparison_direction == "NE":
                 cml_op = mb.logical_xor(x=lhs, y=rhs)
+            elif comparison_direction == "GT":
+                cml_op = mb.logical_and(x=lhs, y=mb.logical_not(x=rhs))
+            elif comparison_direction == "LT":
+                cml_op = mb.logical_and(x=mb.logical_not(x=lhs), y=rhs)
+            elif comparison_direction == "GE":
+                cml_op = mb.logical_or(x=lhs, y=mb.logical_not(x=rhs))
+            elif comparison_direction == "LE":
+                cml_op = mb.logical_or(x=mb.logical_not(x=lhs), y=rhs)
             else:
                 raise ValueError(
-                    f"Boolean comparison operations other than EQ and NE (such as GT, LT, GE, LE) are not supported! "
-                    f"Attempted operation: {comparison_direction}"
+                    f"Unexpected operation: {comparison_direction}"
                 )
         else:
             cml_op = cml_op_builder(x=lhs, y=rhs)
