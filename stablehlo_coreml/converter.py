@@ -29,7 +29,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -181,6 +181,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError(f"Unknown dtype {lhs_type}")
 
         context.add_result(op.result, cml_op)
+
+    @register_stablehlo_op
+    def op_round(self, context: TranslationContext, op: RoundOp):
+        operand = context[op.operand.get_name()]
+        if op.OPERATION_NAME == 'stablehlo.round_nearest_afz':
+            magnitude = mb.abs(x=operand)
+            shifted = mb.add(x=magnitude, y=0.5)
+            rounded_magnitude = mb.floor(x=shifted)
+            result = mb.mul(x=rounded_magnitude, y=mb.sign(x=operand))
+            context.add_result(op.result, result)
+        # TODO
+        # elif op.OPERATION_NAME == 'stablehlo.round_nearest_even':
+        else:
+            raise ValueError(f"Unsupported RoundOp type of {op.OPERATION_NAME}")
 
     @register_stablehlo_op
     def op_neg(self, context: TranslationContext, op: NegOp):
