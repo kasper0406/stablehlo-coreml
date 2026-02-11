@@ -862,3 +862,8 @@ def test_transposed_conv_large_padding():
         )
 
     run_and_compare(transposed_conv, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
+
+def test_constant_return():
+    def func(x):
+        return jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
+    run_and_compare(func, (jnp.zeros((3,), dtype=jnp.float32),))
