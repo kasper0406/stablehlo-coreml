@@ -28,7 +28,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
+    OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
     ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
@@ -143,6 +143,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_and(self, context: TranslationContext, op: AndOp):
         self.__simple_binary_op(context, mb.logical_and, op)
+
+    @register_stablehlo_op
+    def op_xor(self, context: TranslationContext, op: XorOp):
+        self.__simple_binary_op(context, mb.logical_xor, op)
 
     @register_stablehlo_op
     def op_not(self, context: TranslationContext, op: NotOp):
