@@ -500,6 +500,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(result_shape) == 0:
             # Cast a scalar shape to a (1,) shape
             result_shape = [1]
+        elif any(i == 0 for i in result_shape):
+            res = mb.const(
+                val=np.empty(result_shape, get_numpy_type(op.result.type))
+            )
+            context.add_result(op.result, res)
+            return
         result_shape_rank = len(result_shape)
 
         reshaped_operand_shape = [1] * result_shape_rank
