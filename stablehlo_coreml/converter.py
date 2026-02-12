@@ -1067,7 +1067,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
             if len(dim_mapping) == 1:
-                if start_indices_rank > 1:
+                if start_indices_rank > 1 or len(dim_numbers.collapsed_slice_dims):
                     clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
                 result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
                 context.add_result(op.result, result)
