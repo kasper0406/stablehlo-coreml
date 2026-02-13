@@ -872,7 +872,16 @@ def test_constant_return():
 
 def test_while_loop_scalar():
     def while_loop_scalar(x):
-        return jax.lax.while_loop(lambda val: val < 5, lambda val: val + 1, x)
+        # Issue reported in #50:
+        # We explicitly reshape to scalar to test that the converter handles
+        # rank-0 variables correctly (or consistently with inputs) inside loops.
+        def cond(val):
+            return jnp.reshape(val, ()) < 5
+
+        def body(val):
+            return jnp.reshape(val, ()) + 1
+
+        return jax.lax.while_loop(cond, body, x)
 
     run_and_compare(while_loop_scalar, (jnp.array(0, dtype=jnp.int32),))
 
