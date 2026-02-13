@@ -15,6 +15,9 @@ def pad_with_cast(x, pad, mode="constant", constant_val=None):
         if constant_val is not None:
             constant_val = mb.cast(x=constant_val, dtype="fp32")
 
+    if constant_val is not None and len(constant_val.shape) > 0:
+        constant_val = mb.squeeze(x=constant_val)
+
     padded = mb.pad(x=x, pad=pad, mode=mode, constant_val=constant_val)
 
     if is_int_input:

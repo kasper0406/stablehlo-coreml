@@ -9,7 +9,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim, auto_cast_bool
+    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -527,10 +527,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         def body(*body_args):
             params = [param for param in op.body.blocks[0].arguments]
-            return self.invoke_hlo_function(context, "while_body", params, op.body, body_args)
+            outputs = self.invoke_hlo_function(context, "while_body", params, op.body, body_args)
+            return [fix_scalar_tensor(output) for output in outputs]
 
         loop_vars = [context[arg.get_name()] for arg in op.operands]
         while_results = mb.while_loop(_cond=cond, _body=body, loop_vars=loop_vars)
+
+        if not isinstance(while_results, (list, tuple)):
+            while_results = [while_results]
 
         for result_var, while_result in zip(op.results, while_results):
             context.add_result(result_var, while_result)
