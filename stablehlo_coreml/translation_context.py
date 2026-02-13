@@ -1,4 +1,5 @@
 from coremltools.converters.mil import mil
+from .utils import fix_scalar_tensor
 
 
 class TranslationContext:
@@ -33,7 +34,8 @@ class TranslationContext:
 
         if name in self.variables[path]:
             raise ValueError(f"Variable {name} is already defined in path {path}")
-        self.variables[path][name] = mil_var
+
+        self.variables[path][name] = fix_scalar_tensor(mil_var)
 
     def add_result(self, hlo_result, result: mil.Var):
         result_name = hlo_result.get_name()

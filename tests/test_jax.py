@@ -868,3 +868,17 @@ def test_constant_return():
     def func(x):
         return jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
     run_and_compare(func, (jnp.zeros((3,), dtype=jnp.float32),))
+
+
+def test_while_loop_scalar():
+    def while_loop_scalar(x):
+        return jax.lax.while_loop(lambda val: val < 5, lambda val: val + 1, x)
+
+    run_and_compare(while_loop_scalar, (jnp.array(0, dtype=jnp.int32),))
+
+
+def test_while_loop_1d():
+    def while_loop_1d(x):
+        return jax.lax.while_loop(lambda val: val[0] < 5, lambda val: val + 1, x)
+
+    run_and_compare(while_loop_1d, (jnp.array([0], dtype=jnp.int32),))
