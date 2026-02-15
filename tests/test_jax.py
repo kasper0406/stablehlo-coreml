@@ -892,10 +892,12 @@ def test_while_loop_1d():
 
     run_and_compare(while_loop_1d, (jnp.array([0], dtype=jnp.int32),))
 
+
 def test_afz():
     f, x = lambda x: x // 3, jnp.array([5.])
     run_and_compare(f, (x,))
     assert "afz" in jax.jit(f).lower(x).as_text()
+
 
 def test_xor():
     run_and_compare(jnp.logical_xor, (
