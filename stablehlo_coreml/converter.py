@@ -191,7 +191,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             rounded_magnitude = mb.floor(x=shifted)
             result = mb.mul(x=rounded_magnitude, y=mb.sign(x=operand))
             context.add_result(op.result, result)
-        # TODO
         # elif op.OPERATION_NAME == 'stablehlo.round_nearest_even':
         else:
             raise ValueError(f"Unsupported RoundOp type of {op.OPERATION_NAME}")

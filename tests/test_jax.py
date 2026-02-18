@@ -898,6 +898,11 @@ def test_afz():
     run_and_compare(f, (x,))
     assert "afz" in jax.jit(f).lower(x).as_text()
 
+    def ties(x):
+        return jax.lax.round(x)
+
+    run_and_compare_specific_input(ties, (jnp.array([-0.5, 0.5, 5.5, -4.5]),))
+
 
 def test_xor():
     run_and_compare(jnp.logical_xor, (
