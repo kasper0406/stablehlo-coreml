@@ -28,8 +28,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp,
+    OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
 )
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
@@ -145,6 +145,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         self.__simple_binary_op(context, mb.logical_and, op)
 
     @register_stablehlo_op
+    def op_xor(self, context: TranslationContext, op: XorOp):
+        self.__simple_binary_op(context, mb.logical_xor, op)
+
+    @register_stablehlo_op
     def op_not(self, context: TranslationContext, op: NotOp):
         self.__simple_unary_op(context, mb.logical_not, op)
 
@@ -177,6 +181,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError(f"Unknown dtype {lhs_type}")
 
         context.add_result(op.result, cml_op)
+
+    @register_stablehlo_op
+    def op_round(self, context: TranslationContext, op: RoundOp):
+        operand = context[op.operand.get_name()]
+        if op.OPERATION_NAME == 'stablehlo.round_nearest_afz':
+            magnitude = mb.abs(x=operand)
+            shifted = mb.add(x=magnitude, y=0.5)
+            rounded_magnitude = mb.floor(x=shifted)
+            result = mb.mul(x=rounded_magnitude, y=mb.sign(x=operand))
+            context.add_result(op.result, result)
+        # elif op.OPERATION_NAME == 'stablehlo.round_nearest_even':
+        else:
+            raise ValueError(f"Unsupported RoundOp type of {op.OPERATION_NAME}")
 
     @register_stablehlo_op
     def op_neg(self, context: TranslationContext, op: NegOp):
@@ -496,6 +513,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(result_shape) == 0:
             # Cast a scalar shape to a (1,) shape
             result_shape = [1]
+        elif any(i == 0 for i in result_shape):
+            res = mb.const(
+                val=np.empty(result_shape, get_numpy_type(op.result.type))
+            )
+            context.add_result(op.result, res)
+            return
         result_shape_rank = len(result_shape)
 
         reshaped_operand_shape = [1] * result_shape_rank
@@ -558,10 +581,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 cml_op = mb.logical_not(x=mb.logical_xor(x=lhs, y=rhs))
             elif comparison_direction == "NE":
                 cml_op = mb.logical_xor(x=lhs, y=rhs)
+            elif comparison_direction == "GT":
+                cml_op = mb.logical_and(x=lhs, y=mb.logical_not(x=rhs))
+            elif comparison_direction == "LT":
+                cml_op = mb.logical_and(x=mb.logical_not(x=lhs), y=rhs)
+            elif comparison_direction == "GE":
+                cml_op = mb.logical_or(x=lhs, y=mb.logical_not(x=rhs))
+            elif comparison_direction == "LE":
+                cml_op = mb.logical_or(x=mb.logical_not(x=lhs), y=rhs)
             else:
                 raise ValueError(
-                    f"Boolean comparison operations other than EQ and NE (such as GT, LT, GE, LE) are not supported! "
-                    f"Attempted operation: {comparison_direction}"
+                    f"Unexpected operation: {comparison_direction}"
                 )
         else:
             cml_op = cml_op_builder(x=lhs, y=rhs)
@@ -1036,7 +1066,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             clamped_indices = mb.minimum(x=mb.maximum(x=start_indices, y=broadcastable(lower)), y=broadcastable(upper))
             clamped_indices = mb.gather(x=clamped_indices, indices=np.argsort(dim_mapping), axis=-1)
             if len(dim_mapping) == 1:
-                if start_indices_rank > 1:
+                if start_indices_rank > 1 or len(dim_numbers.collapsed_slice_dims):
                     clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
                 result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
                 context.add_result(op.result, result)

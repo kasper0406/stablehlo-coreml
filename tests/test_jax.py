@@ -256,6 +256,15 @@ def test_gather():
 
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
+    operand = jnp.reshape(jnp.arange(50), (10, 5))
+    start_indices = jnp.array([2], dtype=jnp.int32)  # Rank 1 scalar index
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(0,),
+        collapsed_slice_dims=(0,),
+        start_index_map=(0,)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
+
 
 def test_complex_gather():
     from jax.lax import GatherDimensionNumbers
@@ -891,3 +900,20 @@ def test_while_loop_1d():
         return jax.lax.while_loop(lambda val: val[0] < 5, lambda val: val + 1, x)
 
     run_and_compare(while_loop_1d, (jnp.array([0], dtype=jnp.int32),))
+
+
+def test_afz():
+    f, x = lambda x: x // 3, jnp.array([5.])
+    run_and_compare(f, (x,))
+    assert "afz" in jax.jit(f).lower(x).as_text()
+
+    def ties(x):
+        return jax.lax.round(x)
+
+    run_and_compare_specific_input(ties, (jnp.array([-0.5, 0.5, 5.5, -4.5]),))
+
+
+def test_xor():
+    run_and_compare(jnp.logical_xor, (
+        jnp.array([False, False, True, True]),
+        jnp.array([False, True, False, True])))
