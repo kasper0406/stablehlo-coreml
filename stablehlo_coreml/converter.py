@@ -677,10 +677,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convolution(self, context: TranslationContext, op: ConvolutionOp):
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
-        # TODO(knielsen): It should be possible to remove this batch dimension check, but
-        #                 there should be a unit test testing it.
-        if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
-            raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
         if len(dim_spec.input_spatial_dimensions) > 3 or len(dim_spec.output_spatial_dimensions) > 3:
             raise ValueError("MIL only supports convolutions with dim <= 3")
 
