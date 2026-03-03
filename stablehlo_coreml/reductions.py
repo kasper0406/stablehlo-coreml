@@ -74,8 +74,8 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
     if spatial_rank > 3:
         return None
 
-    spatial_kernel = window_dimensions[rank - spatial_rank : rank]
-    spatial_strides = window_strides[rank - spatial_rank : rank]
+    spatial_kernel = window_dimensions[rank - spatial_rank:rank]
+    spatial_strides = window_strides[rank - spatial_rank:rank]
 
     x_shape = mb.shape(x=x)
 
