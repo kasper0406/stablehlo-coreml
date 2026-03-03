@@ -48,6 +48,87 @@ def match_computation(hlo_body):
     return None, None, None
 
 
+def match_simple_reduce_window(body, inputs, init_values, window_dimensions, window_strides):
+    _, _, mode = match_computation(body)
+    if mode not in ("min", "max", "add"):
+        return None
+    if len(inputs) != 1:
+        return None
+
+    window_dimensions = list(window_dimensions)
+    window_strides = list(window_strides)
+
+    x = inputs[0]
+    rank = len(window_dimensions)
+
+    # CoreML pool/conv instructions support up to 3 spatial dimensions for sliding windows.
+    spatial_rank = 0
+    for i in range(rank):
+        if window_dimensions[i] > 1 or window_strides[i] > 1:
+            spatial_rank = rank - i
+            break
+
+    if spatial_rank == 0:
+        return x
+
+    if spatial_rank > 3:
+        return None
+
+    spatial_kernel = window_dimensions[rank - spatial_rank : rank]
+    spatial_strides = window_strides[rank - spatial_rank : rank]
+
+    x_shape = mb.shape(x=x)
+
+    # Flatten all leading dimensions into a single batch dimension, and set channel dimension to 1.
+    b_shape = np.array([-1], dtype=np.int32)
+    c_shape = np.array([1], dtype=np.int32)
+    s_shape = mb.slice_by_size(x=x_shape, begin=[rank - spatial_rank], size=[spatial_rank])
+    new_shape = mb.concat(values=[b_shape, c_shape, s_shape], axis=0)
+
+    x_reshaped = mb.reshape(x=x, shape=new_shape)
+
+    # mb.max_pool and mb.conv do not support integer types.
+    from coremltools.converters.mil.mil import types
+    from .utils import dtype_str
+
+    x_dtype = x.dtype
+    is_int_or_bool = types.is_int(x_dtype) or types.is_bool(x_dtype)
+    if is_int_or_bool:
+        x_reshaped = mb.cast(x=x_reshaped, dtype="fp32")
+
+    if mode == "max":
+        pool_res = mb.max_pool(x=x_reshaped, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
+    elif mode == "min":
+        minus_one = np.array([-1], dtype=np.float32)
+        x_neg = mb.mul(x=minus_one, y=x_reshaped)
+        pool_res = mb.max_pool(x=x_neg, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
+        pool_res = mb.mul(x=minus_one, y=pool_res)
+    elif mode == "add":
+        weight = np.ones((1, 1) + tuple(spatial_kernel), dtype=np.float32 if is_int_or_bool else get_numpy_type(x))
+        pool_res = mb.conv(x=x_reshaped, weight=weight, strides=spatial_strides, pad_type="valid")
+    else:
+        return None
+
+    if is_int_or_bool:
+        if types.is_bool(x_dtype):
+            pool_res = mb.cast(x=mb.round(x=pool_res), dtype="bool")
+        else:
+            pool_res = mb.cast(x=mb.round(x=pool_res), dtype=dtype_str(x_dtype))
+
+    # Reshape back to the output dims mapping
+    if rank == spatial_rank:
+        out_shape = mb.slice_by_size(x=mb.shape(x=pool_res), begin=[2], size=[spatial_rank])
+    else:
+        leading_shape = mb.slice_by_size(x=x_shape, begin=[0], size=[rank - spatial_rank])
+        pool_res_shape = mb.shape(x=pool_res)
+        out_spatial_shape = mb.slice_by_size(x=pool_res_shape, begin=[2], size=[spatial_rank])
+        out_shape = mb.concat(values=[leading_shape, out_spatial_shape], axis=0)
+
+    final_res = mb.reshape(x=pool_res, shape=out_shape)
+
+    return final_res
+
+
 def compute_reduction(converter, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
     mil_reduction, mil_single_reduction, _ = match_computation(body)
     if mil_reduction and mil_single_reduction and len(inputs) == 1:

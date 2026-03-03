@@ -16,7 +16,7 @@ from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op
 from .sort_utils import match_sort
 from .reductions import (
-    compute_reduction, compute_windowed_reduction, match_computation
+    compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 )
 from .padding import pad_with_cast
 
@@ -934,13 +934,18 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
-        # Pad the inputs if required
+        # Pad the inputs if required before attempting simple match
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
                 pad_with_cast(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
+
+        res = match_simple_reduce_window(op.body, inputs, init_values, op.window_dimensions, window_strides)
+        if res is not None:
+            context.add_result(op.result, res)
+            return
 
         # Unfortunately CoreML only supports tensors with rank <= 6.
         # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
