@@ -265,6 +265,19 @@ def test_gather():
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
 
+    operand = jnp.reshape(jnp.arange(50), (10, 5))
+    start_indices = jnp.array([
+        [[3], [1], [7]],
+        [[4], [0], [9]]
+    ], dtype=jnp.int32)  # shape (2, 3, 1)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(),
+        start_index_map=(0,)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
+
 
 def test_complex_gather():
     from jax.lax import GatherDimensionNumbers
