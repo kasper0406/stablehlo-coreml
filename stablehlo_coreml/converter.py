@@ -13,7 +13,7 @@ from .utils import (
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
-from .ops_register import StableHloOpsRegistry, register_stablehlo_op
+from .ops_register import StableHloOpsRegistry, register_stablehlo_op, register_composite_op
 from .sort_utils import match_sort
 from .reductions import (
     compute_reduction, compute_windowed_reduction, match_computation
@@ -123,19 +123,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_composite(self, context: TranslationContext, op: CompositeOp):
-        # Some named composites map cleanly to CoreML primitives. Handle them
-        # directly to avoid the decomposition (which may use unsupported features).
+        # Dispatch to a named handler if one is registered for this composite op.
+        # Named handlers can map directly to CoreML primitives, which is preferable
+        # when the decomposition uses features that are not supported.
         composite_name = op.name.value
-
-        if composite_name == "chlo.top_k":
-            # Map directly to mb.topk rather than inlining the decomposition,
-            # which uses a stable multi-input sort that is not supported.
-            x = context[op.inputs[0].get_name()]
-            k = ir.IntegerAttr(op.composite_attributes["k"]).value
-            values, indices = mb.topk(x=x, k=k, ascending=False)
-            context.add_result(op.results[0], values)
-            context.add_result(op.results[1], indices)
-            return
+        handler = self._composite_ops_registry.get(composite_name)
+        if handler is not None:
+            return handler(self, context, op)
 
         # Default: inline the decomposition function.
         context_args = [context[arg.get_name()] for arg in op.inputs]
@@ -147,6 +141,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         for result, output in zip(op.results, outputs):
             context.add_result(result, output)
+
+    @register_composite_op("chlo.top_k")
+    def _op_composite_chlo_top_k(self, context: TranslationContext, op: CompositeOp):
+        # Map directly to mb.topk rather than inlining the decomposition, which
+        # uses a stable multi-input sort that is not supported.
+        x = context[op.inputs[0].get_name()]
+        k = ir.IntegerAttr(op.composite_attributes["k"]).value
+        values, indices = self._op_topk(x=x, k=k, ascending=False)
+        context.add_result(op.results[0], values)
+        context.add_result(op.results[1], indices)
 
     @register_stablehlo_op
     def op_return(self, context: TranslationContext, op: ReturnOp):
@@ -1351,6 +1355,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         raise ValueError(f"Custom call is not supported: {op.call_target_name}")
 
+    def _op_topk(self, x, k, ascending):
+        """Core top-k implementation shared by both the mhlo.topk custom call
+        and the chlo.top_k composite op paths.
+
+        Args:
+            x: The input tensor.
+            k: Number of top elements to return.
+            ascending: If True, return the smallest k values; if False, the largest.
+
+        Returns:
+            A list [values, indices] where values are the selected elements and
+            indices are their positions in the last axis of x.
+        """
+        return mb.topk(x=x, k=k, ascending=ascending)
+
     def _op_mhlo_topk(self, context: TranslationContext, op: TopKOp):
         """
         This is a MHLO op, and follows a slightly different pattern, since it is unvoked by a
@@ -1359,8 +1378,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         """
         x = context[op.operand.get_name()]
         descending = op.largest is None or op.largest.value
-        mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
-        return mil_res
+        return self._op_topk(x=x, k=op.k.value, ascending=not descending)
 
     def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
         x = context[op.operand.get_name()]

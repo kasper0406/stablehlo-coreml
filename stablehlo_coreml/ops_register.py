@@ -24,17 +24,39 @@ def register_stablehlo_op(func):
     return func
 
 
+def register_composite_op(composite_name: str):
+    """Decorator that registers a method as the handler for a named StableHLO composite op.
+
+    Usage::
+
+        @register_composite_op("chlo.top_k")
+        def _op_composite_chlo_top_k(self, context: TranslationContext, op: CompositeOp):
+            ...
+    """
+    def decorator(func):
+        func._implements_composite_op = composite_name
+        return func
+    return decorator
+
+
 class StableHloOpsRegistry(type):
     def __init__(cls, name, bases, clsdict):
         super().__init__(name, bases, clsdict)
 
         cls._stablehlo_ops_registry = {}
+        cls._composite_ops_registry = {}
         for name, method in clsdict.items():
             op_type = getattr(method, '_implements_hlo_op', False)
             if callable(method) and op_type:
                 if op_type in cls._stablehlo_ops_registry:
                     raise ValueError(f"StableHLO op {op_type} has been registered more than once!")
                 cls._stablehlo_ops_registry[op_type] = method
+
+            composite_name = getattr(method, '_implements_composite_op', None)
+            if callable(method) and composite_name:
+                if composite_name in cls._composite_ops_registry:
+                    raise ValueError(f"Composite op '{composite_name}' has been registered more than once!")
+                cls._composite_ops_registry[composite_name] = method
 
     def _dispatch_op(cls, self, context: TranslationContext, op):
         op_type = type(op)
