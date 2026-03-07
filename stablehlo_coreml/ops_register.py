@@ -37,11 +37,18 @@ class StableHloOpsRegistry(type):
                 cls._stablehlo_ops_registry[op_type] = method
 
     def _dispatch_op(cls, self, context: TranslationContext, op):
-        if type(op) not in self._stablehlo_ops_registry:
-            raise ValueError(f"The StableHLO op {type(op)} has not been implemented!")
+        op_type = type(op)
+        if op_type in self._stablehlo_ops_registry:
+            return self._stablehlo_ops_registry[op_type](self, context, op)
 
-        op_method = self._stablehlo_ops_registry[type(op)]
-        return op_method(self, context, op)
+        # Fall back: check if any registered type is a subclass of op_type.
+        # This handles the case where the public API type (e.g. stablehlo.CompositeOp)
+        # is a subclass of the internal type returned by the MLIR parser.
+        for registered_type, method in self._stablehlo_ops_registry.items():
+            if issubclass(registered_type, op_type):
+                return method(self, context, op)
+
+        raise ValueError(f"The StableHLO op {type(op)} has not been implemented!")
 
     def __call__(cls, *args, **kwargs):
         # Register the dispatch_op method

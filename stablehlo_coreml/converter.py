@@ -29,9 +29,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
 )
-from jaxlib.mlir.dialects._stablehlo_ops_gen import CompositeOp
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
