@@ -148,7 +148,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # uses a stable multi-input sort that is not supported.
         x = context[op.inputs[0].get_name()]
         k = ir.IntegerAttr(op.composite_attributes["k"]).value
-        values, indices = self._op_topk(x=x, k=k, ascending=False)
+        # The chlo.top_k op returns the largest k values by definition. If a
+        # 'largest' attribute is present in the composite attributes we respect
+        # it, so that a future version of the op (or a hand-crafted composite)
+        # that adds explicit ordering control continues to work correctly.
+        if "largest" in op.composite_attributes:
+            largest = ir.BoolAttr(op.composite_attributes["largest"]).value
+        else:
+            largest = True
+        values, indices = self._op_topk(x=x, k=k, ascending=not largest)
         context.add_result(op.results[0], values)
         context.add_result(op.results[1], indices)
 
