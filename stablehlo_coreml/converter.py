@@ -20,7 +20,8 @@ from .reductions import (
 )
 from .padding import pad_with_cast
 
-from jaxlib.mlir import ir
+from jaxlib.mlir import ir, passmanager
+from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
@@ -46,8 +47,31 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     register_optimizations()
 
+    # Normalize any raw CHLO ops to their StableHLO equivalents before conversion
+    # so the converter only has to handle a single, canonical dialect.  Ops that
+    # are wrapped inside a stablehlo.composite (e.g. "chlo.top_k") are intentionally
+    # left untouched by this pass: the composite wrapper protects them and our
+    # bespoke composite handlers can map them directly to CoreML primitives,
+    # bypassing the (potentially unsupported) generic decompositions.
+    _legalize_chlo_to_stablehlo(module)
+
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)
+
+
+def _legalize_chlo_to_stablehlo(module: ir.Module) -> None:
+    """Run chlo-legalize-to-stablehlo on the module in-place.
+
+    This normalizes raw CHLO ops (e.g. chlo.erf, chlo.log, …) to their
+    StableHLO equivalents so the rest of the converter only needs to understand
+    one dialect.  Ops already wrapped in a stablehlo.composite are not touched.
+    """
+    stablehlo_dialect.register_stablehlo_passes()
+    pm = passmanager.PassManager.parse(
+        "builtin.module(func.func(chlo-legalize-to-stablehlo))",
+        context=module.context,
+    )
+    pm.run(module.operation)
 
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
