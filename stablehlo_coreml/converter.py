@@ -46,9 +46,6 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     register_optimizations()
 
-    # Normalize the incoming module to a canonical StableHLO form before
-    # conversion so the converter only has to handle a single, well-defined
-    # dialect.  See _normalize_module for details.
     _normalize_module(module)
 
     converter = StableHloConverter(opset_version=minimum_deployment_target)
@@ -74,12 +71,7 @@ def _normalize_module(module: ir.Module) -> None:
     """
     stablehlo_dialect.register_stablehlo_passes()
     pm = passmanager.PassManager.parse(
-        "builtin.module("
-        "  func.func("
-        "    chlo-legalize-to-stablehlo,"
-        "    stablehlo-legalize-deprecated-ops"
-        "  )"
-        ")",
+        "builtin.module(func.func(chlo-legalize-to-stablehlo, stablehlo-legalize-deprecated-ops))",
         context=module.context,
     )
     pm.run(module.operation)
@@ -183,15 +175,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # uses a stable multi-input sort that is not supported.
         x = context[op.inputs[0].get_name()]
         k = ir.IntegerAttr(op.composite_attributes["k"]).value
-        # The chlo.top_k op returns the largest k values by definition. If a
-        # 'largest' attribute is present in the composite attributes we respect
-        # it, so that a future version of the op (or a hand-crafted composite)
-        # that adds explicit ordering control continues to work correctly.
-        if "largest" in op.composite_attributes:
-            largest = ir.BoolAttr(op.composite_attributes["largest"]).value
-        else:
-            largest = True
-        values, indices = self._op_topk(x=x, k=k, ascending=not largest)
+        # Default to descending (largest=True) as per the chlo.top_k spec; honour
+        # an explicit 'largest' attribute if present.
+        largest = (ir.BoolAttr(op.composite_attributes["largest"]).value
+                   if "largest" in op.composite_attributes else True)
+        values, indices = mb.topk(x=x, k=k, ascending=not largest)
         context.add_result(op.results[0], values)
         context.add_result(op.results[1], indices)
 
@@ -219,9 +207,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def _op_composite_chlo_atanh(self, context: TranslationContext, op: CompositeOp):
         x = context[op.inputs[0].get_name()]
         # atanh(x) = 0.5 * log((1 + x) / (1 - x))
-        one_plus_x = mb.add(x=1.0, y=x)
-        one_minus_x = mb.sub(x=1.0, y=x)
-        context.add_result(op.results[0], mb.mul(x=0.5, y=mb.log(x=mb.real_div(x=one_plus_x, y=one_minus_x))))
+        ratio = mb.real_div(x=mb.add(x=1.0, y=x), y=mb.sub(x=1.0, y=x))
+        context.add_result(op.results[0], mb.mul(x=0.5, y=mb.log(x=ratio)))
 
     @register_composite_op("chlo.asinh")
     def _op_composite_chlo_asinh(self, context: TranslationContext, op: CompositeOp):
@@ -1396,10 +1383,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
         raise ValueError(f"Custom call is not supported: {op.call_target_name}")
-
-    def _op_topk(self, x, k, ascending):
-        """Core top-k implementation used by the chlo.top_k composite handler."""
-        return mb.topk(x=x, k=k, ascending=ascending)
 
     def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
