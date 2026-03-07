@@ -58,6 +58,17 @@ class StableHloOpsRegistry(type):
                     raise ValueError(f"Composite op '{composite_name}' has been registered more than once!")
                 cls._composite_ops_registry[composite_name] = method
 
+        # Build a reverse-lookup from MLIR operation name (e.g. "chlo.top_k") to
+        # the registered handler. This is used by op_composite for generic dispatch:
+        # when a composite op's name matches a registered native op we can
+        # synthesise the native op and reuse its handler without a bespoke composite
+        # handler.
+        cls._op_name_registry = {}
+        for op_type, method in cls._stablehlo_ops_registry.items():
+            op_name = getattr(op_type, 'OPERATION_NAME', None)
+            if op_name is not None:
+                cls._op_name_registry[op_name] = (op_type, method)
+
     def _dispatch_op(cls, self, context: TranslationContext, op):
         op_type = type(op)
         if op_type in self._stablehlo_ops_registry:
