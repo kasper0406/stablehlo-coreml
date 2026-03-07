@@ -123,8 +123,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_composite(self, context: TranslationContext, op: CompositeOp):
-        # CompositeOp references a decomposition function that implements the op.
-        # Inline the decomposition by mapping inputs to its arguments.
+        # Some named composites map cleanly to CoreML primitives. Handle them
+        # directly to avoid the decomposition (which may use unsupported features).
+        composite_name = op.name.value
+
+        if composite_name == "chlo.top_k":
+            # Map directly to mb.topk rather than inlining the decomposition,
+            # which uses a stable multi-input sort that is not supported.
+            x = context[op.inputs[0].get_name()]
+            k = ir.IntegerAttr(op.composite_attributes["k"]).value
+            values, indices = mb.topk(x=x, k=k, ascending=False)
+            context.add_result(op.results[0], values)
+            context.add_result(op.results[1], indices)
+            return
+
+        # Default: inline the decomposition function.
         context_args = [context[arg.get_name()] for arg in op.inputs]
 
         func_name = op.decomposition.value
