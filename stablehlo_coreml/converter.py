@@ -31,6 +31,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
     ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
 )
+from jaxlib.mlir.dialects._stablehlo_ops_gen import CompositeOp
 from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
@@ -118,6 +119,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
 
         # Configure return value
+        for result, output in zip(op.results, outputs):
+            context.add_result(result, output)
+
+    @register_stablehlo_op
+    def op_composite(self, context: TranslationContext, op: CompositeOp):
+        # CompositeOp references a decomposition function that implements the op.
+        # Inline the decomposition by mapping inputs to its arguments.
+        context_args = [context[arg.get_name()] for arg in op.inputs]
+
+        func_name = op.decomposition.value
+        hlo_func = self.func_index[func_name]
+        params = hlo_func.arguments
+        outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
+
         for result, output in zip(op.results, outputs):
             context.add_result(result, output)
 
