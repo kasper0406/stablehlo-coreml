@@ -24,11 +24,27 @@ def register_stablehlo_op(func):
     return func
 
 
+def register_composite_op(composite_name: str):
+    """Decorator that registers a method as the handler for a named StableHLO composite op.
+
+    Usage::
+
+        @register_composite_op("chlo.top_k")
+        def _op_composite_chlo_top_k(self, context: TranslationContext, op: CompositeOp):
+            ...
+    """
+    def decorator(func):
+        func._implements_composite_op = composite_name
+        return func
+    return decorator
+
+
 class StableHloOpsRegistry(type):
     def __init__(cls, name, bases, clsdict):
         super().__init__(name, bases, clsdict)
 
         cls._stablehlo_ops_registry = {}
+        cls._composite_ops_registry = {}
         for name, method in clsdict.items():
             op_type = getattr(method, '_implements_hlo_op', False)
             if callable(method) and op_type:
@@ -36,12 +52,25 @@ class StableHloOpsRegistry(type):
                     raise ValueError(f"StableHLO op {op_type} has been registered more than once!")
                 cls._stablehlo_ops_registry[op_type] = method
 
-    def _dispatch_op(cls, self, context: TranslationContext, op):
-        if type(op) not in self._stablehlo_ops_registry:
-            raise ValueError(f"The StableHLO op {type(op)} has not been implemented!")
+            composite_name = getattr(method, '_implements_composite_op', None)
+            if callable(method) and composite_name:
+                if composite_name in cls._composite_ops_registry:
+                    raise ValueError(f"Composite op '{composite_name}' has been registered more than once!")
+                cls._composite_ops_registry[composite_name] = method
 
-        op_method = self._stablehlo_ops_registry[type(op)]
-        return op_method(self, context, op)
+    def _dispatch_op(cls, self, context: TranslationContext, op):
+        op_type = type(op)
+        if op_type in self._stablehlo_ops_registry:
+            return self._stablehlo_ops_registry[op_type](self, context, op)
+
+        # Fall back: check if any registered type is a subclass of op_type.
+        # This handles the case where the public API type (e.g. stablehlo.CompositeOp)
+        # is a subclass of the internal type returned by the MLIR parser.
+        for registered_type, method in self._stablehlo_ops_registry.items():
+            if issubclass(registered_type, op_type):
+                return method(self, context, op)
+
+        raise ValueError(f"The StableHLO op {type(op)} has not been implemented!")
 
     def __call__(cls, *args, **kwargs):
         # Register the dispatch_op method
