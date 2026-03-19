@@ -13,14 +13,15 @@ from .utils import (
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
-from .ops_register import StableHloOpsRegistry, register_stablehlo_op
+from .ops_register import StableHloOpsRegistry, register_stablehlo_op, register_composite_op
 from .sort_utils import match_sort
 from .reductions import (
     compute_reduction, compute_windowed_reduction, match_computation
 )
 from .padding import pad_with_cast
 
-from jaxlib.mlir import ir
+from jaxlib.mlir import ir, passmanager
+from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
@@ -29,9 +30,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
 )
-from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
@@ -46,8 +46,35 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     register_optimizations()
 
+    _normalize_module(module)
+
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)
+
+
+def _normalize_module(module: ir.Module) -> None:
+    """Normalize an incoming StableHLO module in-place before conversion.
+
+    Two passes are applied in sequence:
+
+    1. ``chlo-legalize-to-stablehlo`` – lowers any raw CHLO ops that appear
+       *outside* a ``stablehlo.composite`` wrapper (e.g. from the
+       ``jax.jit().lower().compiler_ir('stablehlo')`` path) to their StableHLO
+       equivalents.  Ops already wrapped in a composite are intentionally left
+       untouched; the composite handlers in the converter map them directly to
+       CoreML primitives, bypassing the (potentially unsupported) stablehlo
+       decompositions.
+
+    2. ``stablehlo-legalize-deprecated-ops`` – rewrites any deprecated
+       StableHLO ops to their current equivalents, keeping the converter
+       insulated from older serialized modules.
+    """
+    stablehlo_dialect.register_stablehlo_passes()
+    pm = passmanager.PassManager.parse(
+        "builtin.module(func.func(chlo-legalize-to-stablehlo, stablehlo-legalize-deprecated-ops))",
+        context=module.context,
+    )
+    pm.run(module.operation)
 
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
@@ -120,6 +147,84 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Configure return value
         for result, output in zip(op.results, outputs):
             context.add_result(result, output)
+
+    @register_stablehlo_op
+    def op_composite(self, context: TranslationContext, op: CompositeOp):
+        # Dispatch to a named handler if one is registered for this composite op.
+        # Named handlers can map directly to CoreML primitives, which is preferable
+        # when the decomposition uses features that are not supported.
+        composite_name = op.name.value
+        handler = self._composite_ops_registry.get(composite_name)
+        if handler is not None:
+            return handler(self, context, op)
+
+        # Default: inline the decomposition function.
+        context_args = [context[arg.get_name()] for arg in op.inputs]
+
+        func_name = op.decomposition.value
+        hlo_func = self.func_index[func_name]
+        params = hlo_func.arguments
+        outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
+
+        for result, output in zip(op.results, outputs):
+            context.add_result(result, output)
+
+    @register_composite_op("chlo.top_k")
+    def _op_composite_chlo_top_k(self, context: TranslationContext, op: CompositeOp):
+        # Map directly to mb.topk rather than inlining the decomposition, which
+        # uses a stable multi-input sort that is not supported.
+        x = context[op.inputs[0].get_name()]
+        k = ir.IntegerAttr(op.composite_attributes["k"]).value
+        # Default to descending (largest=True) as per the chlo.top_k spec; honour
+        # an explicit 'largest' attribute if present.
+        largest = (ir.BoolAttr(op.composite_attributes["largest"]).value
+                   if "largest" in op.composite_attributes else True)
+        values, indices = mb.topk(x=x, k=k, ascending=not largest)
+        context.add_result(op.results[0], values)
+        context.add_result(op.results[1], indices)
+
+    @register_composite_op("chlo.asin")
+    def _op_composite_chlo_asin(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.asin(x=x))
+
+    @register_composite_op("chlo.acos")
+    def _op_composite_chlo_acos(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.acos(x=x))
+
+    @register_composite_op("chlo.sinh")
+    def _op_composite_chlo_sinh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.sinh(x=x))
+
+    @register_composite_op("chlo.cosh")
+    def _op_composite_chlo_cosh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.cosh(x=x))
+
+    @register_composite_op("chlo.atanh")
+    def _op_composite_chlo_atanh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
+        ratio = mb.real_div(x=mb.add(x=1.0, y=x), y=mb.sub(x=1.0, y=x))
+        context.add_result(op.results[0], mb.mul(x=0.5, y=mb.log(x=ratio)))
+
+    @register_composite_op("chlo.asinh")
+    def _op_composite_chlo_asinh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # asinh(x) = log(x + sqrt(x^2 + 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
+        context.add_result(op.results[0], mb.log(x=mb.add(x=x, y=mb.sqrt(x=x_sq_plus_1))))
+
+    @register_composite_op("chlo.acosh")
+    def _op_composite_chlo_acosh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # acosh(x) = log(x + sqrt(x^2 - 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
+        context.add_result(op.results[0], mb.log(x=mb.add(x=x, y=mb.sqrt(x=x_sq_minus_1))))
 
     @register_stablehlo_op
     def op_return(self, context: TranslationContext, op: ReturnOp):
@@ -1279,113 +1384,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
-        if op.call_target_name.value.startswith("mhlo."):
-            mapped_op = None
-            op_impl = None
-            match op.call_target_name.value:
-                case "mhlo.topk":
-                    mapped_op = TopKOp
-                    op_impl = self._op_mhlo_topk
-                case "mhlo.asin":
-                    mapped_op = AsinOp
-                    op_impl = self._op_mhlo_asin
-                case "mhlo.sinh":
-                    mapped_op = SinhOp
-                    op_impl = self._op_mhlo_sinh
-                case "mhlo.asinh":
-                    mapped_op = AsinhOp
-                    op_impl = self._op_mhlo_asinh
-                case "mhlo.acos":
-                    mapped_op = AcosOp
-                    op_impl = self._op_mhlo_acos
-                case "mhlo.cosh":
-                    mapped_op = CoshOp
-                    op_impl = self._op_mhlo_cosh
-                case "mhlo.acosh":
-                    mapped_op = AcoshOp
-                    op_impl = self._op_mhlo_acosh
-                case "mhlo.atanh":
-                    mapped_op = AtanhOp
-                    op_impl = self._op_mhlo_atanh
-
-            if not mapped_op:
-                raise ValueError(f"mhlo op '{op.call_target_name.value}' is not implemented")
-            if not op_impl:
-                raise ValueError(f"mhlo op '{op.call_target_name.value}' does not have an implementation")
-
-            mhlo_attributes = {attr.name: attr.attr for attr in list(op.attributes["mhlo.attributes"])}
-            delegate_op = partial(mapped_op, **mhlo_attributes, loc=op.location)(*op.operands)
-
-            # We manually have to handle the results, as the current API does not allow naming
-            # the `delegate_op` results according to the custom call results
-            mil_results = op_impl(context, delegate_op)
-            for (custom_call_result, mil_result) in zip(op.results, mil_results):
-                context.add_result(custom_call_result, mil_result)
-
-            return
-
         raise ValueError(f"Custom call is not supported: {op.call_target_name}")
-
-    def _op_mhlo_topk(self, context: TranslationContext, op: TopKOp):
-        """
-        This is a MHLO op, and follows a slightly different pattern, since it is unvoked by a
-        custom call. It will return the results, as we currently can not rename the results
-        in the TopKOp
-        """
-        x = context[op.operand.get_name()]
-        descending = op.largest is None or op.largest.value
-        mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
-        return mil_res
-
-    def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.asin(x=x)
-        return [mil_res]
-
-    def _op_mhlo_sinh(self, context: TranslationContext, op: SinhOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.sinh(x=x)
-        return [mil_res]
-
-    def _op_mhlo_asinh(self, context: TranslationContext, op: AsinhOp):
-        x = context[op.operand.get_name()]
-        # asinh(x) = log(x + sqrt(x^2 + 1))
-        x_sq = mb.mul(x=x, y=x)
-        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
-        sqrt_part = mb.sqrt(x=x_sq_plus_1)
-        log_arg = mb.add(x=x, y=sqrt_part)
-        mil_res = mb.log(x=log_arg)
-        return [mil_res]
-
-    def _op_mhlo_acos(self, context: TranslationContext, op: AcosOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.acos(x=x)
-        return [mil_res]
-
-    def _op_mhlo_cosh(self, context: TranslationContext, op: CoshOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.cosh(x=x)
-        return [mil_res]
-
-    def _op_mhlo_acosh(self, context: TranslationContext, op: AcoshOp):
-        x = context[op.operand.get_name()]
-        # acosh(x) = log(x + sqrt(x^2 - 1))
-        x_sq = mb.mul(x=x, y=x)
-        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
-        sqrt_part = mb.sqrt(x=x_sq_minus_1)
-        log_arg = mb.add(x=x, y=sqrt_part)
-        mil_res = mb.log(x=log_arg)
-        return [mil_res]
-
-    def _op_mhlo_atanh(self, context: TranslationContext, op: AtanhOp):
-        x = context[op.operand.get_name()]
-        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
-        one_plus_x = mb.add(x=1.0, y=x)
-        one_minus_x = mb.sub(x=1.0, y=x)
-        div_res = mb.real_div(x=one_plus_x, y=one_minus_x)
-        log_res = mb.log(x=div_res)
-        mil_res = mb.mul(x=0.5, y=log_res)
-        return [mil_res]
 
     def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
