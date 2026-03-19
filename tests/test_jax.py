@@ -161,6 +161,11 @@ def test_trigonmetry():
     run_and_compare(jnp.arctanh, (jnp.zeros((5, 6)),))
 
     run_and_compare(jnp.atan2, (jnp.zeros((50, 20)), jnp.zeros((50, 20)),))
+    run_and_compare(
+        jnp.atan2,
+        (jnp.zeros((50, 20), dtype=jnp.float16), jnp.zeros((50, 20), dtype=jnp.float16),),
+        rtol=1e-05 / jnp.finfo(jnp.float32).eps * jnp.finfo(jnp.float16).eps
+    )
 
 
 def test_is_finite():
