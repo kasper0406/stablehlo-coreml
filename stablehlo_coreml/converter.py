@@ -980,9 +980,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         fraction = mb.real_div(x=y, y=x)
         atan2_res = mb.atan(x=fraction)
         # We need to adjust for negative x, based on the sign of y
-        atan2_res_adjusted = mb.add(x=atan2_res, y=mb.mul(x=mb.sign(x=y), y=np.pi))
+        np_dtype = get_numpy_type(y)
+        atan2_res_adjusted = mb.add(x=atan2_res, y=mb.mul(x=mb.sign(x=y), y=np_dtype(np.pi)))
         atan2_res = mb.select(
-            cond=mb.less(x=x, y=0.0),
+            cond=mb.less(x=x, y=np_dtype(0.0)),
             a=atan2_res_adjusted,
             b=atan2_res,
         )
