@@ -292,16 +292,18 @@ def get_numpy_type(obj):
 
 
 def dtype_str(type):
-    # TODO(knielsen): Add additional types
     return {
+        types.int64: "int64",
+        types.uint64: "uint64",
         types.int32: "int32",
         types.uint32: "uint32",
         types.int16: "int16",
         types.uint16: "uint16",
         types.int8: "int8",
         types.uint8: "uint8",
-        types.fp16: "fp16",
+        types.fp64: "fp64",
         types.fp32: "fp32",
+        types.fp16: "fp16",
         types.bool: "bool",
     }[type]
 

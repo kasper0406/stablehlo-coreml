@@ -913,6 +913,11 @@ def test_while_loop_scalar():
     run_and_compare(while_loop_scalar, (jnp.array(0, dtype=jnp.int32),))
 
 
+def test_neg_unsigned_int():
+    with pytest.raises(ValueError, match="CoreML does not support negation.*unsigned integer type"):
+        run_and_compare(jnp.negative, (jnp.array([1, 2, 3], dtype=jnp.uint32),))
+
+
 def test_while_loop_1d():
     def while_loop_1d(x):
         return jax.lax.while_loop(lambda val: val[0] < 5, lambda val: val + 1, x)
