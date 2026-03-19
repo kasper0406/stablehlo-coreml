@@ -31,7 +31,7 @@ dependencies = [
     # However, the code relies on the mlir StableHLO python bindings, and currently they are not published to pip
     # and the only pre-built stand-alone library is only built for linux.
     # Onces https://github.com/openxla/stablehlo/issues/2346 is resolved, this dependency can be switch to stablehlo instead.
-    "jax>=0.9.1",
+    "jax==0.9.1",
 ]
 
 [tool.hatch.version]
@@ -54,7 +54,7 @@ extra-dependencies = [
     "flatbuffers",
     "einops",
     "pillow",
-    "equinox>=0.13.5",
+    "equinox>=0.13.6",
     "pytest-cov",
 ]
 
