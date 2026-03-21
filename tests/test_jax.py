@@ -893,8 +893,8 @@ def test_transposed_conv_large_padding():
 
 def test_conv_batch_dimension_not_first():
     # Test convolution where the generic batch dimension is not at index 0.
-    input_shape = (2, 4, 4, 3) # (Channels=2, Height=4, Width=4, Batch=3) -> 'CHWN'
-    kernel_shape = (3, 3, 2, 5) # (Height=3, Width=3, InC=2, OutC=5) -> 'HWIO'
+    input_shape = (2, 4, 4, 3)  # (Channels=2, Height=4, Width=4, Batch=3) -> 'CHWN'
+    kernel_shape = (3, 3, 2, 5)  # (Height=3, Width=3, InC=2, OutC=5) -> 'HWIO'
 
     def conv_batch_not_first(img, kernel):
         return jax.lax.conv_general_dilated(
@@ -906,7 +906,6 @@ def test_conv_batch_dimension_not_first():
         )
 
     run_and_compare(conv_batch_not_first, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
-
 
 
 def test_constant_return():

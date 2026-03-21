@@ -308,6 +308,14 @@ def dtype_str(type):
     }[type]
 
 
+def safe_cast_to_int32(array_like, name=""):
+    """Cast an array-like to int32, raising ValueError on overflow."""
+    arr = np.array(array_like, dtype=np.int64)
+    if np.any((arr > np.iinfo(np.int32).max) | (arr < np.iinfo(np.int32).min)):
+        raise ValueError(f"{name} array overflows int32 limits: {arr}")
+    return arr.astype(np.int32)
+
+
 def clamp_index(index, shape, size):
     """
     Clamps start indices to ensure they are within bounds: [0, operand_dim - slice_size]

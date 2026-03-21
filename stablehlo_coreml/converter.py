@@ -9,7 +9,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor
+    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor, safe_cast_to_int32
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -302,7 +302,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_neg(self, context: TranslationContext, op: NegOp):
         operand = context[op.operand.get_name()]
         numpy_dtype = get_numpy_type(operand)
-        
+
         # CoreML's `sub` operator expects signed integers or floats.
         # CoreML's `cast` also does not support casting from uint32/uint64 directly.
         # Negation on unsigned types is rarely used, but when it is, it's virtually unsupported in MIL.
@@ -736,10 +736,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # The slice sizes in HLO are given by a signed integer with 64 bits
         # This is not supported by MIL, so we convert it to a MIL int32 type
-        sizes_int64 = np.array(op.slice_sizes, dtype=np.int64)
-        if np.any((sizes_int64 > np.iinfo(np.int32).max) | (sizes_int64 < np.iinfo(np.int32).min)):
-            raise ValueError(f"Slice sizes overflow int32 limits: {sizes_int64}")
-        sizes = sizes_int64.astype(np.int32)
+        sizes = safe_cast_to_int32(op.slice_sizes, "slice_sizes")
 
         # Clamp start indices to ensure they are within bounds: [0, operand_dim - slice_size]
         # This is required by the StableHLO specification
@@ -752,12 +749,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_slice(self, context: TranslationContext, op: SliceOp):
         x = context[op.operand.get_name()]
-
-        def safe_cast_to_int32(array_like, name=""):
-            arr = np.array(array_like, dtype=np.int64)
-            if np.any((arr > np.iinfo(np.int32).max) | (arr < np.iinfo(np.int32).min)):
-                raise ValueError(f"{name} array overflows int32 limits: {arr}")
-            return arr.astype(np.int32)
 
         begin = safe_cast_to_int32(op.start_indices, "start_indices")
         end = safe_cast_to_int32(op.limit_indices, "limit_indices")
@@ -828,13 +819,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         pad_attr = op.padding
         if pad_attr is None:
             pad = np.zeros((2 * in_rank), dtype=np.int32)
+        elif pad_attr.is_splat:
+            pad = np.full(2 * in_rank, pad_attr.get_splat_value().value, dtype=np.int32)
         else:
-            # Flatten the padding array, handling splats implicitly if needed, to match MIL's expectation
-            pad = np.array(pad_attr.get_splat_value().value if pad_attr.is_splat else pad_attr, dtype=np.int32)
-            if pad_attr.is_splat:
-                pad = pad * np.ones((2 * in_rank), dtype=np.int32)
-            else:
-                pad = pad.reshape(2 * in_rank)
+            pad = np.array(pad_attr, dtype=np.int32).reshape(2 * in_rank)
 
         # We switch the convolution to a transposed convolution if we have lhs_dilation
         conv_type = mb.conv
