@@ -151,7 +151,13 @@ def run_and_compare_hlo_module(
     return cml_model
 
 
-def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_000):
+def run_and_compare_specific_input(
+    jax_func,
+    inputs,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+):
     """
     Converts the given `jax_func` to a CoreML model.
     If the CoreML model and `jax_func` does not agree on the output, an error will be raised.
@@ -168,10 +174,16 @@ def run_and_compare_specific_input(jax_func, inputs, max_complexity: int = 10_00
     jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, flatten(inputs))
     expected_output = jax_func(*jax_input_values)
 
-    return run_and_compare_hlo_module(hlo_module, inputs, expected_output, max_complexity=max_complexity)
+    return run_and_compare_hlo_module(hlo_module, inputs, expected_output, max_complexity=max_complexity, atol=atol, rtol=rtol)
 
 
-def run_and_compare(jax_func, input_specification, max_complexity: int = 10_000):
+def run_and_compare(
+    jax_func,
+    input_specification,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+):
     """
     Converts the given `jax_func` to a CoreML model.
     The model will be tested with randomly generated data with the shapes of `input_specification`.
@@ -186,7 +198,7 @@ def run_and_compare(jax_func, input_specification, max_complexity: int = 10_000)
         flat_inputs.append(input_value)
 
     inputs = __nest_flat_jax_input_to_input_spec(input_specification, flat_inputs)
-    return run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity)
+    return run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity, atol=atol, rtol=rtol)
 
 
 def get_model_instruction_types(cml_model) -> List[str]:
