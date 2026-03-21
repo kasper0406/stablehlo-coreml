@@ -16,7 +16,7 @@ from .translation_context import TranslationContext
 from .ops_register import StableHloOpsRegistry, register_stablehlo_op, register_composite_op
 from .sort_utils import match_sort
 from .reductions import (
-    compute_reduction, compute_windowed_reduction, match_computation
+    compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 )
 from .padding import pad_with_cast
 
@@ -1035,7 +1035,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
-        # Pad the inputs if required
+        # Pad the inputs if required before attempting simple match
         if op.padding:
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
             inputs = [
@@ -1043,11 +1043,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 for input, init_value in zip(inputs, init_values)
             ]
 
-        # Unfortunately CoreML only supports tensors with rank <= 6.
-        # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
-        # means the function can not be called with tensors of rank >= 4.
-        # To work around this problem, we have to iterate over the leading dimensions not being
-        # windowed over, and calculate the result values incrementally.
         fixed_dimensions = []
         reduction_dimensions = []
         for axis in range(inputs_rank):
@@ -1056,6 +1051,30 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             else:
                 reduction_dimensions.append(axis)
         permutation = fixed_dimensions + reduction_dimensions
+        is_identity_perm = all(i == p for i, p in enumerate(permutation))
+
+        transposed_inputs = inputs
+        transposed_window_dimensions = list(op.window_dimensions)
+        transposed_window_strides = list(window_strides)
+        if not is_identity_perm:
+            transposed_inputs = [mb.transpose(x=input, perm=permutation) for input in inputs]
+            transposed_window_dimensions = [op.window_dimensions[i] for i in permutation]
+            transposed_window_strides = [window_strides[i] for i in permutation]
+
+        res = match_simple_reduce_window(
+            op.body, transposed_inputs, init_values, transposed_window_dimensions, transposed_window_strides
+        )
+        if res is not None:
+            if not is_identity_perm:
+                res = mb.transpose(x=res, perm=inverse_permutation(permutation))
+            context.add_result(op.result, res)
+            return
+
+        # Unfortunately CoreML only supports tensors with rank <= 6.
+        # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
+        # means the function can not be called with tensors of rank >= 4.
+        # To work around this problem, we have to iterate over the leading dimensions not being
+        # windowed over, and calculate the result values incrementally.
 
         # We will put as few dimensions as possible in the loop_dimensions (i.e. we may
         # choose to put some of the `fixedf_dimensions` inside the reduction itself)
@@ -1065,9 +1084,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         loop_dimensions = fixed_dimensions[:max(0, inputs_rank - max_dims)]
         loop_shapes = [inputs[0].shape[dim] for dim in loop_dimensions]
         loop_shape_rank = len(loop_shapes)
-
-        # Transpose the input so they are easily indexable inside the loop
-        transposed_inputs = [mb.transpose(x=input, perm=permutation) for input in inputs]
 
         def compute_reduction(result_idx, *partial_results):
             # Pick out the attributes from the dimensions we are reducing over for this index
