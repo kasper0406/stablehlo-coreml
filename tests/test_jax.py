@@ -163,6 +163,37 @@ def test_reduce_window():
         (jnp.arange(16, dtype=jnp.int32).reshape((4, 4)),)
     )
 
+    # non-contiguous spatial dimensions (e.g. [2, 1, 1, 2])
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=-1000.0,
+            computation=jax.lax.max,
+            window_dimensions=(2, 1, 1, 2),
+            window_strides=(1, 1, 1, 1),
+        ),
+        (jnp.ones((4, 4, 4, 4), dtype=jnp.float32),)
+    )
+
+    # ensure no transposes for already contiguous layouts [1, 1, 1, 3]
+    def compare_and_ensure_no_loops_or_transposes(jax_func, input_spec):
+        cml_model = run_and_compare(jax_func, input_spec)
+        ops = get_model_instruction_types(cml_model)
+        assert "while_loop" not in ops
+        assert "sliding_windows" not in ops
+        assert "transpose" not in ops
+
+    compare_and_ensure_no_loops_or_transposes(
+        partial(
+            jax.lax.reduce_window,
+            init_value=-1000.0,
+            computation=jax.lax.max,
+            window_dimensions=(1, 1, 1, 2),
+            window_strides=(1, 1, 1, 1),
+        ),
+        (jnp.ones((1, 1, 1, 4), dtype=jnp.float32),)
+    )
+
 
 def test_complex_reductions():
     """
@@ -213,6 +244,11 @@ def test_trigonmetry():
     run_and_compare(jnp.arctanh, (jnp.zeros((5, 6)),))
 
     run_and_compare(jnp.atan2, (jnp.zeros((50, 20)), jnp.zeros((50, 20)),))
+    run_and_compare(
+        jnp.atan2,
+        (jnp.zeros((50, 20), dtype=jnp.float16), jnp.zeros((50, 20), dtype=jnp.float16),),
+        rtol=1e-05 / jnp.finfo(jnp.float32).eps * jnp.finfo(jnp.float16).eps
+    )
 
 
 def test_is_finite():
@@ -313,6 +349,19 @@ def test_gather():
     dimension_numbers = GatherDimensionNumbers(
         offset_dims=(0,),
         collapsed_slice_dims=(0,),
+        start_index_map=(0,)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
+
+    operand = jnp.reshape(jnp.arange(50), (10, 5))
+    start_indices = jnp.array([
+        [[3], [1], [7]],
+        [[4], [0], [9]]
+    ], dtype=jnp.int32)  # shape (2, 3, 1)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(),
         start_index_map=(0,)
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
@@ -925,6 +974,23 @@ def test_transposed_conv_large_padding():
     run_and_compare(transposed_conv, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
 
 
+def test_conv_batch_dimension_not_first():
+    # Test convolution where the generic batch dimension is not at index 0.
+    input_shape = (2, 4, 4, 3)  # (Channels=2, Height=4, Width=4, Batch=3) -> 'CHWN'
+    kernel_shape = (3, 3, 2, 5)  # (Height=3, Width=3, InC=2, OutC=5) -> 'HWIO'
+
+    def conv_batch_not_first(img, kernel):
+        return jax.lax.conv_general_dilated(
+            lhs=img,
+            rhs=kernel,
+            window_strides=(1, 1),
+            padding='SAME',
+            dimension_numbers=('CHWN', 'HWIO', 'CHWN')
+        )
+
+    run_and_compare(conv_batch_not_first, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
+
+
 def test_constant_return():
     def func(x):
         return jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
@@ -945,6 +1011,11 @@ def test_while_loop_scalar():
         return jax.lax.while_loop(cond, body, x)
 
     run_and_compare(while_loop_scalar, (jnp.array(0, dtype=jnp.int32),))
+
+
+def test_neg_unsigned_int():
+    with pytest.raises(ValueError, match="CoreML does not support negation.*unsigned integer type"):
+        run_and_compare(jnp.negative, (jnp.array([1, 2, 3], dtype=jnp.uint32),))
 
 
 def test_while_loop_1d():

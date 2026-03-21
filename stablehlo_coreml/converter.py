@@ -9,18 +9,19 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor
+    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor, safe_cast_to_int32
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
-from .ops_register import StableHloOpsRegistry, register_stablehlo_op
+from .ops_register import StableHloOpsRegistry, register_stablehlo_op, register_composite_op
 from .sort_utils import match_sort
 from .reductions import (
     compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 )
 from .padding import pad_with_cast
 
-from jaxlib.mlir import ir
+from jaxlib.mlir import ir, passmanager
+from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
 from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
@@ -29,9 +30,8 @@ from jaxlib.mlir.dialects.stablehlo import (
     MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp,
+    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
 )
-from jaxlib.mlir.dialects.mhlo import (TopKOp, AsinOp, AcosOp, SinhOp, CoshOp, AsinhOp, AcoshOp, AtanhOp)
 from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
@@ -46,8 +46,35 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     register_optimizations()
 
+    _normalize_module(module)
+
     converter = StableHloConverter(opset_version=minimum_deployment_target)
     return converter.convert(module)
+
+
+def _normalize_module(module: ir.Module) -> None:
+    """Normalize an incoming StableHLO module in-place before conversion.
+
+    Two passes are applied in sequence:
+
+    1. ``chlo-legalize-to-stablehlo`` – lowers any raw CHLO ops that appear
+       *outside* a ``stablehlo.composite`` wrapper (e.g. from the
+       ``jax.jit().lower().compiler_ir('stablehlo')`` path) to their StableHLO
+       equivalents.  Ops already wrapped in a composite are intentionally left
+       untouched; the composite handlers in the converter map them directly to
+       CoreML primitives, bypassing the (potentially unsupported) stablehlo
+       decompositions.
+
+    2. ``stablehlo-legalize-deprecated-ops`` – rewrites any deprecated
+       StableHLO ops to their current equivalents, keeping the converter
+       insulated from older serialized modules.
+    """
+    stablehlo_dialect.register_stablehlo_passes()
+    pm = passmanager.PassManager.parse(
+        "builtin.module(func.func(chlo-legalize-to-stablehlo, stablehlo-legalize-deprecated-ops))",
+        context=module.context,
+    )
+    pm.run(module.operation)
 
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
@@ -93,12 +120,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def process_block(self, context: TranslationContext, block: ir.Block):
         outputs = None
         for op in block:
-            # Convention: Only the "return" op is returning from its building function
-            # TODO: Check that "return" is always the last node!
+            if outputs is not None:
+                raise ValueError("The 'return' op must be the last operation in the block.")
             ret = self.dispatch_op(self, context, op)
             if ret is not None:
-                if outputs is not None:
-                    raise ValueError("More than 1 return op in block!")
                 outputs = ret
         return outputs
 
@@ -120,6 +145,84 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Configure return value
         for result, output in zip(op.results, outputs):
             context.add_result(result, output)
+
+    @register_stablehlo_op
+    def op_composite(self, context: TranslationContext, op: CompositeOp):
+        # Dispatch to a named handler if one is registered for this composite op.
+        # Named handlers can map directly to CoreML primitives, which is preferable
+        # when the decomposition uses features that are not supported.
+        composite_name = op.name.value
+        handler = self._composite_ops_registry.get(composite_name)
+        if handler is not None:
+            return handler(self, context, op)
+
+        # Default: inline the decomposition function.
+        context_args = [context[arg.get_name()] for arg in op.inputs]
+
+        func_name = op.decomposition.value
+        hlo_func = self.func_index[func_name]
+        params = hlo_func.arguments
+        outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
+
+        for result, output in zip(op.results, outputs):
+            context.add_result(result, output)
+
+    @register_composite_op("chlo.top_k")
+    def _op_composite_chlo_top_k(self, context: TranslationContext, op: CompositeOp):
+        # Map directly to mb.topk rather than inlining the decomposition, which
+        # uses a stable multi-input sort that is not supported.
+        x = context[op.inputs[0].get_name()]
+        k = ir.IntegerAttr(op.composite_attributes["k"]).value
+        # Default to descending (largest=True) as per the chlo.top_k spec; honour
+        # an explicit 'largest' attribute if present.
+        largest = (ir.BoolAttr(op.composite_attributes["largest"]).value
+                   if "largest" in op.composite_attributes else True)
+        values, indices = mb.topk(x=x, k=k, ascending=not largest)
+        context.add_result(op.results[0], values)
+        context.add_result(op.results[1], indices)
+
+    @register_composite_op("chlo.asin")
+    def _op_composite_chlo_asin(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.asin(x=x))
+
+    @register_composite_op("chlo.acos")
+    def _op_composite_chlo_acos(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.acos(x=x))
+
+    @register_composite_op("chlo.sinh")
+    def _op_composite_chlo_sinh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.sinh(x=x))
+
+    @register_composite_op("chlo.cosh")
+    def _op_composite_chlo_cosh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.cosh(x=x))
+
+    @register_composite_op("chlo.atanh")
+    def _op_composite_chlo_atanh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
+        ratio = mb.real_div(x=mb.add(x=1.0, y=x), y=mb.sub(x=1.0, y=x))
+        context.add_result(op.results[0], mb.mul(x=0.5, y=mb.log(x=ratio)))
+
+    @register_composite_op("chlo.asinh")
+    def _op_composite_chlo_asinh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # asinh(x) = log(x + sqrt(x^2 + 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
+        context.add_result(op.results[0], mb.log(x=mb.add(x=x, y=mb.sqrt(x=x_sq_plus_1))))
+
+    @register_composite_op("chlo.acosh")
+    def _op_composite_chlo_acosh(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # acosh(x) = log(x + sqrt(x^2 - 1))
+        x_sq = mb.mul(x=x, y=x)
+        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
+        context.add_result(op.results[0], mb.log(x=mb.add(x=x, y=mb.sqrt(x=x_sq_minus_1))))
 
     @register_stablehlo_op
     def op_return(self, context: TranslationContext, op: ReturnOp):
@@ -197,11 +300,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_neg(self, context: TranslationContext, op: NegOp):
-        # TODO(knielsen): Consider unsigned and more exotic types
         operand = context[op.operand.get_name()]
-        minus_one = np.array([-1], dtype=get_numpy_type(operand))
-        cml_op = mb.mul(x=minus_one, y=operand)
-        context.add_result(op.result, cml_op)
+        numpy_dtype = get_numpy_type(operand)
+
+        # CoreML's `sub` operator expects signed integers or floats.
+        # CoreML's `cast` also does not support casting from uint32/uint64 directly.
+        # Negation on unsigned types is rarely used, but when it is, it's virtually unsupported in MIL.
+        is_unsigned = numpy_dtype in [np.uint8, np.uint16, np.uint32, np.uint64]
+        if is_unsigned:
+            raise ValueError(
+                f"CoreML does not support negation (or casting) for unsigned integer type {numpy_dtype}."
+            )
+
+        zero_val = np.array([0], dtype=numpy_dtype)
+        result = mb.sub(x=zero_val, y=operand)
+
+        context.add_result(op.result, result)
 
     @register_stablehlo_op
     def op_sign(self, context: TranslationContext, op: SignOp):
@@ -301,7 +415,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             return reduce(lambda a, b: int(a) * int(b), lst, 1)
 
         def last_column_dot(lhs, rhs):
-            # TODO: Figure out if we need to special case broadcasting dims
             return mb.matmul(x=lhs, y=rhs, transpose_y=True)
 
         # Remark: There is a potential performance optimization here:
@@ -623,8 +736,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # The slice sizes in HLO are given by a signed integer with 64 bits
         # This is not supported by MIL, so we convert it to a MIL int32 type
-        # TODO(knielsen): Overflow check?
-        sizes = np.array(op.slice_sizes, dtype=np.int32)
+        sizes = safe_cast_to_int32(op.slice_sizes, "slice_sizes")
 
         # Clamp start indices to ensure they are within bounds: [0, operand_dim - slice_size]
         # This is required by the StableHLO specification
@@ -638,9 +750,9 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_slice(self, context: TranslationContext, op: SliceOp):
         x = context[op.operand.get_name()]
 
-        begin = np.array(op.start_indices, dtype=np.int32)
-        end = np.array(op.limit_indices, dtype=np.int32)
-        stride = np.array(op.strides, dtype=np.int32)
+        begin = safe_cast_to_int32(op.start_indices, "start_indices")
+        end = safe_cast_to_int32(op.limit_indices, "limit_indices")
+        stride = safe_cast_to_int32(op.strides, "strides")
 
         cml_op = mb.slice_by_index(
             x=x,
@@ -677,10 +789,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convolution(self, context: TranslationContext, op: ConvolutionOp):
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
-        # TODO(knielsen): It should be possible to remove this batch dimension check, but
-        #                 there should be a unit test testing it.
-        if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
-            raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
         if len(dim_spec.input_spatial_dimensions) > 3 or len(dim_spec.output_spatial_dimensions) > 3:
             raise ValueError("MIL only supports convolutions with dim <= 3")
 
@@ -707,15 +815,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         groups = op.feature_group_count.value
 
         # Handle padding
-        # TODO(knielsen): Consider moving splat/non-splat handling to some utility
         in_rank = x.rank - 2
-        if op.padding is None:
+        pad_attr = op.padding
+        if pad_attr is None:
             pad = np.zeros((2 * in_rank), dtype=np.int32)
-        elif op.padding.is_splat:
-            pad = op.padding.get_splat_value().value * np.ones((2 * in_rank), dtype=np.int32)
+        elif pad_attr.is_splat:
+            pad = np.full(2 * in_rank, pad_attr.get_splat_value().value, dtype=np.int32)
         else:
-            # We need to reshape the array to a linear array to match MILs expectation
-            pad = np.reshape(np.array(op.padding, dtype=np.int32), (2 * in_rank, ))
+            pad = np.array(pad_attr, dtype=np.int32).reshape(2 * in_rank)
 
         # We switch the convolution to a transposed convolution if we have lhs_dilation
         conv_type = mb.conv
@@ -795,28 +902,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # The MIL weights should be on form:
         #  - normal convolutions: [output_features, input_features / groups, spatial kernels*]
         #  - transposed convolutions: [input_features, output_features / groups, spatial kernels*]
-        weight = context[op.rhs.get_name()]  # The weights are numpy arrays
-        weight_permutation = []
-        if conv_type == mb.conv:
-            weight_permutation = [
-                dim_spec.kernel_output_feature_dimension,
-                dim_spec.kernel_input_feature_dimension,
-                *dim_spec.kernel_spatial_dimensions
-            ]
-        else:
-            weight_permutation = [
-                dim_spec.kernel_input_feature_dimension,
-                dim_spec.kernel_output_feature_dimension,
-                *dim_spec.kernel_spatial_dimensions
-            ]
+        weight = context[op.rhs.get_name()]
+        is_transposed = conv_type != mb.conv
+
+        weight_permutation = [
+            dim_spec.kernel_input_feature_dimension if is_transposed else dim_spec.kernel_output_feature_dimension,
+            dim_spec.kernel_output_feature_dimension if is_transposed else dim_spec.kernel_input_feature_dimension,
+            *dim_spec.kernel_spatial_dimensions
+        ]
         weight = mb.transpose(x=weight, perm=weight_permutation)
 
-        # TODO(knielsen): Make this check more readable!
-        # It is executed for conv transpose
-        if conv_type != mb.conv:
-            # MIL expects the weights to be reversed along the kernel dimensions
-            kernel_dimensions = [i + 2 for i in range(len(weight.shape) - 2)]
-            weight = mb.reverse(x=weight, axes=kernel_dimensions)
+        # For transposed convolutions, MIL requires the weights to be reversed along all spatial dimensions
+        if is_transposed:
+            num_spatial_dims = len(dim_spec.kernel_spatial_dimensions)
+            spatial_axes = [i + 2 for i in range(num_spatial_dims)]
+            weight = mb.reverse(x=weight, axes=spatial_axes)
 
         cml_conv = conv_type(
             x=x,
@@ -875,9 +975,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         fraction = mb.real_div(x=y, y=x)
         atan2_res = mb.atan(x=fraction)
         # We need to adjust for negative x, based on the sign of y
-        atan2_res_adjusted = mb.add(x=atan2_res, y=mb.mul(x=mb.sign(x=y), y=np.pi))
+        np_dtype = get_numpy_type(y)
+        atan2_res_adjusted = mb.add(x=atan2_res, y=mb.mul(x=mb.sign(x=y), y=np_dtype(np.pi)))
         atan2_res = mb.select(
-            cond=mb.less(x=x, y=0.0),
+            cond=mb.less(x=x, y=np_dtype(0.0)),
             a=atan2_res_adjusted,
             b=atan2_res,
         )
@@ -942,16 +1043,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 for input, init_value in zip(inputs, init_values)
             ]
 
-        res = match_simple_reduce_window(op.body, inputs, init_values, op.window_dimensions, window_strides)
-        if res is not None:
-            context.add_result(op.result, res)
-            return
-
-        # Unfortunately CoreML only supports tensors with rank <= 6.
-        # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
-        # means the function can not be called with tensors of rank >= 4.
-        # To work around this problem, we have to iterate over the leading dimensions not being
-        # windowed over, and calculate the result values incrementally.
         fixed_dimensions = []
         reduction_dimensions = []
         for axis in range(inputs_rank):
@@ -960,6 +1051,30 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             else:
                 reduction_dimensions.append(axis)
         permutation = fixed_dimensions + reduction_dimensions
+        is_identity_perm = all(i == p for i, p in enumerate(permutation))
+
+        transposed_inputs = inputs
+        transposed_window_dimensions = list(op.window_dimensions)
+        transposed_window_strides = list(window_strides)
+        if not is_identity_perm:
+            transposed_inputs = [mb.transpose(x=input, perm=permutation) for input in inputs]
+            transposed_window_dimensions = [op.window_dimensions[i] for i in permutation]
+            transposed_window_strides = [window_strides[i] for i in permutation]
+
+        res = match_simple_reduce_window(
+            op.body, transposed_inputs, init_values, transposed_window_dimensions, transposed_window_strides
+        )
+        if res is not None:
+            if not is_identity_perm:
+                res = mb.transpose(x=res, perm=inverse_permutation(permutation))
+            context.add_result(op.result, res)
+            return
+
+        # Unfortunately CoreML only supports tensors with rank <= 6.
+        # Due to the re-shaping and windowing operations inside `__compute_windowed_reduction`, this
+        # means the function can not be called with tensors of rank >= 4.
+        # To work around this problem, we have to iterate over the leading dimensions not being
+        # windowed over, and calculate the result values incrementally.
 
         # We will put as few dimensions as possible in the loop_dimensions (i.e. we may
         # choose to put some of the `fixedf_dimensions` inside the reduction itself)
@@ -969,9 +1084,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         loop_dimensions = fixed_dimensions[:max(0, inputs_rank - max_dims)]
         loop_shapes = [inputs[0].shape[dim] for dim in loop_dimensions]
         loop_shape_rank = len(loop_shapes)
-
-        # Transpose the input so they are easily indexable inside the loop
-        transposed_inputs = [mb.transpose(x=input, perm=permutation) for input in inputs]
 
         def compute_reduction(result_idx, *partial_results):
             # Pick out the attributes from the dimensions we are reducing over for this index
@@ -1074,6 +1186,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 if start_indices_rank > 1 or len(dim_numbers.collapsed_slice_dims):
                     clamped_indices = mb.squeeze(x=clamped_indices, axes=(start_indices_rank - 1,))
                 result = mb.gather(x=operand, indices=clamped_indices, axis=dim_mapping[0], batch_dims=len(dim_batches))
+                if start_indices_rank > 1 and not len(dim_numbers.collapsed_slice_dims):
+                    result = mb.expand_dims(x=result, axes=(start_indices_rank - 1,))
                 context.add_result(op.result, result)
                 return
             elif np.max(dim_mapping) < len(dim_mapping) + len(dim_batches):
@@ -1282,113 +1396,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
-        if op.call_target_name.value.startswith("mhlo."):
-            mapped_op = None
-            op_impl = None
-            match op.call_target_name.value:
-                case "mhlo.topk":
-                    mapped_op = TopKOp
-                    op_impl = self._op_mhlo_topk
-                case "mhlo.asin":
-                    mapped_op = AsinOp
-                    op_impl = self._op_mhlo_asin
-                case "mhlo.sinh":
-                    mapped_op = SinhOp
-                    op_impl = self._op_mhlo_sinh
-                case "mhlo.asinh":
-                    mapped_op = AsinhOp
-                    op_impl = self._op_mhlo_asinh
-                case "mhlo.acos":
-                    mapped_op = AcosOp
-                    op_impl = self._op_mhlo_acos
-                case "mhlo.cosh":
-                    mapped_op = CoshOp
-                    op_impl = self._op_mhlo_cosh
-                case "mhlo.acosh":
-                    mapped_op = AcoshOp
-                    op_impl = self._op_mhlo_acosh
-                case "mhlo.atanh":
-                    mapped_op = AtanhOp
-                    op_impl = self._op_mhlo_atanh
-
-            if not mapped_op:
-                raise ValueError(f"mhlo op '{op.call_target_name.value}' is not implemented")
-            if not op_impl:
-                raise ValueError(f"mhlo op '{op.call_target_name.value}' does not have an implementation")
-
-            mhlo_attributes = {attr.name: attr.attr for attr in list(op.attributes["mhlo.attributes"])}
-            delegate_op = partial(mapped_op, **mhlo_attributes, loc=op.location)(*op.operands)
-
-            # We manually have to handle the results, as the current API does not allow naming
-            # the `delegate_op` results according to the custom call results
-            mil_results = op_impl(context, delegate_op)
-            for (custom_call_result, mil_result) in zip(op.results, mil_results):
-                context.add_result(custom_call_result, mil_result)
-
-            return
-
         raise ValueError(f"Custom call is not supported: {op.call_target_name}")
-
-    def _op_mhlo_topk(self, context: TranslationContext, op: TopKOp):
-        """
-        This is a MHLO op, and follows a slightly different pattern, since it is unvoked by a
-        custom call. It will return the results, as we currently can not rename the results
-        in the TopKOp
-        """
-        x = context[op.operand.get_name()]
-        descending = op.largest is None or op.largest.value
-        mil_res = mb.topk(x=x, k=op.k.value, ascending=not descending)
-        return mil_res
-
-    def _op_mhlo_asin(self, context: TranslationContext, op: AsinOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.asin(x=x)
-        return [mil_res]
-
-    def _op_mhlo_sinh(self, context: TranslationContext, op: SinhOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.sinh(x=x)
-        return [mil_res]
-
-    def _op_mhlo_asinh(self, context: TranslationContext, op: AsinhOp):
-        x = context[op.operand.get_name()]
-        # asinh(x) = log(x + sqrt(x^2 + 1))
-        x_sq = mb.mul(x=x, y=x)
-        x_sq_plus_1 = mb.add(x=x_sq, y=1.0)
-        sqrt_part = mb.sqrt(x=x_sq_plus_1)
-        log_arg = mb.add(x=x, y=sqrt_part)
-        mil_res = mb.log(x=log_arg)
-        return [mil_res]
-
-    def _op_mhlo_acos(self, context: TranslationContext, op: AcosOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.acos(x=x)
-        return [mil_res]
-
-    def _op_mhlo_cosh(self, context: TranslationContext, op: CoshOp):
-        x = context[op.operand.get_name()]
-        mil_res = mb.cosh(x=x)
-        return [mil_res]
-
-    def _op_mhlo_acosh(self, context: TranslationContext, op: AcoshOp):
-        x = context[op.operand.get_name()]
-        # acosh(x) = log(x + sqrt(x^2 - 1))
-        x_sq = mb.mul(x=x, y=x)
-        x_sq_minus_1 = mb.sub(x=x_sq, y=1.0)
-        sqrt_part = mb.sqrt(x=x_sq_minus_1)
-        log_arg = mb.add(x=x, y=sqrt_part)
-        mil_res = mb.log(x=log_arg)
-        return [mil_res]
-
-    def _op_mhlo_atanh(self, context: TranslationContext, op: AtanhOp):
-        x = context[op.operand.get_name()]
-        # atanh(x) = 0.5 * log((1 + x) / (1 - x))
-        one_plus_x = mb.add(x=1.0, y=x)
-        one_minus_x = mb.sub(x=1.0, y=x)
-        div_res = mb.real_div(x=one_plus_x, y=one_minus_x)
-        log_res = mb.log(x=div_res)
-        mil_res = mb.mul(x=0.5, y=log_res)
-        return [mil_res]
 
     def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call
