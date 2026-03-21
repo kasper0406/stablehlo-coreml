@@ -163,6 +163,37 @@ def test_reduce_window():
         (jnp.arange(16, dtype=jnp.int32).reshape((4, 4)),)
     )
 
+    # non-contiguous spatial dimensions (e.g. [2, 1, 1, 2])
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=-1000.0,
+            computation=jax.lax.max,
+            window_dimensions=(2, 1, 1, 2),
+            window_strides=(1, 1, 1, 1),
+        ),
+        (jnp.ones((4, 4, 4, 4), dtype=jnp.float32),)
+    )
+
+    # ensure no transposes for already contiguous layouts [1, 1, 1, 3]
+    def compare_and_ensure_no_loops_or_transposes(jax_func, input_spec):
+        cml_model = run_and_compare(jax_func, input_spec)
+        ops = get_model_instruction_types(cml_model)
+        assert "while_loop" not in ops
+        assert "sliding_windows" not in ops
+        assert "transpose" not in ops
+
+    compare_and_ensure_no_loops_or_transposes(
+        partial(
+            jax.lax.reduce_window,
+            init_value=-1000.0,
+            computation=jax.lax.max,
+            window_dimensions=(1, 1, 1, 2),
+            window_strides=(1, 1, 1, 1),
+        ),
+        (jnp.ones((1, 1, 1, 4), dtype=jnp.float32),)
+    )
+
 
 def test_complex_reductions():
     """
