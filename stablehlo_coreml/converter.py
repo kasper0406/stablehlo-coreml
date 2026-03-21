@@ -9,7 +9,7 @@ from coremltools.converters.mil.mil.ops.defs._utils import (
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
     inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor
+    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor, safe_cast_to_int32
 )
 from .passes.utils import register_optimizations
 from .translation_context import TranslationContext
@@ -120,12 +120,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def process_block(self, context: TranslationContext, block: ir.Block):
         outputs = None
         for op in block:
-            # Convention: Only the "return" op is returning from its building function
-            # TODO: Check that "return" is always the last node!
+            if outputs is not None:
+                raise ValueError("The 'return' op must be the last operation in the block.")
             ret = self.dispatch_op(self, context, op)
             if ret is not None:
-                if outputs is not None:
-                    raise ValueError("More than 1 return op in block!")
                 outputs = ret
         return outputs
 
@@ -302,11 +300,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_neg(self, context: TranslationContext, op: NegOp):
-        # TODO(knielsen): Consider unsigned and more exotic types
         operand = context[op.operand.get_name()]
-        minus_one = np.array([-1], dtype=get_numpy_type(operand))
-        cml_op = mb.mul(x=minus_one, y=operand)
-        context.add_result(op.result, cml_op)
+        numpy_dtype = get_numpy_type(operand)
+
+        # CoreML's `sub` operator expects signed integers or floats.
+        # CoreML's `cast` also does not support casting from uint32/uint64 directly.
+        # Negation on unsigned types is rarely used, but when it is, it's virtually unsupported in MIL.
+        is_unsigned = numpy_dtype in [np.uint8, np.uint16, np.uint32, np.uint64]
+        if is_unsigned:
+            raise ValueError(
+                f"CoreML does not support negation (or casting) for unsigned integer type {numpy_dtype}."
+            )
+
+        zero_val = np.array([0], dtype=numpy_dtype)
+        result = mb.sub(x=zero_val, y=operand)
+
+        context.add_result(op.result, result)
 
     @register_stablehlo_op
     def op_sign(self, context: TranslationContext, op: SignOp):
@@ -406,7 +415,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             return reduce(lambda a, b: int(a) * int(b), lst, 1)
 
         def last_column_dot(lhs, rhs):
-            # TODO: Figure out if we need to special case broadcasting dims
             return mb.matmul(x=lhs, y=rhs, transpose_y=True)
 
         # Remark: There is a potential performance optimization here:
@@ -728,8 +736,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # The slice sizes in HLO are given by a signed integer with 64 bits
         # This is not supported by MIL, so we convert it to a MIL int32 type
-        # TODO(knielsen): Overflow check?
-        sizes = np.array(op.slice_sizes, dtype=np.int32)
+        sizes = safe_cast_to_int32(op.slice_sizes, "slice_sizes")
 
         # Clamp start indices to ensure they are within bounds: [0, operand_dim - slice_size]
         # This is required by the StableHLO specification
@@ -743,9 +750,9 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_slice(self, context: TranslationContext, op: SliceOp):
         x = context[op.operand.get_name()]
 
-        begin = np.array(op.start_indices, dtype=np.int32)
-        end = np.array(op.limit_indices, dtype=np.int32)
-        stride = np.array(op.strides, dtype=np.int32)
+        begin = safe_cast_to_int32(op.start_indices, "start_indices")
+        end = safe_cast_to_int32(op.limit_indices, "limit_indices")
+        stride = safe_cast_to_int32(op.strides, "strides")
 
         cml_op = mb.slice_by_index(
             x=x,
@@ -782,10 +789,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_convolution(self, context: TranslationContext, op: ConvolutionOp):
         dim_spec = hlo.ConvDimensionNumbers(op.dimension_numbers)
-        # TODO(knielsen): It should be possible to remove this batch dimension check, but
-        #                 there should be a unit test testing it.
-        if dim_spec.input_batch_dimension != 0 or dim_spec.output_batch_dimension != 0:
-            raise ValueError(f"Only the first dimension is currently supported for batch dimension. Got {dim_spec}")
         if len(dim_spec.input_spatial_dimensions) > 3 or len(dim_spec.output_spatial_dimensions) > 3:
             raise ValueError("MIL only supports convolutions with dim <= 3")
 
@@ -812,15 +815,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         groups = op.feature_group_count.value
 
         # Handle padding
-        # TODO(knielsen): Consider moving splat/non-splat handling to some utility
         in_rank = x.rank - 2
-        if op.padding is None:
+        pad_attr = op.padding
+        if pad_attr is None:
             pad = np.zeros((2 * in_rank), dtype=np.int32)
-        elif op.padding.is_splat:
-            pad = op.padding.get_splat_value().value * np.ones((2 * in_rank), dtype=np.int32)
+        elif pad_attr.is_splat:
+            pad = np.full(2 * in_rank, pad_attr.get_splat_value().value, dtype=np.int32)
         else:
-            # We need to reshape the array to a linear array to match MILs expectation
-            pad = np.reshape(np.array(op.padding, dtype=np.int32), (2 * in_rank, ))
+            pad = np.array(pad_attr, dtype=np.int32).reshape(2 * in_rank)
 
         # We switch the convolution to a transposed convolution if we have lhs_dilation
         conv_type = mb.conv
@@ -900,28 +902,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # The MIL weights should be on form:
         #  - normal convolutions: [output_features, input_features / groups, spatial kernels*]
         #  - transposed convolutions: [input_features, output_features / groups, spatial kernels*]
-        weight = context[op.rhs.get_name()]  # The weights are numpy arrays
-        weight_permutation = []
-        if conv_type == mb.conv:
-            weight_permutation = [
-                dim_spec.kernel_output_feature_dimension,
-                dim_spec.kernel_input_feature_dimension,
-                *dim_spec.kernel_spatial_dimensions
-            ]
-        else:
-            weight_permutation = [
-                dim_spec.kernel_input_feature_dimension,
-                dim_spec.kernel_output_feature_dimension,
-                *dim_spec.kernel_spatial_dimensions
-            ]
+        weight = context[op.rhs.get_name()]
+        is_transposed = conv_type != mb.conv
+
+        weight_permutation = [
+            dim_spec.kernel_input_feature_dimension if is_transposed else dim_spec.kernel_output_feature_dimension,
+            dim_spec.kernel_output_feature_dimension if is_transposed else dim_spec.kernel_input_feature_dimension,
+            *dim_spec.kernel_spatial_dimensions
+        ]
         weight = mb.transpose(x=weight, perm=weight_permutation)
 
-        # TODO(knielsen): Make this check more readable!
-        # It is executed for conv transpose
-        if conv_type != mb.conv:
-            # MIL expects the weights to be reversed along the kernel dimensions
-            kernel_dimensions = [i + 2 for i in range(len(weight.shape) - 2)]
-            weight = mb.reverse(x=weight, axes=kernel_dimensions)
+        # For transposed convolutions, MIL requires the weights to be reversed along all spatial dimensions
+        if is_transposed:
+            num_spatial_dims = len(dim_spec.kernel_spatial_dimensions)
+            spatial_axes = [i + 2 for i in range(num_spatial_dims)]
+            weight = mb.reverse(x=weight, axes=spatial_axes)
 
         cml_conv = conv_type(
             x=x,

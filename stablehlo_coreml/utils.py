@@ -292,18 +292,28 @@ def get_numpy_type(obj):
 
 
 def dtype_str(type):
-    # TODO(knielsen): Add additional types
     return {
+        types.int64: "int64",
+        types.uint64: "uint64",
         types.int32: "int32",
         types.uint32: "uint32",
         types.int16: "int16",
         types.uint16: "uint16",
         types.int8: "int8",
         types.uint8: "uint8",
-        types.fp16: "fp16",
+        types.fp64: "fp64",
         types.fp32: "fp32",
+        types.fp16: "fp16",
         types.bool: "bool",
     }[type]
+
+
+def safe_cast_to_int32(array_like, name=""):
+    """Cast an array-like to int32, raising ValueError on overflow."""
+    arr = np.array(array_like, dtype=np.int64)
+    if np.any((arr > np.iinfo(np.int32).max) | (arr < np.iinfo(np.int32).min)):
+        raise ValueError(f"{name} array overflows int32 limits: {arr}")
+    return arr.astype(np.int32)
 
 
 def clamp_index(index, shape, size):

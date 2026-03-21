@@ -891,6 +891,23 @@ def test_transposed_conv_large_padding():
     run_and_compare(transposed_conv, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
 
 
+def test_conv_batch_dimension_not_first():
+    # Test convolution where the generic batch dimension is not at index 0.
+    input_shape = (2, 4, 4, 3)  # (Channels=2, Height=4, Width=4, Batch=3) -> 'CHWN'
+    kernel_shape = (3, 3, 2, 5)  # (Height=3, Width=3, InC=2, OutC=5) -> 'HWIO'
+
+    def conv_batch_not_first(img, kernel):
+        return jax.lax.conv_general_dilated(
+            lhs=img,
+            rhs=kernel,
+            window_strides=(1, 1),
+            padding='SAME',
+            dimension_numbers=('CHWN', 'HWIO', 'CHWN')
+        )
+
+    run_and_compare(conv_batch_not_first, (jnp.zeros(input_shape), jnp.zeros(kernel_shape)))
+
+
 def test_constant_return():
     def func(x):
         return jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)
@@ -911,6 +928,11 @@ def test_while_loop_scalar():
         return jax.lax.while_loop(cond, body, x)
 
     run_and_compare(while_loop_scalar, (jnp.array(0, dtype=jnp.int32),))
+
+
+def test_neg_unsigned_int():
+    with pytest.raises(ValueError, match="CoreML does not support negation.*unsigned integer type"):
+        run_and_compare(jnp.negative, (jnp.array([1, 2, 3], dtype=jnp.uint32),))
 
 
 def test_while_loop_1d():
