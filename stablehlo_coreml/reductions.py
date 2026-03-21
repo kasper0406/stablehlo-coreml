@@ -1,5 +1,6 @@
 from coremltools import _logger as logger
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import types
 import numpy as np
 from jaxlib.mlir.dialects.stablehlo import (
     AddOp, MulOp, MinOp, MaxOp, ReturnOp, SubtractOp, DivOp
@@ -7,7 +8,7 @@ from jaxlib.mlir.dialects.stablehlo import (
 
 from .utils import (
     index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
-    get_numpy_type
+    get_numpy_type, dtype_str
 )
 from .translation_context import TranslationContext
 
@@ -88,32 +89,26 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
     x_reshaped = mb.reshape(x=x, shape=new_shape)
 
     # mb.max_pool and mb.conv do not support integer types.
-    from coremltools.converters.mil.mil import types
-    from .utils import dtype_str
-
     x_dtype = x.dtype
     is_int_or_bool = types.is_int(x_dtype) or types.is_bool(x_dtype)
     if is_int_or_bool:
         x_reshaped = mb.cast(x=x_reshaped, dtype="fp32")
 
-    if mode == "max":
-        pool_res = mb.max_pool(x=x_reshaped, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
-    elif mode == "min":
-        minus_one = np.array([-1], dtype=np.float32)
-        x_neg = mb.mul(x=minus_one, y=x_reshaped)
-        pool_res = mb.max_pool(x=x_neg, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
-        pool_res = mb.mul(x=minus_one, y=pool_res)
-    elif mode == "add":
-        weight = np.ones((1, 1) + tuple(spatial_kernel), dtype=np.float32 if is_int_or_bool else get_numpy_type(x))
-        pool_res = mb.conv(x=x_reshaped, weight=weight, strides=spatial_strides, pad_type="valid")
-    else:
-        return None
+    match mode:
+        case "max":
+            pool_res = mb.max_pool(x=x_reshaped, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
+        case "min":
+            x_neg = mb.sub(x=0.0, y=x_reshaped)
+            pool_res = mb.max_pool(x=x_neg, kernel_sizes=spatial_kernel, strides=spatial_strides, pad_type="valid")
+            pool_res = mb.sub(x=0.0, y=pool_res)
+        case "add":
+            weight = np.ones((1, 1) + tuple(spatial_kernel), dtype=np.float32 if is_int_or_bool else get_numpy_type(x))
+            pool_res = mb.conv(x=x_reshaped, weight=weight, strides=spatial_strides, pad_type="valid")
+        case _:
+            return None
 
     if is_int_or_bool:
-        if types.is_bool(x_dtype):
-            pool_res = mb.cast(x=mb.round(x=pool_res), dtype="bool")
-        else:
-            pool_res = mb.cast(x=mb.round(x=pool_res), dtype=dtype_str(x_dtype))
+        pool_res = mb.cast(x=mb.round(x=pool_res), dtype=dtype_str(x_dtype))
 
     # Reshape back to the output dims mapping
     if rank == spatial_rank:
