@@ -161,6 +161,11 @@ def test_trigonmetry():
     run_and_compare(jnp.arctanh, (jnp.zeros((5, 6)),))
 
     run_and_compare(jnp.atan2, (jnp.zeros((50, 20)), jnp.zeros((50, 20)),))
+    run_and_compare(
+        jnp.atan2,
+        (jnp.zeros((50, 20), dtype=jnp.float16), jnp.zeros((50, 20), dtype=jnp.float16),),
+        rtol=1e-05 / jnp.finfo(jnp.float32).eps * jnp.finfo(jnp.float16).eps
+    )
 
 
 def test_is_finite():
@@ -261,6 +266,19 @@ def test_gather():
     dimension_numbers = GatherDimensionNumbers(
         offset_dims=(0,),
         collapsed_slice_dims=(0,),
+        start_index_map=(0,)
+    )
+    run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
+
+    operand = jnp.reshape(jnp.arange(50), (10, 5))
+    start_indices = jnp.array([
+        [[3], [1], [7]],
+        [[4], [0], [9]]
+    ], dtype=jnp.int32)  # shape (2, 3, 1)
+
+    dimension_numbers = GatherDimensionNumbers(
+        offset_dims=(2, 3),
+        collapsed_slice_dims=(),
         start_index_map=(0,)
     )
     run_and_compare_specific_input(wrapped_gather(dimension_numbers, (1, 5)), (operand, start_indices))
