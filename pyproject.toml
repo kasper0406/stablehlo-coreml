@@ -77,6 +77,12 @@ extra-dependencies = [
     "transformers>=5.3.0",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+addopts = "-m 'not slow'"
+
 [project.urls]
 Homepage = "https://github.com/kasper0406/stablehlo-coreml"
 Issues = "https://github.com/kasper0406/stablehlo-coreml/issues"
