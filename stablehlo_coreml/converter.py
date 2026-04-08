@@ -40,6 +40,30 @@ from typing import List, Optional
 from functools import partial, reduce
 
 
+# Optional streaming quantization hook.  When set to a callable, it is
+# invoked inside op_constant for every constant tensor materialized during
+# hlo_to_mil conversion.
+#
+# Signature: hook(array: np.ndarray, name: str) -> coremltools MIL Var or None
+#   - If the hook returns a Var, that Var is stored in the translation context
+#     as the result of the HLO constant op and the fp16 numpy array is freed.
+#   - If the hook returns None, the default mb.const(val=array) path is used.
+#
+# This lets export.py quantize large weight tensors to int8 during conversion
+# so that the MIL program is built directly with ~4.5 GB of int8 ops instead
+# of first building a 9.27 GB fp16 program and then running a separate pass.
+# Peak memory drops from ~23 GB (fp16 accumulated + int8 being built) to ~14 GB
+# (13 GB mlirbc + 4.4 GB int8 + at most one 42 MB fp16 tensor at a time).
+_constant_quantizer = None
+
+
+def _attr_str(attr) -> str:
+    """Return the Python str from either a plain str or an ir.Attribute with .value."""
+    if isinstance(attr, str):
+        return attr
+    return attr.value
+
+
 def convert(module, minimum_deployment_target: AvailableTarget):
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
@@ -89,10 +113,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Build function index to resolve/inline HLO function calls
         for func in module.body:
-            self.func_index[func.name.value] = func
+            self.func_index[_attr_str(func.name)] = func
 
         for func in module.body:
-            if func.sym_visibility is None or "public" == func.sym_visibility.value:
+            if func.sym_visibility is None or "public" == _attr_str(func.sym_visibility):
                 self.build_func(func)
 
         return self.prog
@@ -115,7 +139,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 context.add_variable(name, ssa_func.inputs[name])
 
             ssa_func.set_outputs(self.process_block(context, hlo_func.body.blocks[0]))
-            self.prog.add_function(hlo_func.name.value, ssa_func)
+            self.prog.add_function(_attr_str(hlo_func.name), ssa_func)
 
     def process_block(self, context: TranslationContext, block: ir.Block):
         outputs = None
@@ -137,8 +161,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         for arg in op.operands:
             context_args.append(context[arg.get_name()])
 
-        func_name = op.callee.value
-        hlo_func = self.func_index[op.callee.value]
+        func_name = _attr_str(op.callee)
+        hlo_func = self.func_index[_attr_str(op.callee)]
         params = hlo_func.arguments
         outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
 
@@ -151,7 +175,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Dispatch to a named handler if one is registered for this composite op.
         # Named handlers can map directly to CoreML primitives, which is preferable
         # when the decomposition uses features that are not supported.
-        composite_name = op.name.value
+        composite_name = _attr_str(op.name)
         handler = self._composite_ops_registry.get(composite_name)
         if handler is not None:
             return handler(self, context, op)
@@ -159,7 +183,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # Default: inline the decomposition function.
         context_args = [context[arg.get_name()] for arg in op.inputs]
 
-        func_name = op.decomposition.value
+        func_name = _attr_str(op.decomposition)
         hlo_func = self.func_index[func_name]
         params = hlo_func.arguments
         outputs = self.invoke_hlo_function(context, func_name, params, hlo_func.body, context_args)
@@ -393,6 +417,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def op_constant(self, context: TranslationContext, op: ConstantOp):
         constant = np.array(op.value)
         constant = np.reshape(constant, op.result.type.shape)
+        if _constant_quantizer is not None:
+            result = _constant_quantizer(constant, op.result.get_name())
+            if result is not None:
+                # Drop the fp16 ref immediately — the int8 constexpr var owns
+                # the data from here on.  This is the streaming memory saving:
+                # at most one 42 MB fp16 tensor live at a time instead of all
+                # 317 (9.27 GB) accumulating in the MIL program.
+                del constant
+                context.add_result(op.result, result)
+                return
         context.add_result(op.result, mb.const(val=constant))
 
     @register_stablehlo_op
