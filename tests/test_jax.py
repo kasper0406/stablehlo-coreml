@@ -112,6 +112,29 @@ def test_simple_reductions():
     compare_and_ensure_no_loops(partial(jnp.prod, axis=1), (jnp.zeros((2, 3, 4)),))
 
 
+def test_boolean_reductions():
+    def compare_and_ensure_no_loops(jax_func, input_spec):
+        cml_model = run_and_compare(jax_func, input_spec)
+        assert "while_loop" not in get_model_instruction_types(cml_model)
+
+    bool_2d = jnp.zeros((4, 6), dtype=jnp.bool_)
+    bool_3d = jnp.zeros((2, 3, 4), dtype=jnp.bool_)
+
+    # any (OrOp reduction)
+    compare_and_ensure_no_loops(partial(jnp.any, axis=0), (bool_2d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=1), (bool_2d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=1), (bool_3d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=(0, 2)), (bool_3d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=1, keepdims=True), (bool_3d,))
+
+    # all (AndOp reduction)
+    compare_and_ensure_no_loops(partial(jnp.all, axis=0), (bool_2d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=1), (bool_2d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=1), (bool_3d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=(0, 2)), (bool_3d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=1, keepdims=True), (bool_3d,))
+
+
 def test_reduce_window():
     def compare_and_ensure_no_loops(jax_func, input_spec):
         cml_model = run_and_compare(jax_func, input_spec)
