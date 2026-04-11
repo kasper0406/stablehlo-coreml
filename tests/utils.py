@@ -108,6 +108,7 @@ def run_and_compare_hlo_module(
     max_complexity: int = 10_000,
     atol=1e-04,
     rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
 ):
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
     program_complexity = _count_program_complexity(mil_program)
@@ -129,7 +130,7 @@ def run_and_compare_hlo_module(
         source="milinternal",
         minimum_deployment_target=ct.target.iOS18,
         pass_pipeline=pipeline,
-        compute_units=ct.ComputeUnit.CPU_ONLY,
+        compute_units=compute_units,
     )
 
     # Generate random inputs that matches cml_model input spec
@@ -157,6 +158,7 @@ def run_and_compare_specific_input(
     max_complexity: int = 10_000,
     atol=1e-04,
     rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
 ):
     """
     Converts the given `jax_func` to a CoreML model.
@@ -174,7 +176,15 @@ def run_and_compare_specific_input(
     jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, flatten(inputs))
     expected_output = jax_func(*jax_input_values)
 
-    return run_and_compare_hlo_module(hlo_module, inputs, expected_output, max_complexity=max_complexity, atol=atol, rtol=rtol)
+    return run_and_compare_hlo_module(
+        hlo_module,
+        inputs,
+        expected_output,
+        max_complexity=max_complexity,
+        atol=atol,
+        rtol=rtol,
+        compute_units=compute_units,
+    )
 
 
 def run_and_compare(
@@ -183,6 +193,7 @@ def run_and_compare(
     max_complexity: int = 10_000,
     atol=1e-04,
     rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
 ):
     """
     Converts the given `jax_func` to a CoreML model.
@@ -198,7 +209,14 @@ def run_and_compare(
         flat_inputs.append(input_value)
 
     inputs = __nest_flat_jax_input_to_input_spec(input_specification, flat_inputs)
-    return run_and_compare_specific_input(jax_func, inputs, max_complexity=max_complexity, atol=atol, rtol=rtol)
+    return run_and_compare_specific_input(
+        jax_func,
+        inputs,
+        max_complexity=max_complexity,
+        atol=atol,
+        rtol=rtol,
+        compute_units=compute_units,
+    )
 
 
 def get_model_instruction_types(cml_model) -> List[str]:

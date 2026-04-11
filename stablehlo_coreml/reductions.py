@@ -3,7 +3,7 @@ from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 import numpy as np
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, MulOp, MinOp, MaxOp, ReturnOp, SubtractOp, DivOp
+    AddOp, MulOp, MinOp, MaxOp, OrOp, AndOp, ReturnOp, SubtractOp, DivOp
 )
 
 from .utils import (
@@ -39,6 +39,8 @@ def match_computation(hlo_body):
         MulOp: (mb.reduce_prod, mb.mul, "mul"),
         SubtractOp: (None, mb.sub, "sub"),
         DivOp: (None, mb.real_div, "div"),
+        OrOp: (None, mb.logical_or, "or"),
+        AndOp: (None, mb.logical_and, "and"),
     }
 
     for generic_reduce_op_type, mil_equivalents in simple_matches.items():
@@ -125,10 +127,23 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
 
 
 def compute_reduction(converter, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
-    mil_reduction, mil_single_reduction, _ = match_computation(body)
+    mil_reduction, mil_single_reduction, mode = match_computation(body)
     if mil_reduction and mil_single_reduction and len(inputs) == 1:
         res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
         # Handle initial value
+        res = mil_single_reduction(x=res, y=init_values[0])
+        return [res]
+
+    # Boolean Or/And: MIL has no reduce_or/reduce_and, so lower via
+    # cast(bool→int32) → reduce_max/reduce_min → cast(→bool) → logical combine.
+    if mode in ("or", "and") and len(inputs) == 1 and types.is_bool(inputs[0].dtype):
+        axes = np.array(dimensions, dtype=np.int32)
+        x_int = mb.cast(x=inputs[0], dtype="int32")
+        if mode == "or":
+            res = mb.reduce_max(x=x_int, axes=axes)
+        else:
+            res = mb.reduce_min(x=x_int, axes=axes)
+        res = mb.cast(x=res, dtype="bool")
         res = mil_single_reduction(x=res, y=init_values[0])
         return [res]
 

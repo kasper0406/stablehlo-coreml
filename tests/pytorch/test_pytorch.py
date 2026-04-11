@@ -2,6 +2,7 @@ import pytest
 
 import jax
 import numpy as np
+import coremltools as ct
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 
@@ -80,7 +81,7 @@ def _filter_unused_inputs(jaxpr, inputs):
     return [inputs[i].detach().numpy() for i in used_input_indices]
 
 
-def evaluate_pytorch_model(model, inputs):
+def evaluate_pytorch_model(model, inputs, compute_units=ct.ComputeUnit.CPU_ONLY):
     hlo_module, module_inputs = export_to_stablehlo_module(model, inputs)
 
     model_outputs = model(*inputs)
@@ -110,7 +111,15 @@ def evaluate_pytorch_model(model, inputs):
                              "This likely means the model has uninitialized weights")
 
     # These models are quite big, so tolerances are relaxed
-    run_and_compare_hlo_module(hlo_module, module_inputs, expected_outputs, max_complexity=50_000, atol=5e-01, rtol=5e-02)
+    run_and_compare_hlo_module(
+        hlo_module,
+        module_inputs,
+        expected_outputs,
+        max_complexity=50_000,
+        atol=5e-01,
+        rtol=5e-02,
+        compute_units=compute_units,
+    )
 
 
 # ==============================================================================
@@ -240,7 +249,12 @@ def test_whisper_tiny():
     attention_mask = torch.ones((1, 3000))
 
     # Whisper forward: (input_features, attention_mask, decoder_input_ids, ...)
-    evaluate_pytorch_model(model, (input_features, attention_mask, decoder_input_ids))
+    # Temporary workaround: Whisper hits a CoreML CPU backend bug, so allow all compute units.
+    evaluate_pytorch_model(
+        model,
+        (input_features, attention_mask, decoder_input_ids),
+        compute_units=ct.ComputeUnit.ALL,
+    )
 
 
 # ==============================================================================
