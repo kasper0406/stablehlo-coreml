@@ -136,12 +136,7 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
 
     # Boolean Or/And: MIL has no reduce_or/reduce_and, so lower via
     # cast(bool→int32) → reduce_max/reduce_min → cast(→bool) → logical combine.
-    # Skip this fast path when the input is a compile-time constant, because
-    # the explicit ops propagate constness into downstream operations, causing
-    # the MIL const_elimination pass to aggressively fold large subgraphs.
-    # The while-loop fallback naturally breaks this const chain.
-    if mode in ("or", "and") and len(inputs) == 1 and types.is_bool(inputs[0].dtype) \
-            and not inputs[0].can_be_folded_to_const():
+    if mode in ("or", "and") and len(inputs) == 1 and types.is_bool(inputs[0].dtype):
         axes = np.array(dimensions, dtype=np.int32)
         x_int = mb.cast(x=inputs[0], dtype="int32")
         if mode == "or":
