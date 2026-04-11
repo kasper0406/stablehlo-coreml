@@ -129,7 +129,7 @@ def run_and_compare_hlo_module(
         source="milinternal",
         minimum_deployment_target=ct.target.iOS18,
         pass_pipeline=pipeline,
-        compute_units=ct.ComputeUnit.CPU_ONLY,
+        compute_units=ct.ComputeUnit.ALL,
     )
 
     # Generate random inputs that matches cml_model input spec
