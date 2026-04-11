@@ -136,7 +136,7 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
 
     # Boolean Or/And: MIL has no reduce_or/reduce_and, so lower via
     # cast(bool→int32) → reduce_max/reduce_min → cast(→bool) → logical combine.
-    if mode in ("or", "and") and len(inputs) == 1:
+    if mode in ("or", "and") and len(inputs) == 1 and types.is_bool(inputs[0].dtype):
         axes = np.array(dimensions, dtype=np.int32)
         x_int = mb.cast(x=inputs[0], dtype="int32")
         if mode == "or":
