@@ -134,6 +134,16 @@ def test_boolean_reductions():
     compare_and_ensure_no_loops(partial(jnp.all, axis=(0, 2)), (bool_3d,))
     compare_and_ensure_no_loops(partial(jnp.all, axis=1, keepdims=True), (bool_3d,))
 
+    # any/all on integer inputs: JAX auto-casts to bool before reduction, so
+    # the underlying OrOp/AndOp reduction is still on boolean tensors.
+    int_2d = jnp.array([[1, 0, 3], [0, 2, 0]], dtype=jnp.int32)
+    int_3d = jnp.array([[[1, 0], [0, 4]], [[0, 0], [2, 3]]], dtype=jnp.int32)
+    compare_and_ensure_no_loops(partial(jnp.any, axis=0), (int_2d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=1), (int_2d,))
+    compare_and_ensure_no_loops(partial(jnp.any, axis=0), (int_3d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=0), (int_2d,))
+    compare_and_ensure_no_loops(partial(jnp.all, axis=1), (int_3d,))
+
 
 def test_reduce_window():
     def compare_and_ensure_no_loops(jax_func, input_spec):
