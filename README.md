@@ -1,18 +1,31 @@
-# Convert StableHLO models into Apple Core ML format
+# stablehlo-coreml
 
-**This repo is currently experimental!**
+Convert [StableHLO](https://github.com/openxla/stablehlo) models into Apple Core ML format.
 
-Only a subset of the StableHLO operations have been implemented, and some of them may have restrictions.
+StableHLO is the portability layer used by ML frameworks like [JAX](https://github.com/jax-ml/jax) and [PyTorch](https://pytorch.org/). This library converts StableHLO programs into Apple's [Core ML](https://developer.apple.com/documentation/coreml) format via [coremltools](https://github.com/apple/coremltools), enabling deployment on Apple hardware (iOS, macOS, etc.).
 
-Due to the current _dot_general_ op implementation, it is only possible to target iOS >= 18.
+## Installation
 
-Look in the `tests` directory, to see what has currently been tested.
+```bash
+pip install stablehlo-coreml
+```
 
-The package is published to PyPi as `stablehlo-coreml-experimental`.
+Requires Python 3.9+ and targets iOS/macOS 18+.
 
-## Converting a model
+## Supported Frameworks
 
-To convert a StableHLO module, do the following:
+Models can be exported from any framework that produces StableHLO:
+
+- **JAX / Flax / Equinox** — via `jax.export`
+- **PyTorch** — via [torchax](https://github.com/google/torchax) to trace the model into JAX, then `jax.export` to StableHLO
+
+The test suite validates against a broad set of models, including full HuggingFace Transformers such as TinyLlama, T5, DistilBERT, GPT-2, BERT, and Whisper, as well as vision models like ResNet, EfficientNet, ViT, ConvNeXt, and more.
+
+For a real-world example, see [gemma-coreml-chat](https://github.com/kasper0406/gemma-coreml-chat), which exports Google's Gemma 4 model to Core ML using this library.
+
+## Converting a Model
+
+To convert a StableHLO module:
 
 ```python
 import coremltools as ct
@@ -28,7 +41,7 @@ cml_model = ct.convert(
 )
 ```
 
-For a Jax project, the `hlo_module` can be obtained the following way:
+### Obtaining a StableHLO Module from JAX
 
 ```python
 import jax
@@ -47,7 +60,7 @@ jax_exported = export(jax.jit(jax_function))(*input_shapes)
 hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 ```
 
-For the Jax example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
+For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
 ## Dynamic / symbolic shapes
 
@@ -86,7 +99,17 @@ See `tests/test_symbolic_shapes.py` for additional examples.
 
 For additional examples see the `tests` directory.
 
-## Notes
-* `coremltools` supports up to python 3.13. Do not run hatch with a newer version.
-  Can be controlled using fx `export HATCH_PYTHON=python3.13`
+
+### Examples in the test suite
+
+The [`tests/`](tests/) directory has end-to-end export and conversion examples:
+
+- **PyTorch (torchax)** — [`tests/pytorch/test_pytorch.py`](tests/pytorch/test_pytorch.py): `export_to_stablehlo_module`, HuggingFace Transformers, and torchvision models.
+- **JAX** — [`tests/test_jax.py`](tests/test_jax.py)
+- **Flax / Equinox** — [`tests/test_flax.py`](tests/test_flax.py), [`tests/test_equinox.py`](tests/test_equinox.py)
+
+## Development
+
+* `coremltools` supports up to Python 3.13. Do not run hatch with a newer version.
+  Can be controlled using e.g. `export HATCH_PYTHON=python3.13`
 * Run tests using `hatch run test:pytest tests`
