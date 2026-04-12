@@ -1,12 +1,11 @@
+import coremltools as ct
+import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.testing_utils import (
     apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
-import coremltools as ct
-
-import numpy as np
 
 from stablehlo_coreml import register_optimizations
 

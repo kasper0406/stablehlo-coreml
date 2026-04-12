@@ -1,12 +1,11 @@
-import pytest
-
+import coremltools as ct
 import jax
 import numpy as np
-import coremltools as ct
-from jax._src.lib.mlir import ir
+import pytest
 from jax._src.interpreters import mlir as jax_mlir
+from jax._src.lib.mlir import ir
 
-from tests.utils import run_and_compare_hlo_module, flatten
+from tests.utils import flatten, run_and_compare_hlo_module
 
 torch = pytest.importorskip("torch")
 torchvision = pytest.importorskip("torchvision")
@@ -127,7 +126,7 @@ def evaluate_pytorch_model(model, inputs, compute_units=ct.ComputeUnit.CPU_ONLY)
 # ==============================================================================
 
 def test_tinyllama():
-    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -151,7 +150,7 @@ def test_tinyllama():
 
 
 def test_t5_small():
-    from transformers import AutoTokenizer, T5Model, AutoConfig
+    from transformers import AutoConfig, AutoTokenizer, T5Model
 
     # Use AutoTokenizer which might fallback to fast tokenizer (no sentencepiece needed if available)
     tokenizer = AutoTokenizer.from_pretrained("t5-small")
@@ -175,7 +174,7 @@ def test_t5_small():
 
 
 def test_distilbert():
-    from transformers import AutoModel, AutoTokenizer, AutoConfig
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
 
     model_name = "distilbert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -191,7 +190,7 @@ def test_distilbert():
 
 
 def test_gpt2():
-    from transformers import AutoModel, AutoTokenizer, AutoConfig
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
 
     model_name = "gpt2"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -207,7 +206,7 @@ def test_gpt2():
 
 
 def test_bert():
-    from transformers import AutoModel, AutoTokenizer, AutoConfig
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
 
     model_name = "bert-base-uncased"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -227,8 +226,8 @@ def test_bert():
 # ==============================================================================
 
 def test_whisper_tiny():
-    from transformers import AutoModelForSpeechSeq2Seq, AutoConfig
     import torch
+    from transformers import AutoConfig, AutoModelForSpeechSeq2Seq
 
     model_name = "openai/whisper-tiny"
     config = AutoConfig.from_pretrained(model_name)

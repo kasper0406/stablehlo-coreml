@@ -1,6 +1,7 @@
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-from .utils import get_mil_type, dtype_str
+
+from .utils import dtype_str, get_mil_type
 
 
 def pad_with_cast(x, pad, mode="constant", constant_val=None):

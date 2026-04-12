@@ -1,12 +1,11 @@
-import jax
-from flax import nnx
-import jax.numpy as jnp
-
-from tests.utils import run_and_compare, run_and_compare_specific_input
-
-from tests.flax_blocks import ResidualConv, Encoder, UNet
-
 from functools import partial
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from tests.flax_blocks import Encoder, ResidualConv, UNet
+from tests.utils import run_and_compare, run_and_compare_specific_input
 
 
 def test_flax_nnx_linear():

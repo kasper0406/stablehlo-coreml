@@ -1,16 +1,11 @@
+import numpy as np
 from coremltools import _logger as logger
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-import numpy as np
-from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, MulOp, MinOp, MaxOp, OrOp, AndOp, ReturnOp, SubtractOp, DivOp
-)
+from jaxlib.mlir.dialects.stablehlo import AddOp, AndOp, DivOp, MaxOp, MinOp, MulOp, OrOp, ReturnOp, SubtractOp
 
-from .utils import (
-    index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
-    get_numpy_type, dtype_str
-)
 from .translation_context import TranslationContext
+from .utils import dtype_str, get_numpy_type, index_by_slices, iterate_indexes_in_shapes, update_tensor_by_slice
 
 
 def match_computation(hlo_body):

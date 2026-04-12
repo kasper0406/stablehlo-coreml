@@ -1,9 +1,10 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
-from functools import partial
 import pytest
 
-from tests.utils import run_and_compare, run_and_compare_specific_input, get_model_instruction_types
+from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_specific_input
 
 
 def test_addition():
@@ -72,10 +73,10 @@ def test_tensor_multiplication():
     def full_tensor_product_4_1(lhs, rhs):
         return jnp.einsum("abcd,i->abcdi", lhs, rhs)
 
-    run_and_compare(scalar_product, (jnp.zeros((1)), jnp.zeros((1))))
-    run_and_compare(scalar_with_vector, (jnp.zeros((1)), jnp.zeros((5))))
-    run_and_compare(scalar_with_matrix, (jnp.zeros((1)), jnp.zeros((5, 3))))
-    run_and_compare(vector_with_matrix, (jnp.zeros((5)), jnp.zeros((5, 3))))
+    run_and_compare(scalar_product, (jnp.zeros(1), jnp.zeros(1)))
+    run_and_compare(scalar_with_vector, (jnp.zeros(1), jnp.zeros(5)))
+    run_and_compare(scalar_with_matrix, (jnp.zeros(1), jnp.zeros((5, 3))))
+    run_and_compare(vector_with_matrix, (jnp.zeros(5), jnp.zeros((5, 3))))
     run_and_compare(matrix_multiplication, (jnp.zeros((3, 4)), jnp.zeros((4, 5))))
     run_and_compare(outer_product_with_single_batch_dim, (jnp.zeros((2, 3, 4)), jnp.zeros((2, 4, 5))))
     run_and_compare(single_contraction_single_batch, (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 2, 5))))
@@ -90,8 +91,8 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product_1_4, (jnp.zeros((2,)), jnp.zeros((2, 2, 2, 3))))
     run_and_compare(full_tensor_product_3_2, (jnp.zeros((20, 10, 3)), jnp.zeros((15, 3))))
     run_and_compare(full_tensor_product_3_2, (jnp.zeros((2, 2, 3)), jnp.zeros((2, 3))))
-    run_and_compare(full_tensor_product_4_1, (jnp.zeros(((15, 20, 5, 3))), jnp.zeros((10,))))
-    run_and_compare(full_tensor_product_4_1, (jnp.zeros(((2, 2, 2, 3))), jnp.zeros((2,))))
+    run_and_compare(full_tensor_product_4_1, (jnp.zeros((15, 20, 5, 3)), jnp.zeros((10,))))
+    run_and_compare(full_tensor_product_4_1, (jnp.zeros((2, 2, 2, 3)), jnp.zeros((2,))))
 
 
 def test_simple_reductions():
@@ -844,17 +845,17 @@ def test_multikey_sort_fails_due_to_stability():
 
     k1 = jnp.array([1, 3, 2, 4], dtype=jnp.int32)
     k2 = jnp.array([3, 1, 2, 4], dtype=jnp.int32)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1 = jnp.array([1, 5, 1, 4, 3, 4, 4], dtype=jnp.int32)
     k2 = jnp.array([9, 4, 0, 4, 0, 2, 1], dtype=jnp.int32)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1 = jnp.array([1, 3, 1, 4, 3, 5, 4], dtype=jnp.int32)
     k2 = jnp.array([0, 4, 0, 4, 0, -21, -12], dtype=jnp.int32)
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare_specific_input(sort_dim_0, (k1, k2))
 
     k1_2d = jnp.array([[1, 2], [3, 4]], dtype=jnp.int32)
@@ -863,16 +864,16 @@ def test_multikey_sort_fails_due_to_stability():
     def sort_dim_1(k1, k2):
         return jax.lax.sort([k1, k2], dimension=1, num_keys=2)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare_specific_input(sort_dim_1, (k1_2d, k2_2d))
 
     # Larger random inputs
     def sort_dim_0_large(k1, k2):
         return jax.lax.sort([k1, k2], dimension=0, num_keys=2)
 
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.int32), jnp.zeros((100, 50), dtype=jnp.int32)))
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         run_and_compare(sort_dim_0_large, (jnp.zeros((100, 50), dtype=jnp.float32), jnp.zeros((100, 50), dtype=jnp.float32)))
 
 
@@ -1047,7 +1048,7 @@ def test_while_loop_scalar():
 
 
 def test_neg_unsigned_int():
-    with pytest.raises(ValueError, match="CoreML does not support negation.*unsigned integer type"):
+    with pytest.raises(ValueError, match=r"CoreML does not support negation.*unsigned integer type"):
         run_and_compare(jnp.negative, (jnp.array([1, 2, 3], dtype=jnp.uint32),))
 
 
