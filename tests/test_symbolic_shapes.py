@@ -266,6 +266,7 @@ def test_validate_shapes_dynamic_sentinel():
         def __init__(self, shape, name):
             self.type = FakeType(shape)
             self._name = name
+
         def get_name(self):
             return self._name
 
