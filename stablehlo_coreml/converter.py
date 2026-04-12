@@ -31,6 +31,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
     ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
+    GetDimensionSizeOp, DynamicIotaOp, DynamicBroadcastInDimOp,
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -97,14 +98,29 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         return self.prog
 
+    # Sentinel for dynamic dimensions in MLIR ShapedType
+    _DYNAMIC_DIM = -9223372036854775808  # ir.ShapedType.get_dynamic_size()
+
     def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
         func_inputs = {}
+        sym_counter = 0
         for arg in hlo_func.arguments:
             shape = arg.type.shape
             if shape == []:
                 shape = [1]
+            else:
+                # Replace dynamic dims with MIL Symbols for flexible shapes
+                from coremltools.converters.mil.mil import Symbol
+                new_shape = []
+                for d in shape:
+                    if d == self._DYNAMIC_DIM:
+                        new_shape.append(Symbol(f'dim_{sym_counter}'))
+                        sym_counter += 1
+                    else:
+                        new_shape.append(d)
+                shape = new_shape
 
             func_inputs[arg.get_name()] = mb.placeholder(
                 shape=shape, dtype=get_mil_type_from_ir(arg.type.element_type)
@@ -395,6 +411,88 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         constant = np.reshape(constant, op.result.type.shape)
         context.add_result(op.result, mb.const(val=constant))
 
+    def _dot_general_dynamic(self, lhs, rhs, lhs_rank, rhs_rank,
+                             lhs_contracting_dim, rhs_contracting_dim,
+                             lhs_batching_dim, rhs_batching_dim, op):
+        """Fast path for dot_general when the result has dynamic/symbolic dims.
+
+        Bypasses the fill+iterate+slice_update loop (which can't handle symbolic
+        shapes in mb.fill/mb.reshape) by computing a single matmul directly.
+
+        Requires that all non-last result dims are concrete size 1 (or empty),
+        ensuring the loop would execute exactly once.
+        """
+        from coremltools.converters.mil.mil import Symbol
+
+        lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
+        rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
+
+        # Verify single-iteration: all non-last result dims must be concrete size 1
+        lhs_non_last = [lhs.shape[d] for d in lhs_result_dim[:-1]] if lhs_result_dim else []
+        rhs_non_last = [rhs.shape[d] for d in rhs_result_dim[:-1]] if rhs_result_dim else []
+        for dims, side in [(lhs_non_last, "lhs"), (rhs_non_last, "rhs")]:
+            for d in dims:
+                if isinstance(d, Symbol) or d != 1:
+                    raise ValueError(
+                        f"Dynamic dot_general fast-path requires single iteration "
+                        f"(all non-last result dims must be 1), but {side} has {dims}"
+                    )
+
+        # Transpose to [batch..., result..., contract...]
+        lhs_perm = lhs_batching_dim + lhs_result_dim + lhs_contracting_dim
+        rhs_perm = rhs_batching_dim + rhs_result_dim + rhs_contracting_dim
+        t_lhs = lhs if lhs_perm == list(range(lhs_rank)) else mb.transpose(x=lhs, perm=lhs_perm)
+        t_rhs = rhs if rhs_perm == list(range(rhs_rank)) else mb.transpose(x=rhs, perm=rhs_perm)
+
+        n_batch = len(lhs_batching_dim)
+
+        # Total contraction element count (always concrete)
+        contracted_count = reduce(lambda a, b: int(a) * int(b),
+                                  [lhs.shape[d] for d in lhs_contracting_dim], 1)
+        batch_shape = tuple(int(lhs.shape[d]) for d in lhs_batching_dim)
+
+        # Build reshape targets: (batch..., last_result, contracted_count)
+        # Use -1 for symbolic dims so MIL infers them
+        def _build_target(result_dims, tensor):
+            if len(result_dims) > 0:
+                last = tensor.shape[result_dims[-1]]
+                d = -1 if isinstance(last, Symbol) else int(last)
+                return list(batch_shape) + [d, int(contracted_count)]
+            return list(batch_shape) + [1, int(contracted_count)]
+
+        lhs_target = _build_target(lhs_result_dim, lhs)
+        rhs_target = _build_target(rhs_result_dim, rhs)
+
+        c_lhs = mb.reshape(x=t_lhs, shape=lhs_target)
+        c_rhs = mb.reshape(x=t_rhs, shape=rhs_target)
+
+        # (..., M, K) × (..., N, K)^T = (..., M, N)
+        result = mb.matmul(x=c_lhs, y=c_rhs, transpose_y=True)
+
+        # Squeeze fake dims when a side has no result dims
+        if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
+            if len(result.shape) == len(batch_shape) + 2:
+                result = mb.squeeze(x=result, axes=[-2, -1])
+        elif len(lhs_result_dim) == 0:
+            result = mb.squeeze(x=result, axes=[n_batch])
+        elif len(rhs_result_dim) == 0:
+            result = mb.squeeze(x=result, axes=[-1])
+
+        # Re-expand non-last result dims (all size 1, were squeezed during reshape)
+        # Current shape: (batch..., M, N)
+        # Target:  (batch..., 1...1, M, 1...1, N)
+        if lhs_non_last or rhs_non_last:
+            axes = []
+            for i in range(len(lhs_non_last)):
+                axes.append(n_batch + i)
+            offset = n_batch + len(lhs_non_last) + (1 if lhs_result_dim else 0)
+            for i in range(len(rhs_non_last)):
+                axes.append(offset + i)
+            if axes:
+                result = mb.expand_dims(x=result, axes=axes)
+
+        return result
+
     @register_stablehlo_op
     def op_dot_general(self, context: TranslationContext, op: DotGeneralOp):
         # This roughly follows the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
@@ -410,6 +508,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
+
+        # Dynamic result dims: use fast path (no fill/iterate/slice_update)
+        if any(d == self._DYNAMIC_DIM for d in op.result.type.shape):
+            result = self._dot_general_dynamic(
+                lhs, rhs, lhs_rank, rhs_rank,
+                lhs_contracting_dim, rhs_contracting_dim,
+                lhs_batching_dim, rhs_batching_dim, op
+            )
+            context.add_result(op.result, result)
+            return
 
         def multiply(lst: List):
             return reduce(lambda a, b: int(a) * int(b), lst, 1)
@@ -647,6 +755,27 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             assert result_shape[result_dim] % current_shape == 0
             result_tiling[result_dim] = result_shape[result_dim] // current_shape
         x = mb.tile(x=x, reps=result_tiling)
+
+        context.add_result(op.result, x)
+
+    @register_stablehlo_op
+    def op_dynamic_broadcast_in_dim(self, context: TranslationContext, op: DynamicBroadcastInDimOp):
+        x = context[op.operand.get_name()]
+        broadcast_dims = [int(d) for d in op.broadcast_dimensions]
+        output_rank = len(op.result.type.shape)
+
+        if len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1):
+            # Scalar or (1,) input: expand to output rank with unit dims.
+            # MIL auto-broadcast in subsequent elementwise ops handles the rest.
+            if output_rank > 0:
+                x = mb.reshape(x=x, shape=[1] * output_rank)
+        else:
+            # Ranked input: insert unit dims at non-broadcast positions.
+            # Uses expand_dims (axis-based, no shape values) instead of reshape
+            # to handle inputs with symbolic dimensions.
+            axes_to_add = [d for d in range(output_rank) if d not in broadcast_dims]
+            if axes_to_add:
+                x = mb.expand_dims(x=x, axes=axes_to_add)
 
         context.add_result(op.result, x)
 
@@ -1147,6 +1276,42 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.add_result(op.result, res)
 
     @register_stablehlo_op
+    def op_get_dimension_size(self, context: TranslationContext, op: GetDimensionSizeOp):
+        x = context[op.operand.get_name()]
+        dim = int(op.dimension)
+        shape_tensor = mb.shape(x=x)
+        dim_size = mb.slice_by_index(
+            x=shape_tensor,
+            begin=[dim],
+            end=[dim + 1],
+            squeeze_mask=[True],
+        )
+        dim_size = mb.cast(x=dim_size, dtype="int32")
+        context.add_result(op.result, dim_size)
+
+    @register_stablehlo_op
+    def op_dynamic_iota(self, context: TranslationContext, op: DynamicIotaOp):
+        output_shape = context[op.output_shape.get_name()]
+        iota_dim = int(op.iota_dimension)
+        output_rank = len(op.result.type.shape)
+
+        if output_rank == 1 and iota_dim == 0:
+            # 1D case: range_1d(0, N, 1)
+            dim_size = mb.squeeze(x=output_shape)
+            result = mb.range_1d(
+                start=np.int32(0),
+                end=dim_size,
+                step=np.int32(1),
+            )
+        else:
+            raise ValueError(
+                f"DynamicIotaOp with rank={output_rank}, iota_dim={iota_dim} "
+                f"is not yet supported (only 1D iota is implemented)"
+            )
+
+        context.add_result(op.result, result)
+
+    @register_stablehlo_op
     @auto_cast_bool(target_dtype="uint8")
     def op_gather(self, context: TranslationContext, op: GatherOp):
         """
@@ -1396,7 +1561,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_custom_call(self, context: TranslationContext, op: CustomCallOp):
-        raise ValueError(f"Custom call is not supported: {op.call_target_name}")
+        call_target = op.call_target_name.value
+        if call_target == "shape_assertion":
+            # JAX symbolic export emits these for runtime dim validation.
+            # Safe to skip — constraints are checked at export time.
+            return
+        raise ValueError(f"Custom call is not supported: {call_target}")
 
     def invoke_hlo_function(self, context: TranslationContext, func_name: str, hlo_params, hlo_func_body, cml_args):
         # Enter variable context for the function call

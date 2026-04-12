@@ -47,6 +47,17 @@ class TranslationContext:
             if hlo_shape == mil_shape:
                 return True
 
+            # Allow dynamic dims: HLO uses a large negative sentinel for '?',
+            # MIL uses Symbol or concrete 1 (broadcastable). Accept any MIL dim
+            # when HLO dim is dynamic.
+            _DYNAMIC = -9223372036854775808
+            if len(hlo_shape) == len(mil_shape):
+                if all(
+                    h == m or h == _DYNAMIC
+                    for h, m in zip(hlo_shape, mil_shape)
+                ):
+                    return True
+
             raise ValueError(f"The HLO result shape `{hlo_shape}` is different from the actual MIL result shape `{mil_shape}`")
 
         hlo_shape = tuple(hlo_result.type.shape)
