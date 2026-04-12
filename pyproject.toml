@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "stablehlo-coreml-experimental"
+name = "stablehlo-coreml"
 dynamic = ["version"]
 authors = [
     { name="Kasper Nielsen", email="kasper0406@gmail.com" },
@@ -11,7 +11,7 @@ authors = [
 description = "Convert StableHLO models into Apple Core ML format"
 readme = "README.md"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "License :: OSI Approved :: MIT License",
     "Intended Audience :: Developers",
     "Intended Audience :: End Users/Desktop",
@@ -38,7 +38,6 @@ dependencies = [
 path = "stablehlo_coreml/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-# This setting is needed as long as we publish with the `_experimental` suffix
 packages = ["stablehlo_coreml"]
 
 [[tool.hatch.envs.test.matrix]]
