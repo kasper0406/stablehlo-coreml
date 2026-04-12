@@ -13,6 +13,8 @@ import coremltools as ct
 from coremltools.converters.mil.testing_utils import compare_backend
 from coremltools.converters.mil.mil import Program, Block
 
+from coremltools.converters.mil.mil import Symbol
+
 from typing import List
 
 
@@ -234,3 +236,95 @@ def get_model_instruction_types(cml_model) -> List[str]:
     for func in mil_program.functions.values():
         all_ops += collect_ops(func.operations)
     return all_ops
+
+
+def run_and_compare_symbolic(
+    jax_func,
+    symbolic_input_specs,
+    test_shapes,
+    *,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+    range_dim_max=2048,  # upper bound for RangeDim on symbolic axes
+):
+    """
+    Export ``jax_func`` with symbolic (dynamic) shapes, convert to CoreML,
+    and validate at multiple concrete shapes against JAX reference outputs.
+
+    Parameters
+    ----------
+    jax_func : callable
+        The JAX function to export.
+    symbolic_input_specs : list of jax.ShapeDtypeStruct
+        Input specs with symbolic dimensions (from ``jax.export.symbolic_shape``).
+    test_shapes : list of tuples
+        Each entry is a tuple of concrete input arrays to test with.
+    range_dim_max : int
+        Upper bound for RangeDim on symbolic dimensions.
+    """
+    jax_func = jax.jit(jax_func)
+    exported = _jax_export(jax_func)(*symbolic_input_specs)
+    context = jax_mlir.make_ir_context()
+    hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
+
+    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
+    program_complexity = _count_program_complexity(mil_program)
+    if program_complexity > max_complexity:
+        raise ValueError(
+            f"Generated a MIL program with complexity {program_complexity}, "
+            f"max allowed complexity is {max_complexity}"
+        )
+
+    # Build ct.TensorType inputs with RangeDim for symbolic dimensions
+    ct_inputs = []
+    for func in mil_program.functions.values():
+        for inp_name, inp in func.inputs.items():
+            ct_shape = []
+            for dim in inp.shape:
+                if isinstance(dim, Symbol):
+                    ct_shape.append(ct.RangeDim(1, range_dim_max, default=1))
+                else:
+                    ct_shape.append(int(dim))
+            ct_inputs.append(ct.TensorType(name=inp_name, shape=ct_shape))
+        break  # only first (main) function
+
+    pipeline = DEFAULT_HLO_PIPELINE
+    passes_to_remove = ['common::add_fp16_cast']
+    pipeline.remove_passes(passes_to_remove)
+
+    cml_model = ct.convert(
+        mil_program,
+        source="milinternal",
+        minimum_deployment_target=ct.target.iOS18,
+        pass_pipeline=pipeline,
+        compute_units=compute_units,
+        inputs=ct_inputs,
+    )
+
+    input_names = list(cml_model.input_description)
+    output_names = list(cml_model.output_description)
+
+    for concrete_inputs in test_shapes:
+        if not isinstance(concrete_inputs, (list, tuple)):
+            concrete_inputs = (concrete_inputs,)
+
+        expected_output = jax_func(*concrete_inputs)
+        if not isinstance(expected_output, (list, tuple)):
+            expected_output = (expected_output,)
+
+        cml_input_dict = {}
+        for name, val in zip(input_names, flatten(concrete_inputs)):
+            cml_input_dict[name] = np.asarray(val)
+
+        cml_expected = {}
+        for name, val in zip(output_names, flatten(expected_output)):
+            cml_expected[name] = np.asarray(val)
+
+        compare_backend(
+            cml_model, cml_input_dict, cml_expected,
+            atol=atol, rtol=rtol,
+        )
+
+    return cml_model
