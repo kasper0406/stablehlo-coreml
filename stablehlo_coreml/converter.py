@@ -1,43 +1,100 @@
+from functools import partial, reduce
+
+import numpy as np
 from coremltools import _logger as logger
 from coremltools.converters.mil import mil
+from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
-from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
-from .utils import (
-    index_by_slices, update_tensor_by_slice, iterate_indexes_in_shapes,
-    inverse_permutation, get_mil_type, dtype_str, get_mil_type_from_ir, get_numpy_type,
-    clamp_index, range_along_dim, auto_cast_bool, fix_scalar_tensor, safe_cast_to_int32
-)
-from .passes.utils import register_optimizations
-from .translation_context import TranslationContext
-from .ops_register import StableHloOpsRegistry, register_stablehlo_op, register_composite_op
-from .sort_utils import match_sort
-from .reductions import (
-    compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
-)
-from .padding import pad_with_cast
-
+from jax._src.lib.mlir.dialects import hlo
 from jaxlib.mlir import ir, passmanager
 from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
-from jaxlib.mlir.dialects.func import FuncOp, CallOp, ReturnOp as FuncReturnOp
+from jaxlib.mlir.dialects.func import CallOp, FuncOp
+from jaxlib.mlir.dialects.func import ReturnOp as FuncReturnOp
 from jaxlib.mlir.dialects.stablehlo import (
-    AddOp, SubtractOp, MulOp, DivOp, NegOp, SignOp, AbsOp, ExpOp, Expm1Op, LogOp,
-    Log1pOp, SqrtOp, ConstantOp, DotGeneralOp, ReshapeOp, BroadcastInDimOp, WhileOp,
-    CompareOp, ConvertOp, SelectOp, DynamicSliceOp, ReturnOp, ConvolutionOp, MinOp,
-    MaxOp, RsqrtOp, TanhOp, SineOp, CosineOp, TanOp, Atan2Op, ConcatenateOp, TransposeOp,
-    DynamicUpdateSliceOp, SliceOp, CustomCallOp, IotaOp, ReduceOp, ReduceWindowOp,
-    OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
-    ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
+    AbsOp,
+    AddOp,
+    AndOp,
+    Atan2Op,
+    BroadcastInDimOp,
+    CaseOp,
+    CeilOp,
+    ClampOp,
+    CompareOp,
+    CompositeOp,
+    ConcatenateOp,
+    ConstantOp,
+    ConvertOp,
+    ConvolutionOp,
+    CosineOp,
+    CustomCallOp,
+    DivOp,
+    DotGeneralOp,
+    DynamicSliceOp,
+    DynamicUpdateSliceOp,
+    Expm1Op,
+    ExpOp,
+    FloorOp,
+    GatherOp,
+    IotaOp,
+    IsFiniteOp,
+    Log1pOp,
+    LogOp,
+    MaxOp,
+    MinOp,
+    MulOp,
+    NegOp,
+    NotOp,
+    OrOp,
+    PadOp,
+    PowOp,
+    ReduceOp,
+    ReduceWindowOp,
+    RemOp,
+    ReshapeOp,
+    ReturnOp,
+    ReverseOp,
+    RoundOp,
+    RsqrtOp,
+    ScatterOp,
+    SelectOp,
+    SignOp,
+    SineOp,
+    SliceOp,
+    SortOp,
+    SqrtOp,
+    SubtractOp,
+    TanhOp,
+    TanOp,
+    TransposeOp,
+    WhileOp,
+    XorOp,
 )
-from jax._src.lib.mlir.dialects import hlo
 
-import numpy as np
-
-from typing import List, Optional
-from functools import partial, reduce
+from .ops_register import StableHloOpsRegistry, register_composite_op, register_stablehlo_op
+from .padding import pad_with_cast
+from .passes.utils import register_optimizations
+from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
+from .sort_utils import match_sort
+from .translation_context import TranslationContext
+from .utils import (
+    auto_cast_bool,
+    clamp_index,
+    dtype_str,
+    fix_scalar_tensor,
+    get_mil_type,
+    get_mil_type_from_ir,
+    get_numpy_type,
+    index_by_slices,
+    inverse_permutation,
+    iterate_indexes_in_shapes,
+    range_along_dim,
+    safe_cast_to_int32,
+    update_tensor_by_slice,
+)
 
 
 def convert(module, minimum_deployment_target: AvailableTarget):
@@ -79,7 +136,7 @@ def _normalize_module(module: ir.Module) -> None:
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 
-    def __init__(self, opset_version: Optional[int] = None):
+    def __init__(self, opset_version: int | None = None):
         self.opset_version = AvailableTarget(opset_version) if opset_version is not None else None
         self.prog = mil.Program()
         self.func_index = {}
@@ -92,7 +149,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             self.func_index[func.name.value] = func
 
         for func in module.body:
-            if func.sym_visibility is None or "public" == func.sym_visibility.value:
+            if func.sym_visibility is None or func.sym_visibility.value == "public":
                 self.build_func(func)
 
         return self.prog
@@ -111,7 +168,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             )
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
-            for name in func_inputs.keys():
+            for name in func_inputs:
                 context.add_variable(name, ssa_func.inputs[name])
 
             ssa_func.set_outputs(self.process_block(context, hlo_func.body.blocks[0]))
@@ -411,7 +468,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        def multiply(lst: List):
+        def multiply(lst: list):
             return reduce(lambda a, b: int(a) * int(b), lst, 1)
 
         def last_column_dot(lhs, rhs):

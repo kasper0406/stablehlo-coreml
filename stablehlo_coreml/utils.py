@@ -1,21 +1,20 @@
-from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.var import Var
-
-from dataclasses import dataclass
-from typing import List
-from functools import reduce, wraps
 import itertools
+from dataclasses import dataclass
+from functools import reduce, wraps
+
 import numpy as np
+from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.var import Var
 from jaxlib.mlir import ir
 
 
 @dataclass
 class ResolvedSliceSpec:
-    start_indices: List[int] | Var
-    end_indices: List[int] | Var
-    strides: List[int]
-    shape: List[int]
+    start_indices: list[int] | Var
+    end_indices: list[int] | Var
+    strides: list[int]
+    shape: list[int]
 
 
 def index_by_slices(tensor, slice_spec):
@@ -177,7 +176,7 @@ def _resolve_slice_spec(tensor, slice_spec) -> ResolvedSliceSpec:
     )
 
 
-def iterate_indexes_in_shapes(func, shapes: List, init_values: List, unroll_limit: int = 25):
+def iterate_indexes_in_shapes(func, shapes: list, init_values: list, unroll_limit: int = 25):
     """
     Given a list of `shapes`, fx [(3, 2, 3), (5, 2, 3)] this method will iterate
     the product of all valid indexes into the given shapes.

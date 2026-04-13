@@ -1,19 +1,16 @@
-import jax
-import jax.numpy as jnp
-from jax.export import export as _jax_export
-from jax._src.lib.mlir import ir
-from jax._src.interpreters import mlir as jax_mlir
-
-import numpy as np
-
-from stablehlo_coreml.converter import convert
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 
 import coremltools as ct
+import jax
+import jax.numpy as jnp
+import numpy as np
+from coremltools.converters.mil.mil import Block, Program
 from coremltools.converters.mil.testing_utils import compare_backend
-from coremltools.converters.mil.mil import Program, Block
+from jax._src.interpreters import mlir as jax_mlir
+from jax._src.lib.mlir import ir
+from jax.export import export as _jax_export
 
-from typing import List
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE
+from stablehlo_coreml.converter import convert
 
 
 def jax_export(jax_func, input_spec):
@@ -219,8 +216,8 @@ def run_and_compare(
     )
 
 
-def get_model_instruction_types(cml_model) -> List[str]:
-    def collect_ops(ops: List) -> List[str]:
+def get_model_instruction_types(cml_model) -> list[str]:
+    def collect_ops(ops: list) -> list[str]:
         collected_ops = []
         for op in ops:
             collected_ops.append(op.op_type)

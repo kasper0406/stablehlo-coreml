@@ -1,7 +1,6 @@
-from flax import nnx
-import jax.numpy as jnp
 
-from typing import List
+import jax.numpy as jnp
+from flax import nnx
 
 
 class ResidualConv(nnx.Module):
@@ -57,7 +56,7 @@ class ResidualConv(nnx.Module):
 
 
 class Encoder(nnx.Module):
-    cnn_layers: List[ResidualConv]
+    cnn_layers: list[ResidualConv]
     normalization: nnx.Module
 
     def __init__(self, num_layers: int, rngs: nnx.Rngs):
@@ -90,8 +89,8 @@ class Encoder(nnx.Module):
 
 
 class Decoder(nnx.Module):
-    cnn_layers: List[ResidualConv]
-    residual_norm_layers: List[nnx.Module]
+    cnn_layers: list[ResidualConv]
+    residual_norm_layers: list[nnx.Module]
     output_polling: nnx.Conv
 
     def __init__(self, num_layers: int, rngs: nnx.Rngs):
