@@ -97,8 +97,6 @@ cml_model = ct.convert(
 
 See `tests/test_symbolic_shapes.py` for additional examples.
 
-For additional examples see the `tests` directory.
-
 
 ### Examples in the test suite
 

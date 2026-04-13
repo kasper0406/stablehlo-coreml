@@ -4,6 +4,7 @@ from jax.export import export as _jax_export
 from jax._src.lib.mlir import ir
 from jax._src.interpreters import mlir as jax_mlir
 
+import copy
 import numpy as np
 
 from stablehlo_coreml.converter import convert
@@ -125,6 +126,7 @@ def run_and_compare_hlo_module(
     passes_to_remove = [
          'common::add_fp16_cast'
     ]
+    pipeline = copy.deepcopy(pipeline)
     pipeline.remove_passes(passes_to_remove)
 
     cml_model = ct.convert(
@@ -292,6 +294,7 @@ def run_and_compare_symbolic(
 
     pipeline = DEFAULT_HLO_PIPELINE
     passes_to_remove = ['common::add_fp16_cast']
+    pipeline = copy.deepcopy(pipeline)
     pipeline.remove_passes(passes_to_remove)
 
     cml_model = ct.convert(

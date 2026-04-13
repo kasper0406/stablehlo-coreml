@@ -38,6 +38,9 @@ from jax._src.lib.mlir.dialects import hlo
 
 import numpy as np
 
+from coremltools.converters.mil.mil import Symbol
+import sympy
+
 from typing import List, Optional
 from functools import partial, reduce
 
@@ -113,7 +116,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 shape = [1]
             else:
                 # Replace dynamic dims with MIL Symbols for flexible shapes
-                from coremltools.converters.mil.mil import Symbol
                 new_shape = []
                 for d in shape:
                     if d == self._DYNAMIC_DIM:
@@ -423,9 +425,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         Requires that all non-last result dims are concrete size 1 (or empty),
         ensuring the loop would execute exactly once.
         """
-        from coremltools.converters.mil.mil import Symbol
-        import sympy
-
         def _is_symbolic(dim):
             return isinstance(dim, (Symbol, sympy.Basic)) and not isinstance(dim, (int, float))
 
@@ -773,6 +772,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_dynamic_reshape(self, context: TranslationContext, op: DynamicReshapeOp):
+        """Reshape where the target shape is a runtime tensor."""
         x = context[op.operand.get_name()]
         shape = context[op.output_shape.get_name()]
         reshape_res = mb.reshape(x=x, shape=shape)
@@ -812,6 +812,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_dynamic_broadcast_in_dim(self, context: TranslationContext, op: DynamicBroadcastInDimOp):
+        """Broadcast with a runtime-determined output shape."""
         x = context[op.operand.get_name()]
         broadcast_dims = [int(d) for d in op.broadcast_dimensions]
         output_rank = len(op.result.type.shape)
@@ -848,7 +849,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if need_tile:
                 x = mb.tile(x=x, reps=reps)
 
-        context.add_variable(op.result.get_name(), x)
+        context.add_result(op.result, x)
 
     @register_stablehlo_op
     def op_while(self, context: TranslationContext, op: WhileOp):
@@ -1348,6 +1349,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_get_dimension_size(self, context: TranslationContext, op: GetDimensionSizeOp):
+        """Extract a single dimension's runtime size as a scalar i32 tensor."""
         x = context[op.operand.get_name()]
         dim = int(op.dimension)
         shape_tensor = mb.shape(x=x)
@@ -1362,6 +1364,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_dynamic_iota(self, context: TranslationContext, op: DynamicIotaOp):
+        """Iota with a runtime-determined output shape (1D only)."""
         output_shape = context[op.output_shape.get_name()]
         iota_dim = int(op.iota_dimension)
         output_rank = len(op.result.type.shape)

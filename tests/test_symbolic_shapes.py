@@ -322,3 +322,45 @@ def test_custom_call_unsupported_raises():
 
     with pytest.raises(ValueError, match="Custom call is not supported"):
         convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
+
+
+# ---------------------------------------------------------------------------
+# DynamicReshapeOp
+# ---------------------------------------------------------------------------
+
+def test_symbolic_reshape():
+    """Reshape with a runtime-computed output shape via DynamicReshapeOp."""
+    def f(x):
+        # Merges the symbolic dim with the static dim
+        return jnp.reshape(x, (x.shape[0] * 4,))
+
+    (n,) = _sym("n")
+    specs = [jax.ShapeDtypeStruct((n, 4), jnp.float32)]
+    test_shapes = [
+        (np.random.randn(1, 4).astype(np.float32),),
+        (np.random.randn(3, 4).astype(np.float32),),
+        (np.random.randn(8, 4).astype(np.float32),),
+    ]
+    run_and_compare_symbolic(f, specs, test_shapes)
+
+
+def test_symbolic_dynamic_iota_unsupported_raises():
+    """DynamicIotaOp with rank > 1 should raise ValueError."""
+    from jax._src.lib.mlir import ir
+    from jax._src.interpreters import mlir as jax_mlir
+    from stablehlo_coreml.converter import convert
+    import coremltools as ct
+
+    mlir_text = """
+    module {
+      func.func public @main(%arg0: tensor<2xi32>) -> tensor<2x3xi64> {
+        %0 = stablehlo.dynamic_iota %arg0, dim = 0 : (tensor<2xi32>) -> tensor<2x3xi64>
+        return %0 : tensor<2x3xi64>
+      }
+    }
+    """
+    context = jax_mlir.make_ir_context()
+    hlo_module = ir.Module.parse(mlir_text, context=context)
+
+    with pytest.raises(ValueError, match="DynamicIotaOp with rank=2.*is not yet supported"):
+        convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
