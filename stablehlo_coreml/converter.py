@@ -424,6 +424,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         ensuring the loop would execute exactly once.
         """
         from coremltools.converters.mil.mil import Symbol
+        import sympy
+
+        def _is_symbolic(dim):
+            return isinstance(dim, (Symbol, sympy.Basic)) and not isinstance(dim, (int, float))
 
         lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
         rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
@@ -433,7 +437,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         rhs_non_last = [rhs.shape[d] for d in rhs_result_dim[:-1]] if rhs_result_dim else []
         for dims, side in [(lhs_non_last, "lhs"), (rhs_non_last, "rhs")]:
             for d in dims:
-                if isinstance(d, Symbol) or d != 1:
+                if _is_symbolic(d) or d != 1:
                     raise ValueError(
                         f"Dynamic dot_general fast-path requires single iteration "
                         f"(all non-last result dims must be 1), but {side} has {dims}"
@@ -449,14 +453,14 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Check if contracting dimensions contain any symbolic dims
         contracting_shapes = [lhs.shape[d] for d in lhs_contracting_dim]
-        has_symbolic_contraction = any(isinstance(s, Symbol) for s in contracting_shapes)
+        has_symbolic_contraction = any(_is_symbolic(s) for s in contracting_shapes)
 
         if has_symbolic_contraction:
             contracted_count = -1  # let MIL infer
         else:
             contracted_count = reduce(lambda a, b: int(a) * int(b), contracting_shapes, 1)
 
-        batch_dims_symbolic = any(isinstance(lhs.shape[d], Symbol) for d in lhs_batching_dim)
+        batch_dims_symbolic = any(_is_symbolic(lhs.shape[d]) for d in lhs_batching_dim)
         if batch_dims_symbolic:
             raise ValueError(
                 "Dynamic dot_general fast-path does not support symbolic batch dims"
@@ -482,7 +486,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 # Last result dim in the transposed tensor is at n_batch + len - 1
                 last_pos = n_batch + len(result_dims) - 1
                 last = tensor.shape[last_pos]
-                if isinstance(last, Symbol):
+                if _is_symbolic(last):
                     if contracted_count == -1:
                         raise ValueError(
                             f"Dynamic dot_general: cannot reshape {side_name} — "
@@ -825,9 +829,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if axes_to_add:
                 x = mb.expand_dims(x=x, axes=axes_to_add)
 
-        # Bypass strict shape validation: the output is intentionally under-expanded
-        # (unit dims where the HLO expects concrete or dynamic sizes) because MIL
-        # auto-broadcast in subsequent elementwise ops will handle expansion at runtime.
+        # After expand_dims, x has the same rank as the output but unit dims
+        # where broadcast should happen. If a subsequent op is not elementwise
+        # (e.g. reshape), MIL auto-broadcast won't fire. Tile any static dims
+        # that need replication (input=1, output>1).
+        output_shape = op.result.type.shape
+        if len(x.shape) == len(output_shape):
+            reps = []
+            need_tile = False
+            for i, (in_dim, out_dim) in enumerate(zip(x.shape, output_shape)):
+                in_s = in_dim if isinstance(in_dim, int) else None
+                out_s = out_dim if isinstance(out_dim, int) else None
+                if in_s == 1 and out_s is not None and out_s > 1:
+                    reps.append(out_s)
+                    need_tile = True
+                else:
+                    reps.append(1)
+            if need_tile:
+                x = mb.tile(x=x, reps=reps)
+
         context.add_variable(op.result.get_name(), x)
 
     @register_stablehlo_op
