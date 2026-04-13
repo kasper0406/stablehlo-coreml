@@ -32,6 +32,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     OrOp, AndOp, XorOp, NotOp, ReverseOp, IsFiniteOp, GatherOp, PowOp, PadOp, RemOp,
     ScatterOp, FloorOp, CeilOp, SortOp, ClampOp, CaseOp, RoundOp, CompositeOp,
     GetDimensionSizeOp, DynamicIotaOp, DynamicBroadcastInDimOp,
+    DynamicReshapeOp,
 )
 from jax._src.lib.mlir.dialects import hlo
 
@@ -467,15 +468,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # no reshape is needed. This avoids the two-unknown-dims problem
         # when both the result dim and contraction dim are symbolic.
         def _needs_reshape(result_dims, contracting_dims):
-            return len(result_dims) > 1 or len(contracting_dims) > 1
+            # Reshape is needed when there isn't exactly 1 result dim and 1
+            # contraction dim, since the matmul expects (..., M, K) layout.
+            return len(result_dims) != 1 or len(contracting_dims) != 1
 
         def _reshape_to_3d(tensor, result_dims, contracting_dims, side_name):
             if not _needs_reshape(result_dims, contracting_dims):
                 return tensor
-            # Build reshape target: (batch..., last_result, contracted_count)
+            # After transpose the tensor is (batch..., result..., contract...).
+            # Reshape to (batch..., last_result, contracted_count).
             # Use -1 for symbolic dims so MIL infers them.
             if len(result_dims) > 0:
-                last = tensor.shape[result_dims[-1]]
+                # Last result dim in the transposed tensor is at n_batch + len - 1
+                last_pos = n_batch + len(result_dims) - 1
+                last = tensor.shape[last_pos]
                 if isinstance(last, Symbol):
                     if contracted_count == -1:
                         raise ValueError(
@@ -537,8 +543,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        # Dynamic result dims: use fast path (no fill/iterate/slice_update)
-        if any(d == self._DYNAMIC_DIM for d in op.result.type.shape):
+        # Dynamic dims: use fast path (no fill/iterate/slice_update)
+        # Triggered when result OR any operand has symbolic dimensions, since
+        # the iterate path creates slice indices from operand shapes.
+        has_dynamic = (
+            any(d == self._DYNAMIC_DIM for d in op.result.type.shape)
+            or any(d == self._DYNAMIC_DIM for d in op.lhs.type.shape)
+            or any(d == self._DYNAMIC_DIM for d in op.rhs.type.shape)
+        )
+        if has_dynamic:
             result = self._dot_general_dynamic(
                 lhs, rhs, lhs_rank, rhs_rank,
                 lhs_contracting_dim, rhs_contracting_dim,
@@ -752,6 +765,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             reshape_res = mb.squeeze(x=x)
         else:
             reshape_res = mb.reshape(x=x, shape=new_shape)
+        context.add_result(op.result, reshape_res)
+
+    @register_stablehlo_op
+    def op_dynamic_reshape(self, context: TranslationContext, op: DynamicReshapeOp):
+        x = context[op.operand.get_name()]
+        shape = context[op.output_shape.get_name()]
+        reshape_res = mb.reshape(x=x, shape=shape)
         context.add_result(op.result, reshape_res)
 
     @register_stablehlo_op
