@@ -1,9 +1,7 @@
 import numpy as np
-from jaxlib.mlir import ir
-from jaxlib.mlir.dialects.stablehlo import (
-    CompareOp, SelectOp, ConstantOp
-)
 from jax._src.lib.mlir.dialects import hlo
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects.stablehlo import CompareOp, ConstantOp, SelectOp
 
 
 def match_sort(comparator_root, args, inputs):
@@ -53,7 +51,7 @@ def match_sort(comparator_root, args, inputs):
             return None, None
 
         direction = hlo.ComparisonDirectionAttr(compare_op.comparison_direction).value
-        is_ascending = lhs < rhs and direction == "LT" or lhs > rhs and direction == "GT"
+        is_ascending = (lhs < rhs and direction == "LT") or (lhs > rhs and direction == "GT")
 
         return lhs // 2, is_ascending
 

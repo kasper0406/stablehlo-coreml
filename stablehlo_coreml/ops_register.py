@@ -45,7 +45,7 @@ class StableHloOpsRegistry(type):
 
         cls._stablehlo_ops_registry = {}
         cls._composite_ops_registry = {}
-        for name, method in clsdict.items():
+        for _name, method in clsdict.items():
             op_type = getattr(method, '_implements_hlo_op', False)
             if callable(method) and op_type:
                 if op_type in cls._stablehlo_ops_registry:
@@ -75,5 +75,5 @@ class StableHloOpsRegistry(type):
     def __call__(cls, *args, **kwargs):
         # Register the dispatch_op method
         instance = super().__call__(*args, **kwargs)
-        setattr(instance, 'dispatch_op', cls._dispatch_op)
+        instance.dispatch_op = cls._dispatch_op
         return instance

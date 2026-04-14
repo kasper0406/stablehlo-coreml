@@ -1,11 +1,11 @@
-import jax
-import jax.numpy as jnp
+from functools import partial
+
 import equinox as eqx
 import equinox.internal as eqxi
+import jax
+import jax.numpy as jnp
 
 from tests.utils import run_and_compare, run_and_compare_specific_input
-
-from functools import partial
 
 
 def run_and_compare_eqx_specific_input(model, inputs):
@@ -173,7 +173,7 @@ def test_rotary_attention():
         rope_embeddings: eqx.nn.RotaryPositionalEmbedding
 
         def __init__(self, key: jax.random.PRNGKey):
-            attention_key, rope_key = jax.random.split(key, 2)
+            attention_key, _rope_key = jax.random.split(key, 2)
             self.mha_attention = eqx.nn.MultiheadAttention(
                 num_heads=4,
                 query_size=24,

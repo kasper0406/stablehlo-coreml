@@ -1,8 +1,7 @@
+import numpy as np
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
-
-import numpy as np
 
 
 def _match_pattern(op):
