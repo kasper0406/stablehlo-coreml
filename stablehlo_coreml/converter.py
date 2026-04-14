@@ -563,7 +563,24 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             final_shape = [1]
 
         if list(result.shape) != final_shape:
-            result = mb.reshape(x=result, shape=final_shape)
+            if any(_is_symbolic(d) for d in final_shape):
+                # MIL reshape cannot accept symbolic values in a constant
+                # shape list.  Replace each symbolic dim with -1 (MIL
+                # supports at most one -1 per reshape call).
+                n_sym = sum(1 for d in final_shape if _is_symbolic(d))
+                if n_sym > 1:
+                    raise ValueError(
+                        f"dot_general: final reshape {final_shape} has "
+                        f"{n_sym} symbolic dims — MIL supports at most "
+                        f"one -1 per reshape."
+                    )
+                mil_shape = [
+                    int(d) if not _is_symbolic(d) else -1
+                    for d in final_shape
+                ]
+                result = mb.reshape(x=result, shape=mil_shape)
+            else:
+                result = mb.reshape(x=result, shape=final_shape)
 
         context.add_result(op.result, result)
 

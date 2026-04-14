@@ -145,6 +145,32 @@ def test_symbolic_einsum_batched():
     run_and_compare_symbolic(f, specs, test_shapes, atol=1e-3)
 
 
+def test_symbolic_einsum_multi_result_dims():
+    """Einsum with multiple result dims and one symbolic: bsd,dhk->bshk.
+
+    This is the pattern used by transformer QKV projections.  The dot_general
+    result has shape (b, s, h, k) where s is symbolic.  After the internal
+    matmul the final reshape must use -1 for the symbolic dim.
+    """
+    def f(x, w):
+        return jnp.einsum("bsd,dhk->bshk", x, w)
+
+    (seq,) = _sym("seq")
+    specs = [
+        jax.ShapeDtypeStruct((1, seq, 16), jnp.float32),
+        jax.ShapeDtypeStruct((16, 4, 8), jnp.float32),
+    ]
+    test_shapes = [
+        (np.random.randn(1, 1, 16).astype(np.float32),
+         np.random.randn(16, 4, 8).astype(np.float32)),
+        (np.random.randn(1, 7, 16).astype(np.float32),
+         np.random.randn(16, 4, 8).astype(np.float32)),
+        (np.random.randn(1, 32, 16).astype(np.float32),
+         np.random.randn(16, 4, 8).astype(np.float32)),
+    ]
+    run_and_compare_symbolic(f, specs, test_shapes, atol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # Dynamic iota (arange with symbolic length)
 # Exercises: DynamicIotaOp
