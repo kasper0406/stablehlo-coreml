@@ -471,126 +471,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         constant = np.reshape(constant, op.result.type.shape)
         context.add_result(op.result, mb.const(val=constant))
 
-    def _dot_general_dynamic(self, lhs, rhs, lhs_rank, rhs_rank,
-                             lhs_contracting_dim, rhs_contracting_dim,
-                             lhs_batching_dim, rhs_batching_dim, op):
-        """Fast path for dot_general when the result has dynamic/symbolic dims.
-
-        Bypasses the fill+iterate+slice_update loop (which can't handle symbolic
-        shapes in mb.fill/mb.reshape) by computing a single matmul directly.
-
-        Requires that all non-last result dims are concrete size 1 (or empty),
-        ensuring the loop would execute exactly once.
-        """
-        def _is_symbolic(dim):
-            return isinstance(dim, (Symbol, sympy.Basic)) and not isinstance(dim, (int, float))
-
-        lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
-        rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
-
-        # Verify single-iteration: all non-last result dims must be concrete size 1
-        lhs_non_last = [lhs.shape[d] for d in lhs_result_dim[:-1]] if lhs_result_dim else []
-        rhs_non_last = [rhs.shape[d] for d in rhs_result_dim[:-1]] if rhs_result_dim else []
-        for dims, side in [(lhs_non_last, "lhs"), (rhs_non_last, "rhs")]:
-            for d in dims:
-                if _is_symbolic(d) or d != 1:
-                    raise ValueError(
-                        f"Dynamic dot_general fast-path requires single iteration "
-                        f"(all non-last result dims must be 1), but {side} has {dims}"
-                    )
-
-        # Transpose to [batch..., result..., contract...]
-        lhs_perm = lhs_batching_dim + lhs_result_dim + lhs_contracting_dim
-        rhs_perm = rhs_batching_dim + rhs_result_dim + rhs_contracting_dim
-        t_lhs = lhs if lhs_perm == list(range(lhs_rank)) else mb.transpose(x=lhs, perm=lhs_perm)
-        t_rhs = rhs if rhs_perm == list(range(rhs_rank)) else mb.transpose(x=rhs, perm=rhs_perm)
-
-        n_batch = len(lhs_batching_dim)
-
-        # Check if contracting dimensions contain any symbolic dims
-        contracting_shapes = [lhs.shape[d] for d in lhs_contracting_dim]
-        has_symbolic_contraction = any(_is_symbolic(s) for s in contracting_shapes)
-
-        if has_symbolic_contraction:
-            contracted_count = -1  # let MIL infer
-        else:
-            contracted_count = reduce(lambda a, b: int(a) * int(b), contracting_shapes, 1)
-
-        batch_dims_symbolic = any(_is_symbolic(lhs.shape[d]) for d in lhs_batching_dim)
-        if batch_dims_symbolic:
-            raise ValueError(
-                "Dynamic dot_general fast-path does not support symbolic batch dims"
-            )
-        batch_shape = tuple(int(lhs.shape[d]) for d in lhs_batching_dim)
-
-        # When each side has at most 1 result dim and 1 contraction dim,
-        # the transposed tensor is already in (batch..., M, K) form and
-        # no reshape is needed. This avoids the two-unknown-dims problem
-        # when both the result dim and contraction dim are symbolic.
-        def _needs_reshape(result_dims, contracting_dims):
-            # Reshape is needed when there isn't exactly 1 result dim and 1
-            # contraction dim, since the matmul expects (..., M, K) layout.
-            return len(result_dims) != 1 or len(contracting_dims) != 1
-
-        def _reshape_to_3d(tensor, result_dims, contracting_dims, side_name):
-            if not _needs_reshape(result_dims, contracting_dims):
-                return tensor
-            # After transpose the tensor is (batch..., result..., contract...).
-            # Reshape to (batch..., last_result, contracted_count).
-            # Use -1 for symbolic dims so MIL infers them.
-            if len(result_dims) > 0:
-                # Last result dim in the transposed tensor is at n_batch + len - 1
-                last_pos = n_batch + len(result_dims) - 1
-                last = tensor.shape[last_pos]
-                if _is_symbolic(last):
-                    if contracted_count == -1:
-                        raise ValueError(
-                            f"Dynamic dot_general: cannot reshape {side_name} — "
-                            f"both last result dim and contracted count are symbolic."
-                        )
-                    d = -1
-                else:
-                    d = int(last)
-            else:
-                d = 1
-            cc = -1 if contracted_count == -1 else int(contracted_count)
-            target = list(batch_shape) + [d, cc]
-            return mb.reshape(x=tensor, shape=target)
-
-        c_lhs = _reshape_to_3d(t_lhs, lhs_result_dim, lhs_contracting_dim, "lhs")
-        c_rhs = _reshape_to_3d(t_rhs, rhs_result_dim, rhs_contracting_dim, "rhs")
-
-        # (..., M, K) × (..., N, K)^T = (..., M, N)
-        result = mb.matmul(x=c_lhs, y=c_rhs, transpose_y=True)
-
-        # Squeeze fake dims when a side has no result dims
-        if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
-            if len(result.shape) == len(batch_shape) + 2:
-                result = mb.squeeze(x=result, axes=[-2, -1])
-        elif len(lhs_result_dim) == 0:
-            result = mb.squeeze(x=result, axes=[n_batch])
-        elif len(rhs_result_dim) == 0:
-            result = mb.squeeze(x=result, axes=[-1])
-
-        # Re-expand non-last result dims (all size 1, were squeezed during reshape)
-        # Current shape: (batch..., M, N)
-        # Target:  (batch..., 1...1, M, 1...1, N)
-        if lhs_non_last or rhs_non_last:
-            axes = []
-            for i in range(len(lhs_non_last)):
-                axes.append(n_batch + i)
-            offset = n_batch + len(lhs_non_last) + (1 if lhs_result_dim else 0)
-            for i in range(len(rhs_non_last)):
-                axes.append(offset + i)
-            if axes:
-                result = mb.expand_dims(x=result, axes=axes)
-
-        return result
-
     @register_stablehlo_op
     def op_dot_general(self, context: TranslationContext, op: DotGeneralOp):
-        # This roughly follows the steps from https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
-        # but uses that we have a matrix multiplication primitive, instead of just a dot-product primitive.
+        # Implements dot_general via transpose → reshape → single matmul → reshape.
+        # See https://github.com/openxla/stablehlo/blob/main/docs/spec.md#dot_general
+        #
+        # Handles both static and dynamic (symbolic) shapes in a single code
+        # path. For static shapes every reshape target is a known integer. For
+        # symbolic shapes we use -1 to let MIL infer one unknown dimension per
+        # reshape (MIL limitation: at most one -1 per reshape call).
         lhs_rank = len(op.lhs.type.shape)
         rhs_rank = len(op.rhs.type.shape)
         dot_dim_numbers = hlo.DotDimensionNumbers(op.dot_dimension_numbers)
@@ -603,117 +492,78 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        # Dynamic dims: use fast path (no fill/iterate/slice_update)
-        # Triggered when result OR any operand has symbolic dimensions, since
-        # the iterate path creates slice indices from operand shapes.
-        has_dynamic = (
-            any(d == self._DYNAMIC_DIM for d in op.result.type.shape)
-            or any(d == self._DYNAMIC_DIM for d in op.lhs.type.shape)
-            or any(d == self._DYNAMIC_DIM for d in op.rhs.type.shape)
-        )
-        if has_dynamic:
-            result = self._dot_general_dynamic(
-                lhs, rhs, lhs_rank, rhs_rank,
-                lhs_contracting_dim, rhs_contracting_dim,
-                lhs_batching_dim, rhs_batching_dim, op
-            )
-            context.add_result(op.result, result)
-            return
+        def _is_symbolic(dim):
+            return isinstance(dim, (Symbol, sympy.Basic)) and not isinstance(dim, (int, float))
 
-        def multiply(lst: list):
-            return reduce(lambda a, b: int(a) * int(b), lst, 1)
+        lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
+        rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
 
-        def last_column_dot(lhs, rhs):
-            return mb.matmul(x=lhs, y=rhs, transpose_y=True)
+        # Transpose to [batch…, result…, contract…]
+        lhs_perm = lhs_batching_dim + lhs_result_dim + lhs_contracting_dim
+        rhs_perm = rhs_batching_dim + rhs_result_dim + rhs_contracting_dim
+        t_lhs = lhs if lhs_perm == list(range(lhs_rank)) else mb.transpose(x=lhs, perm=lhs_perm)
+        t_rhs = rhs if rhs_perm == list(range(rhs_rank)) else mb.transpose(x=rhs, perm=rhs_perm)
 
-        # Remark: There is a potential performance optimization here:
-        #         If we move the largest result dimensions of the tensor towards
-        #         the end of the array, we may save a lot of work when iterating
-        #         over the result indexes later, as the last dims will be handled
-        #         by matrix multiplication
-        lhs_result_dim = [dim for dim in range(lhs_rank) if dim not in lhs_batching_dim + lhs_contracting_dim]
-        rhs_result_dim = [dim for dim in range(rhs_rank) if dim not in rhs_batching_dim + rhs_contracting_dim]
+        n_batch = len(lhs_batching_dim)
+        batch_shape = tuple(int(lhs.shape[d]) for d in lhs_batching_dim)
 
-        # For both the lhs and rhs, put the dimensions being contracted last
-        transposed_lhs = mb.transpose(x=lhs, perm=lhs_batching_dim + lhs_result_dim + lhs_contracting_dim)
-        transposed_rhs = mb.transpose(x=rhs, perm=rhs_batching_dim + rhs_result_dim + rhs_contracting_dim)
+        # Compute products for the reshape, using -1 for symbolic dimensions
+        def _safe_product(dims):
+            if any(_is_symbolic(d) for d in dims):
+                return -1
+            return int(reduce(lambda a, b: int(a) * int(b), dims, 1))
 
-        # Calculate the result by looping over the contracting dims in order
-        result_shape = [lhs.shape[dim] for dim in lhs_batching_dim]
-        result_shape += [lhs.shape[dim] for dim in lhs_result_dim]
-        result_shape += [rhs.shape[dim] for dim in rhs_result_dim]
-        if len(result_shape) == 0:
-            # Special case for scalar result
-            result_shape = [1]
+        contracting_shapes = [lhs.shape[d] for d in lhs_contracting_dim]
+        contracted_count = _safe_product(contracting_shapes) if contracting_shapes else 1
 
-        # Allocate memory of the correct type for the result
-        result_dtype = get_mil_type_from_ir(op.result.type.element_type)
-        result = mb.fill(shape=result_shape, value=mb.cast(x=0, dtype=dtype_str(result_dtype)))
+        lhs_result_shapes = [lhs.shape[d] for d in lhs_result_dim]
+        rhs_result_shapes = [rhs.shape[d] for d in rhs_result_dim]
+        lhs_result_count = _safe_product(lhs_result_shapes) if lhs_result_shapes else 1
+        rhs_result_count = _safe_product(rhs_result_shapes) if rhs_result_shapes else 1
 
-        def calculate_result_index(lhs_idx, rhs_idx, acc):
-            contracted_element_count = multiply([lhs.shape[dim] for dim in lhs_contracting_dim])
-            # print(f"contracted_element_count = {contracted_element_count}")
-            batch_selector = tuple([slice(None) for _i in range(len(lhs_batching_dim))])
-            batch_shape = tuple([lhs.shape[dim] for dim in lhs_batching_dim])
+        # Reshape each operand to (batch…, M, K) / (batch…, N, K).
+        # When len(result_dims)==1 and len(contract_dims)==1 the tensor is
+        # already in the right layout and we can skip the reshape entirely,
+        # which avoids the two-unknown-dims problem when both are symbolic.
+        def _reshape_to_3d(tensor, result_count, result_dims, side_name):
+            if len(result_dims) == 1 and len(lhs_contracting_dim) == 1:
+                return tensor
+            rc = result_count if result_count != -1 else -1
+            cc = contracted_count if contracted_count != -1 else -1
+            if rc == -1 and cc == -1:
+                raise ValueError(
+                    f"dot_general: cannot reshape {side_name} — "
+                    f"both result-dim product and contracting-dim product are symbolic."
+                )
+            target = list(batch_shape) + [rc if rc != -1 else -1, cc if cc != -1 else -1]
+            return mb.reshape(x=tensor, shape=target)
 
-            # Reshape the lhs and rhs to have all the contracting dimensions in the end.
-            # We will always make them have the shape `(batch_shape, last_dim_shape, contraction_count)``
-            # where we may have to set `last_dim_shape` to 1, if the dimension does not exist.
-            lhs_for_result_idx = index_by_slices(transposed_lhs, list(batch_selector) + [lhs_idx, ...])
-            if len(lhs_result_dim) > 0:
-                lhs_reshape_shape = batch_shape + (lhs.shape[lhs_result_dim[-1]],) + (contracted_element_count, )
+        c_lhs = _reshape_to_3d(t_lhs, lhs_result_count, lhs_result_dim, "lhs")
+        c_rhs = _reshape_to_3d(t_rhs, rhs_result_count, rhs_result_dim, "rhs")
+
+        # (batch…, M, K) × (batch…, N, K)^T → (batch…, M, N)
+        result = mb.matmul(x=c_lhs, y=c_rhs, transpose_y=True)
+
+        # Squeeze fake dims when a side has no result dims
+        if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
+            if batch_shape:
+                result = mb.squeeze(x=result, axes=[-2, -1])
             else:
-                lhs_reshape_shape = batch_shape + (1, contracted_element_count)
-            contracted_lhs = mb.reshape(x=lhs_for_result_idx, shape=lhs_reshape_shape)
+                result = mb.reshape(x=result, shape=(1,))
+        elif len(lhs_result_dim) == 0:
+            result = mb.squeeze(x=result, axes=[n_batch])
+        elif len(rhs_result_dim) == 0:
+            result = mb.squeeze(x=result, axes=[-1])
 
-            rhs_for_result_idx = index_by_slices(transposed_rhs, list(batch_selector) + [rhs_idx, ...])
-            if len(rhs_result_dim) > 0:
-                rhs_reshape_shape = batch_shape + (rhs.shape[rhs_result_dim[-1]],) + (contracted_element_count, )
-            else:
-                rhs_reshape_shape = batch_shape + (1, contracted_element_count)
-            contracted_rhs = mb.reshape(x=rhs_for_result_idx, shape=rhs_reshape_shape)
+        # Reshape from (batch…, M, N) back to (batch…, L1, …, Ln, R1, …, Rm)
+        final_shape = list(batch_shape)
+        final_shape += [int(d) if not _is_symbolic(d) else d for d in lhs_result_shapes]
+        final_shape += [int(d) if not _is_symbolic(d) else d for d in rhs_result_shapes]
+        if not final_shape:
+            final_shape = [1]
 
-            # print(f"contracted_lhs shape: {contracted_lhs.shape}")
-            # print(f"contracted_rhs shape: {contracted_rhs.shape}")
-
-            idx_result = last_column_dot(contracted_lhs, contracted_rhs)
-
-            # If we added a fake dimension, we will make sure to squeeze it away
-            if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:
-                if len(idx_result.shape) == 2:
-                    assert idx_result.shape == (1, 1)
-                    # This is a special case, where the result is a scalar of shape (1, 1)
-                    # In order to not end up with a 0-rank tensor, we only contract one dimension
-                    idx_result = mb.reshape(x=idx_result, shape=(1,))
-                else:
-                    idx_result = mb.squeeze(x=idx_result, axes=(-1, -2))
-            elif len(lhs_result_dim) == 0:
-                idx_result = mb.squeeze(x=idx_result, axes=(-2,))
-            elif len(rhs_result_dim) == 0:
-                idx_result = mb.squeeze(x=idx_result, axes=(-1,))
-
-            # TODO: Consider making this work on iOS<18 by using concatenation
-            # We may have to add an extra slice for the skipped dimension
-            result_idx = []
-            result_idx.append(lhs_idx)
-            if len(lhs_result_dim) > 0:
-                result_idx.append(slice(None))
-            result_idx.append(rhs_idx)
-            if len(rhs_result_dim) > 0:
-                result_idx.append(slice(None))
-
-            return [update_tensor_by_slice(acc, list(batch_selector) + result_idx, idx_result)]
-
-        # We can utilize that we have a full matrix multiply primitive available, compared to having only
-        # a dot-product primitive. Therefore we can avoid iterating over the last dimension in respectively
-        # the lhs and rhs tensors
-        lhs_shape = [lhs.shape[dim] for dim in lhs_result_dim[:-1]]
-        rhs_shape = [rhs.shape[dim] for dim in rhs_result_dim[:-1]]
-        # In principle all of the matrix multiplications generated here, could be done in parallel.
-        # MIL does not seem to support this.
-        # We could try to combine the matrix multiplications when the shapes allow it, but for now
-        # we will just loop through them sequentially.
-        result, = iterate_indexes_in_shapes(calculate_result_index, [lhs_shape, rhs_shape], [result])
+        if list(result.shape) != final_shape:
+            result = mb.reshape(x=result, shape=final_shape)
 
         context.add_result(op.result, result)
 
