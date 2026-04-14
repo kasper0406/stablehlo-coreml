@@ -1,11 +1,12 @@
 from functools import partial, reduce
 
 import numpy as np
+import sympy
 from coremltools import _logger as logger
 from coremltools.converters.mil import mil
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function, Program, types
+from coremltools.converters.mil.mil import Function, Program, Symbol, types
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
@@ -77,9 +78,6 @@ from jaxlib.mlir.dialects.stablehlo import (
     WhileOp,
     XorOp,
 )
-
-import sympy
-from coremltools.converters.mil.mil import Symbol
 
 from .ops_register import StableHloOpsRegistry, register_composite_op, register_stablehlo_op
 from .padding import pad_with_cast
@@ -919,7 +917,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(x.shape) == len(output_shape):
             reps = []
             need_tile = False
-            for i, (in_dim, out_dim) in enumerate(zip(x.shape, output_shape)):
+            for _i, (in_dim, out_dim) in enumerate(zip(x.shape, output_shape)):
                 in_s = in_dim if isinstance(in_dim, int) else None
                 if in_s == 1 and _is_static_gt1(out_dim):
                     reps.append(out_dim)

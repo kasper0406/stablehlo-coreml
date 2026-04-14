@@ -6,13 +6,12 @@ dot_general fast-path for symbolic dimensions produced by JAX symbolic export.
 """
 import jax
 import jax.numpy as jnp
-from jax import export
 import numpy as np
 import pytest
+from jax import export
 
+from stablehlo_coreml.translation_context import DYNAMIC_DIM, TranslationContext
 from tests.utils import run_and_compare_symbolic
-from stablehlo_coreml.translation_context import TranslationContext, DYNAMIC_DIM
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -270,8 +269,9 @@ def test_validate_shapes_dynamic_sentinel():
         def get_name(self):
             return self._name
 
-    from coremltools.converters.mil.mil import Builder as mb, Function, types
     from coremltools.converters.mil._deployment_compatibility import AvailableTarget
+    from coremltools.converters.mil.mil import Builder as mb
+    from coremltools.converters.mil.mil import Function, types
 
     with Function(
         {"x": mb.placeholder(shape=(1, 4), dtype=types.fp32)},
@@ -303,10 +303,11 @@ def test_validate_shapes_dynamic_sentinel():
 
 def test_custom_call_unsupported_raises():
     """CustomCallOp with unknown target should raise ValueError."""
-    from jax._src.lib.mlir import ir
-    from jax._src.interpreters import mlir as jax_mlir
-    from stablehlo_coreml.converter import convert
     import coremltools as ct
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax._src.lib.mlir import ir
+
+    from stablehlo_coreml.converter import convert
 
     # Craft a minimal MLIR module with an unsupported custom_call
     mlir_text = """
@@ -346,10 +347,11 @@ def test_symbolic_reshape():
 
 def test_symbolic_dynamic_iota_unsupported_raises():
     """DynamicIotaOp with rank > 1 should raise ValueError."""
-    from jax._src.lib.mlir import ir
-    from jax._src.interpreters import mlir as jax_mlir
-    from stablehlo_coreml.converter import convert
     import coremltools as ct
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax._src.lib.mlir import ir
+
+    from stablehlo_coreml.converter import convert
 
     mlir_text = """
     module {
@@ -362,5 +364,5 @@ def test_symbolic_dynamic_iota_unsupported_raises():
     context = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(mlir_text, context=context)
 
-    with pytest.raises(ValueError, match="DynamicIotaOp with rank=2.*is not yet supported"):
+    with pytest.raises(ValueError, match=r"DynamicIotaOp with rank=2.*is not yet supported"):
         convert(hlo_module, minimum_deployment_target=ct.target.iOS18)

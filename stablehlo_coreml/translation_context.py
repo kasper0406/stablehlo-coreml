@@ -2,7 +2,6 @@ from coremltools.converters.mil import mil
 
 from .utils import fix_scalar_tensor
 
-
 # Sentinel value for dynamic dimensions in MLIR ShapedType.
 # Equals ir.ShapedType.get_dynamic_size() — the int64 minimum.
 DYNAMIC_DIM = -9223372036854775808
@@ -58,7 +57,7 @@ class TranslationContext:
             # when HLO dim is dynamic.
             if len(hlo_shape) == len(mil_shape):
                 if all(
-                    h == m or h == DYNAMIC_DIM
+                    h in (m, DYNAMIC_DIM)
                     for h, m in zip(hlo_shape, mil_shape)
                 ):
                     return True

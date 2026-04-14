@@ -1,15 +1,14 @@
+import copy
 
 import coremltools as ct
 import jax
 import jax.numpy as jnp
 import numpy as np
-from coremltools.converters.mil.mil import Block, Program
+from coremltools.converters.mil.mil import Block, Program, Symbol
 from coremltools.converters.mil.testing_utils import compare_backend
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export as _jax_export
-
-from coremltools.converters.mil.mil import Symbol
 
 from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 from stablehlo_coreml.converter import convert
