@@ -816,10 +816,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         x = context[op.operand.get_name()]
         broadcast_dims = [int(d) for d in op.broadcast_dimensions]
         output_rank = len(op.result.type.shape)
+        output_shape = op.result.type.shape
 
-        if len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1):
-            # Scalar or (1,) input: expand to output rank with unit dims.
-            # MIL auto-broadcast in subsequent elementwise ops handles the rest.
+        # MLIR uses INT64_MIN as the sentinel for unknown/dynamic dimensions.
+        _DYNAMIC = -9223372036854775808
+
+        def _is_dynamic(dim):
+            return not isinstance(dim, int) or dim == _DYNAMIC
+
+        def _is_static_gt1(dim):
+            return isinstance(dim, int) and dim != _DYNAMIC and dim > 1
+
+        is_scalar_input = len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1)
+        has_dynamic_broadcast = is_scalar_input and any(
+            _is_dynamic(d) for d in output_shape
+        )
+
+        # Fast path: scalar constant broadcast to a shape with dynamic dims.
+        # Use fill(shape, value) directly — it handles both static and dynamic
+        # dims in one op and won't be folded away by MIL optimization passes.
+        if is_scalar_input and has_dynamic_broadcast and x.val is not None:
+            target_shape = context[op.output_dimensions.get_name()]
+            scalar_val = x.val.flatten()[0]
+            x = mb.fill(shape=target_shape, value=scalar_val)
+            context.add_result(op.result, x)
+            return
+
+        if is_scalar_input:
             if output_rank > 0:
                 x = mb.reshape(x=x, shape=[1] * output_rank)
         else:
@@ -834,15 +857,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         # where broadcast should happen. If a subsequent op is not elementwise
         # (e.g. reshape), MIL auto-broadcast won't fire. Tile any static dims
         # that need replication (input=1, output>1).
-        output_shape = op.result.type.shape
         if len(x.shape) == len(output_shape):
             reps = []
             need_tile = False
             for i, (in_dim, out_dim) in enumerate(zip(x.shape, output_shape)):
                 in_s = in_dim if isinstance(in_dim, int) else None
-                out_s = out_dim if isinstance(out_dim, int) else None
-                if in_s == 1 and out_s is not None and out_s > 1:
-                    reps.append(out_s)
+                if in_s == 1 and _is_static_gt1(out_dim):
+                    reps.append(out_dim)
                     need_tile = True
                 else:
                     reps.append(1)
