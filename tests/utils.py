@@ -98,6 +98,40 @@ def _count_program_complexity(mil_program: Program):
     return total_complexity
 
 
+def _convert_mil_to_coreml(
+    mil_program,
+    *,
+    max_complexity: int = 10_000,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+    ct_inputs=None,
+):
+    """Convert a MIL program to a CoreML model with standard test pipeline.
+
+    Checks complexity, removes the fp16 cast pass (see
+    https://github.com/apple/coremltools/issues/2324), and runs ct.convert.
+    """
+    program_complexity = _count_program_complexity(mil_program)
+    if program_complexity > max_complexity:
+        raise ValueError(
+            f"Generated a MIL program with complexity {program_complexity}, "
+            f"max allowed complexity is {max_complexity}"
+        )
+
+    pipeline = copy.deepcopy(DEFAULT_HLO_PIPELINE)
+    pipeline.remove_passes(['common::add_fp16_cast'])
+
+    convert_kwargs = dict(
+        source="milinternal",
+        minimum_deployment_target=ct.target.iOS18,
+        pass_pipeline=pipeline,
+        compute_units=compute_units,
+    )
+    if ct_inputs is not None:
+        convert_kwargs["inputs"] = ct_inputs
+
+    return ct.convert(mil_program, **convert_kwargs)
+
+
 def run_and_compare_hlo_module(
     hlo_module,
     inputs,
@@ -109,26 +143,10 @@ def run_and_compare_hlo_module(
     compute_units=ct.ComputeUnit.CPU_ONLY,
 ):
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
-    program_complexity = _count_program_complexity(mil_program)
-    if program_complexity > max_complexity:
-        raise ValueError(
-            f"Generated a MIL program with complexity {program_complexity}, "
-            f"max allowed complexity is {max_complexity}"
-        )
 
-    pipeline = DEFAULT_HLO_PIPELINE
-    # We temporarily avoid fp16 conversions in tests because of https://github.com/apple/coremltools/issues/2324
-    passes_to_remove = [
-         'common::add_fp16_cast'
-    ]
-    pipeline = copy.deepcopy(pipeline)
-    pipeline.remove_passes(passes_to_remove)
-
-    cml_model = ct.convert(
+    cml_model = _convert_mil_to_coreml(
         mil_program,
-        source="milinternal",
-        minimum_deployment_target=ct.target.iOS18,
-        pass_pipeline=pipeline,
+        max_complexity=max_complexity,
         compute_units=compute_units,
     )
 
@@ -267,12 +285,6 @@ def run_and_compare_symbolic(
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
 
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
-    program_complexity = _count_program_complexity(mil_program)
-    if program_complexity > max_complexity:
-        raise ValueError(
-            f"Generated a MIL program with complexity {program_complexity}, "
-            f"max allowed complexity is {max_complexity}"
-        )
 
     # Build ct.TensorType inputs with RangeDim for symbolic dimensions
     ct_inputs = []
@@ -287,18 +299,11 @@ def run_and_compare_symbolic(
             ct_inputs.append(ct.TensorType(name=inp_name, shape=ct_shape))
         break  # only first (main) function
 
-    pipeline = DEFAULT_HLO_PIPELINE
-    passes_to_remove = ['common::add_fp16_cast']
-    pipeline = copy.deepcopy(pipeline)
-    pipeline.remove_passes(passes_to_remove)
-
-    cml_model = ct.convert(
+    cml_model = _convert_mil_to_coreml(
         mil_program,
-        source="milinternal",
-        minimum_deployment_target=ct.target.iOS18,
-        pass_pipeline=pipeline,
+        max_complexity=max_complexity,
         compute_units=compute_units,
-        inputs=ct_inputs,
+        ct_inputs=ct_inputs,
     )
 
     input_names = list(cml_model.input_description)

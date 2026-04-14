@@ -95,6 +95,12 @@ cml_model = ct.convert(
 )
 ```
 
+**Current limitations:** The `dot_general` dynamic fast-path requires that all
+non-last result dimensions are size 1 (single-iteration) and that batch
+dimensions are concrete. This covers standard matmul, batched matmul, and
+attention patterns. Exotic multi-result-dim dot products with symbolic shapes
+are not yet supported.
+
 See `tests/test_symbolic_shapes.py` for additional examples.
 
 

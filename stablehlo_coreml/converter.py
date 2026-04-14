@@ -875,14 +875,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         output_rank = len(op.result.type.shape)
         output_shape = op.result.type.shape
 
-        # MLIR uses INT64_MIN as the sentinel for unknown/dynamic dimensions.
-        _DYNAMIC = -9223372036854775808
-
         def _is_dynamic(dim):
-            return not isinstance(dim, int) or dim == _DYNAMIC
+            return not isinstance(dim, int) or dim == self._DYNAMIC_DIM
 
         def _is_static_gt1(dim):
-            return isinstance(dim, int) and dim != _DYNAMIC and dim > 1
+            return isinstance(dim, int) and dim != self._DYNAMIC_DIM and dim > 1
 
         is_scalar_input = len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1)
         has_dynamic_broadcast = is_scalar_input and any(
@@ -917,7 +914,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if len(x.shape) == len(output_shape):
             reps = []
             need_tile = False
-            for _i, (in_dim, out_dim) in enumerate(zip(x.shape, output_shape)):
+            for in_dim, out_dim in zip(x.shape, output_shape):
                 in_s = in_dim if isinstance(in_dim, int) else None
                 if in_s == 1 and _is_static_gt1(out_dim):
                     reps.append(out_dim)
