@@ -58,7 +58,7 @@ class TranslationContext:
             # not compared to MIL.
             if len(hlo_shape) == len(mil_shape):
                 if all(
-                    h == DYNAMIC_DIM_SENTINEL or h == m
+                    h in (DYNAMIC_DIM_SENTINEL, m)
                     for h, m in zip(hlo_shape, mil_shape)
                 ):
                     return True
