@@ -62,6 +62,45 @@ hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 
 For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
+## Dynamic / symbolic shapes
+
+JAX models exported with symbolic dimensions are supported. Symbolic dims flow
+through `GetDimensionSizeOp`, `DynamicBroadcastInDimOp`, `DynamicIotaOp`, and
+shape-assertion `CustomCallOp`s automatically, producing CoreML models with
+flexible inputs.
+
+```python
+import jax
+import jax.numpy as jnp
+from jax.export import export, symbolic_shape
+
+jax_exported = export(jax.jit(jax_function))(
+    jax.ShapeDtypeStruct(symbolic_shape("batch, 4"), jnp.float32),
+    jax.ShapeDtypeStruct((4, 3), jnp.float32),
+)
+```
+
+When converting to a CoreML model, specify `RangeDim` for each symbolic
+dimension so the model accepts a range of sizes at inference time:
+
+```python
+cml_model = ct.convert(
+    mil_program,
+    source="milinternal",
+    minimum_deployment_target=ct.target.iOS18,
+    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    inputs=[
+        ct.TensorType(name="_arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
+        ct.TensorType(name="_arg1", shape=(4, 3)),
+    ],
+)
+```
+
+See [`tests/test_symbolic_shapes.py`](tests/test_symbolic_shapes.py) for
+symbolic matmul, batched einsum, and multi-axis patterns (for example
+transformer-style projections).
+
+
 ### Examples in the test suite
 
 The [`tests/`](tests/) directory has end-to-end export and conversion examples:
