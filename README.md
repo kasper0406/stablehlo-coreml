@@ -70,12 +70,13 @@ shape-assertion `CustomCallOp`s automatically, producing CoreML models with
 flexible inputs.
 
 ```python
+import jax
+import jax.numpy as jnp
 from jax.export import export, symbolic_shape
 
-batch = symbolic_shape("batch")
 jax_exported = export(jax.jit(jax_function))(
-    jnp.zeros((*batch, 4)),
-    jnp.zeros((4, 3)),
+    jax.ShapeDtypeStruct(symbolic_shape("batch, 4"), jnp.float32),
+    jax.ShapeDtypeStruct((4, 3), jnp.float32),
 )
 ```
 
@@ -95,13 +96,9 @@ cml_model = ct.convert(
 )
 ```
 
-**Current limitations:** The `dot_general` dynamic fast-path requires that all
-non-last result dimensions are size 1 (single-iteration) and that batch
-dimensions are concrete. This covers standard matmul, batched matmul, and
-attention patterns. Exotic multi-result-dim dot products with symbolic shapes
-are not yet supported.
-
-See `tests/test_symbolic_shapes.py` for additional examples.
+See [`tests/test_symbolic_shapes.py`](tests/test_symbolic_shapes.py) for
+symbolic matmul, batched einsum, and multi-axis patterns (for example
+transformer-style projections).
 
 
 ### Examples in the test suite

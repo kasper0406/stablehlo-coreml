@@ -1,8 +1,8 @@
 """Tests for dynamic/symbolic shape support.
 
 Validates the new StableHLO ops (GetDimensionSizeOp, DynamicIotaOp,
-DynamicBroadcastInDimOp, CustomCallOp/shape_assertion) and the modified
-dot_general fast-path for symbolic dimensions produced by JAX symbolic export.
+DynamicBroadcastInDimOp, CustomCallOp/shape_assertion) and `dot_general`
+lowering with symbolic dimensions from JAX symbolic export.
 """
 import jax
 import jax.numpy as jnp
@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from jax import export
 
-from stablehlo_coreml.translation_context import DYNAMIC_DIM, TranslationContext
+from stablehlo_coreml.translation_context import DYNAMIC_DIM_SENTINEL, TranslationContext
 from tests.utils import run_and_compare_symbolic
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ def test_symbolic_broadcast_add():
 
 # ---------------------------------------------------------------------------
 # Matrix multiplication with symbolic dims
-# Exercises: _dot_general_dynamic fast path
+# Exercises: op_dot_general (reshape + matmul)
 # ---------------------------------------------------------------------------
 
 def test_symbolic_matmul():
@@ -280,7 +280,7 @@ def test_symbolic_scaled_dot_product_attention():
 # ---------------------------------------------------------------------------
 
 def test_validate_shapes_dynamic_sentinel():
-    """validate_shapes accepts dynamic dim sentinel paired with any MIL dim."""
+    """validate_shapes: sentinel axes are unchecked; concrete HLO dims match MIL."""
     ctx = TranslationContext()
 
     class FakeType:
@@ -314,9 +314,14 @@ def test_validate_shapes_dynamic_sentinel():
         # Scalar tolerance
         ctx.add_result(FakeResult((), "scalar"), scalar)
 
-        # Dynamic dim — any MIL dim should be accepted
-        ctx.add_result(FakeResult((DYNAMIC_DIM, 4), "dyn1"), x)
-        ctx.add_result(FakeResult((DYNAMIC_DIM, DYNAMIC_DIM), "dyn2"), x)
+        # Dynamic dim — any MIL dim should be accepted on sentinel axes
+        ctx.add_result(FakeResult((DYNAMIC_DIM_SENTINEL, 4), "dyn1"), x)
+        ctx.add_result(FakeResult((DYNAMIC_DIM_SENTINEL, DYNAMIC_DIM_SENTINEL), "dyn2"), x)
+
+        # Concrete HLO dim must still match MIL (even if another axis is dynamic)
+        y = mb.const(val=np.zeros((1, 3), dtype=np.float32))
+        with pytest.raises(ValueError, match="different from the actual MIL result shape"):
+            ctx.add_result(FakeResult((DYNAMIC_DIM_SENTINEL, 4), "bad_mixed"), y)
 
         # Mismatch should raise
         with pytest.raises(ValueError, match="different from the actual MIL result shape"):

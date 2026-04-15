@@ -1,10 +1,11 @@
 from coremltools.converters.mil import mil
+from jaxlib.mlir import ir
 
 from .utils import fix_scalar_tensor
 
-# Sentinel value for dynamic dimensions in MLIR ShapedType.
-# Equals ir.ShapedType.get_dynamic_size() — the int64 minimum.
-DYNAMIC_DIM = -9223372036854775808
+# Sentinel value for dynamic dimensions in MLIR ShapedType
+# Used to trace dynamic dimensions through the conversion process
+DYNAMIC_DIM_SENTINEL = ir.ShapedType.get_dynamic_size()
 
 
 class TranslationContext:
@@ -52,12 +53,12 @@ class TranslationContext:
             if hlo_shape == mil_shape:
                 return True
 
-            # Allow dynamic dims: HLO uses a large negative sentinel for '?',
-            # MIL uses Symbol or concrete 1 (broadcastable). Accept any MIL dim
-            # when HLO dim is dynamic.
+            # Dynamic HLO dims use a sentinel ('?'); MIL may use Symbol, 1, etc.
+            # Non-sentinel HLO dims must match MIL exactly; sentinel positions are
+            # not compared to MIL.
             if len(hlo_shape) == len(mil_shape):
                 if all(
-                    h in (m, DYNAMIC_DIM)
+                    h == DYNAMIC_DIM_SENTINEL or h == m
                     for h, m in zip(hlo_shape, mil_shape)
                 ):
                     return True

@@ -1,7 +1,6 @@
 from functools import partial, reduce
 
 import numpy as np
-import sympy
 from coremltools import _logger as logger
 from coremltools.converters.mil import mil
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
@@ -10,6 +9,7 @@ from coremltools.converters.mil.mil import Function, Program, Symbol, types
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 from jax._src.lib.mlir.dialects import hlo
 from jaxlib.mlir import ir, passmanager
 from jaxlib.mlir.dialects import stablehlo as stablehlo_dialect
@@ -84,7 +84,7 @@ from .padding import pad_with_cast
 from .passes.utils import register_optimizations
 from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 from .sort_utils import match_sort
-from .translation_context import DYNAMIC_DIM, TranslationContext
+from .translation_context import DYNAMIC_DIM_SENTINEL, TranslationContext
 from .utils import (
     auto_cast_bool,
     clamp_index,
@@ -159,9 +159,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         return self.prog
 
-    # Sentinel for dynamic dimensions in MLIR ShapedType
-    _DYNAMIC_DIM = DYNAMIC_DIM
-
     def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
@@ -175,7 +172,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                 # Replace dynamic dims with MIL Symbols for flexible shapes
                 new_shape = []
                 for d in shape:
-                    if d == self._DYNAMIC_DIM:
+                    if d == DYNAMIC_DIM_SENTINEL:
                         new_shape.append(Symbol(f'dim_{sym_counter}'))
                         sym_counter += 1
                     else:
@@ -492,9 +489,6 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs = context[op.lhs.get_name()]
         rhs = context[op.rhs.get_name()]
 
-        def _is_symbolic(dim):
-            return isinstance(dim, (Symbol, sympy.Basic)) and not isinstance(dim, (int, float))
-
         lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
         rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
 
@@ -509,7 +503,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Compute products for the reshape, using -1 for symbolic dimensions
         def _safe_product(dims):
-            if any(_is_symbolic(d) for d in dims):
+            if any(is_symbolic(d) for d in dims):
                 return -1
             return int(reduce(lambda a, b: int(a) * int(b), dims, 1))
 
@@ -557,17 +551,17 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
         # Reshape from (batch…, M, N) back to (batch…, L1, …, Ln, R1, …, Rm)
         final_shape = list(batch_shape)
-        final_shape += [int(d) if not _is_symbolic(d) else d for d in lhs_result_shapes]
-        final_shape += [int(d) if not _is_symbolic(d) else d for d in rhs_result_shapes]
+        final_shape += [int(d) if not is_symbolic(d) else d for d in lhs_result_shapes]
+        final_shape += [int(d) if not is_symbolic(d) else d for d in rhs_result_shapes]
         if not final_shape:
             final_shape = [1]
 
         if list(result.shape) != final_shape:
-            if any(_is_symbolic(d) for d in final_shape):
+            if any(is_symbolic(d) for d in final_shape):
                 # MIL reshape cannot accept symbolic values in a constant
                 # shape list.  Replace each symbolic dim with -1 (MIL
                 # supports at most one -1 per reshape call).
-                n_sym = sum(1 for d in final_shape if _is_symbolic(d))
+                n_sym = sum(1 for d in final_shape if is_symbolic(d))
                 if n_sym > 1:
                     raise ValueError(
                         f"dot_general: final reshape {final_shape} has "
@@ -575,7 +569,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         f"one -1 per reshape."
                     )
                 mil_shape = [
-                    int(d) if not _is_symbolic(d) else -1
+                    int(d) if not is_symbolic(d) else -1
                     for d in final_shape
                 ]
                 result = mb.reshape(x=result, shape=mil_shape)
@@ -743,10 +737,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         output_shape = op.result.type.shape
 
         def _is_dynamic(dim):
-            return not isinstance(dim, int) or dim == self._DYNAMIC_DIM
+            return not isinstance(dim, int) or dim == DYNAMIC_DIM_SENTINEL
 
         def _is_static_gt1(dim):
-            return isinstance(dim, int) and dim != self._DYNAMIC_DIM and dim > 1
+            return isinstance(dim, int) and dim != DYNAMIC_DIM_SENTINEL and dim > 1
 
         is_scalar_input = len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1)
         has_dynamic_broadcast = is_scalar_input and any(
