@@ -736,26 +736,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         output_rank = len(op.result.type.shape)
         output_shape = op.result.type.shape
 
-        def _is_dynamic(dim):
-            return not isinstance(dim, int) or dim == DYNAMIC_DIM_SENTINEL
-
         def _is_static_gt1(dim):
             return isinstance(dim, int) and dim != DYNAMIC_DIM_SENTINEL and dim > 1
 
         is_scalar_input = len(x.shape) == 0 or (len(x.shape) == 1 and x.shape[0] == 1)
-        has_dynamic_broadcast = is_scalar_input and any(
-            _is_dynamic(d) for d in output_shape
-        )
-
-        # Fast path: scalar constant broadcast to a shape with dynamic dims.
-        # Use fill(shape, value) directly — it handles both static and dynamic
-        # dims in one op and won't be folded away by MIL optimization passes.
-        if is_scalar_input and has_dynamic_broadcast and x.val is not None:
-            target_shape = context[op.output_dimensions.get_name()]
-            scalar_val = x.val.flatten()[0]
-            x = mb.fill(shape=target_shape, value=scalar_val)
-            context.add_result(op.result, x)
-            return
 
         if is_scalar_input:
             if output_rank > 0:
