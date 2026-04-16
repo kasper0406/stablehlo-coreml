@@ -4,6 +4,7 @@ Validates the new StableHLO ops (GetDimensionSizeOp, DynamicIotaOp,
 DynamicBroadcastInDimOp, CustomCallOp/shape_assertion) and `dot_general`
 lowering with symbolic dimensions from JAX symbolic export.
 """
+import coremltools as ct
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -79,6 +80,64 @@ def test_symbolic_broadcast_add():
          np.random.randn(1, 4).astype(np.float32)),
     ]
     run_and_compare_symbolic(f, specs, test_shapes)
+
+
+# ---------------------------------------------------------------------------
+# ANE compatibility: DynamicBroadcastInDimOp must NOT emit MIL ``fill`` ops
+# for scalar constant broadcasts.  ``fill`` with a dynamically-computed shape
+# causes "Failed to prepare the model for predictions" on the Neural Engine
+# in large models (e.g. Gemma-4 prefill).  The converter must use the
+# reshape([1]*rank) path instead, relying on MIL implicit broadcasting.
+# ---------------------------------------------------------------------------
+
+def _mil_fill_count(jax_func, symbolic_specs):
+    """Return the number of ``fill`` ops in the converted MIL program."""
+    from coremltools.converters.mil.mil import program as _mil_program
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax._src.lib.mlir import ir
+
+    from stablehlo_coreml.converter import convert
+
+    # Save and restore MIL's global symbol registry so the new MIL
+    # program's symbols don't collide with or pollute other tests.
+    saved = dict(_mil_program.k_used_symbols)
+    _mil_program.k_used_symbols.clear()
+    try:
+        exported = export.export(jax.jit(jax_func))(*symbolic_specs)
+        ctx = jax_mlir.make_ir_context()
+        hlo = ir.Module.parse(exported.mlir_module(), context=ctx)
+        mil = convert(hlo, minimum_deployment_target=ct.target.iOS18)
+        return str(mil).count("= fill(")
+    finally:
+        _mil_program.k_used_symbols.clear()
+        _mil_program.k_used_symbols.update(saved)
+
+
+def test_no_fill_op_scalar_broadcast():
+    """Scalar + symbolic-shape tensor must not produce a fill op."""
+    def f(x):
+        return x + 1.0
+
+    (n,) = _sym("n")
+    specs = [jax.ShapeDtypeStruct((n, 4), jnp.float32)]
+    assert _mil_fill_count(f, specs) == 0
+
+
+def test_no_fill_op_causal_mask():
+    """Causal mask pattern (arange * scalar + scalar) must not produce fill ops.
+
+    This mirrors the causal-mask construction in Gemma-4, where
+    ``fill(shape=%N, value=scalar)`` caused ANE prediction failures.
+    """
+    def f(scores):
+        seq_len = scores.shape[0]
+        pos = jnp.arange(seq_len) * 1.0 + 0.0
+        mask = pos[:, None] <= pos[None, :]
+        return jnp.where(mask, scores, jnp.float32(-1e4))
+
+    (n,) = _sym("n")
+    specs = [jax.ShapeDtypeStruct((n, n), jnp.float32)]
+    assert _mil_fill_count(f, specs) == 0
 
 
 # ---------------------------------------------------------------------------
