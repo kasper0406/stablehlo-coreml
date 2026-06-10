@@ -352,7 +352,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if types.is_float(lhs_type):
             cml_op = mb.real_div(x=lhs, y=rhs)
         elif types.is_int(lhs_type):
-            cml_op = mb.floor_div(x=lhs, y=rhs)
+            cml_op = self.__trunc_div(lhs, rhs, lhs_type)
         else:
             raise ValueError(f"Unknown dtype {lhs_type}")
 
@@ -580,7 +580,15 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
     @register_stablehlo_op
     def op_rem(self, context: TranslationContext, op: RemOp):
-        self.__simple_binary_op(context, mb.mod, op)
+        lhs = context[op.lhs.get_name()]
+        rhs = context[op.rhs.get_name()]
+
+        # StableHLO remainder takes the sign of the dividend (C-style), while MIL's
+        # `mod` follows Python semantics (sign of the divisor), so compute
+        # `lhs - trunc_div(lhs, rhs) * rhs` explicitly
+        quotient = self.__trunc_div(lhs, rhs, get_mil_type(lhs))
+        result = mb.sub(x=lhs, y=mb.mul(x=quotient, y=rhs))
+        context.add_result(op.result, result)
 
     @register_stablehlo_op
     def op_floor(self, context: TranslationContext, op: FloorOp):
@@ -1595,6 +1603,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context.pop_function()
 
         return outputs
+
+    def __trunc_div(self, lhs, rhs, operand_type):
+        # Division truncating toward zero, as required by the StableHLO spec.
+        # MIL's `floor_div` rounds toward negative infinity, so divide the magnitudes
+        # and re-apply the sign
+        if types.is_float(operand_type):
+            quotient = mb.real_div(x=lhs, y=rhs)
+            return mb.mul(x=mb.sign(x=quotient), y=mb.floor(x=mb.abs(x=quotient)))
+        elif types.is_int(operand_type):
+            sign = mb.mul(x=mb.sign(x=lhs), y=mb.sign(x=rhs))
+            quotient = mb.floor_div(x=mb.abs(x=lhs), y=mb.abs(x=rhs))
+            return mb.mul(x=sign, y=quotient)
+        else:
+            raise ValueError(f"Unknown dtype {operand_type}")
 
     def __simple_unary_op(self, context: TranslationContext, mil_op, hlo_op):
         operand = context[hlo_op.operand.get_name()]
