@@ -108,9 +108,6 @@ ignore = [
     "SIM102",  # nested if → combined if — can hurt readability
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLC0415"]  # imports inside test functions are valid for heavy deps
-
 [project.urls]
 Homepage = "https://github.com/kasper0406/stablehlo-coreml"
 Issues = "https://github.com/kasper0406/stablehlo-coreml/issues"

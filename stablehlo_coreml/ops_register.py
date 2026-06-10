@@ -12,7 +12,7 @@ def register_stablehlo_op(func):
     params = params[1:]
 
     error_msg = "HLO op implementations should take parameters of exactly " \
-                "(context: TranscriptionContext, op: <HLO_OP_TYPE>)"
+                "(context: TranslationContext, op: <HLO_OP_TYPE>)"
     if len(params) != 2:
         raise ValueError(error_msg)
 
