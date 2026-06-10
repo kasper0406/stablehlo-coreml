@@ -10,7 +10,7 @@ StableHLO is the portability layer used by ML frameworks like [JAX](https://gith
 pip install stablehlo-coreml
 ```
 
-Requires Python 3.9+ and targets iOS/macOS 18+.
+Requires Python 3.10–3.13 and targets iOS/macOS 18+.
 
 ## Supported Frameworks
 
