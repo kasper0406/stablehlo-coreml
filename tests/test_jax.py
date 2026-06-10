@@ -30,6 +30,15 @@ def test_div():
     run_and_compare(jnp.divide, (jnp.int32(1), jnp.zeros((dim_size, dim_size), dtype=jnp.int32)))
 
 
+def test_integer_div_with_negative_values():
+    a = jnp.array([-7, 7, -7, 7], dtype=jnp.int32)
+    b = jnp.array([2, 2, -2, -2], dtype=jnp.int32)
+    # `stablehlo.divide` truncates toward zero for integers
+    run_and_compare_specific_input(jax.lax.div, (a, b))
+    # `//` is floor division, which JAX lowers as trunc-div plus a sign correction
+    run_and_compare_specific_input(lambda x, y: x // y, (a, b))
+
+
 def test_tensor_multiplication():
     def scalar_product(lhs, rhs):
         return jnp.einsum("a,a", lhs, rhs)
@@ -802,6 +811,20 @@ def test_remainder():
     ))
     run_and_compare(jnp.remainder, (
         jnp.array([10.5, 20.2, 30.1], dtype=jnp.float32), jnp.array([3.1, 7.2, 11.3], dtype=jnp.float32)
+    ))
+
+
+def test_remainder_with_negative_values():
+    a = jnp.array([-7, 7, -7, 7], dtype=jnp.int32)
+    b = jnp.array([2, 2, -2, -2], dtype=jnp.int32)
+    # `stablehlo.remainder` takes the sign of the dividend (C-style)
+    run_and_compare_specific_input(jax.lax.rem, (a, b))
+    # `%` is Python-style modulo, which JAX lowers as C-style rem plus a sign correction
+    run_and_compare_specific_input(lambda x, y: x % y, (a, b))
+
+    run_and_compare_specific_input(jax.lax.rem, (
+        jnp.array([-7.5, 7.5, -7.5, 7.5], dtype=jnp.float32),
+        jnp.array([2.0, 2.0, -2.0, -2.0], dtype=jnp.float32),
     ))
 
 
