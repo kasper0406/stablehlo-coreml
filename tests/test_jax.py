@@ -238,6 +238,115 @@ def test_reduce_window():
     )
 
 
+def test_reduce_window_init_value():
+    """
+    Per the StableHLO spec, the init value seeds every window's reduction:
+      result = reduce(window_elements, init_value)
+    """
+    def compare_and_ensure_no_loops(jax_func, inputs):
+        cml_model = run_and_compare_specific_input(jax_func, inputs)
+        assert "while_loop" not in get_model_instruction_types(cml_model)
+        assert "sliding_windows" not in get_model_instruction_types(cml_model)
+
+    # max with init=0 over all-negative inputs must return zeros
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=0.0,
+            computation=jax.lax.max,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((0, 0), (0, 0)),
+        ),
+        (-jnp.arange(1, 17, dtype=jnp.float32).reshape((4, 4)),)
+    )
+    # min with init=0 over all-positive inputs must return zeros
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=0.0,
+            computation=jax.lax.min,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((0, 0), (0, 0)),
+        ),
+        (jnp.arange(1, 17, dtype=jnp.float32).reshape((4, 4)),)
+    )
+    # add with a non-zero init value must add the init exactly once per window
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=5.0,
+            computation=jax.lax.add,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((0, 0), (0, 0)),
+        ),
+        (jnp.arange(16, dtype=jnp.float32).reshape((4, 4)),)
+    )
+    # add with non-zero init and padding: padded elements contribute the init value
+    # once each, and the reduction seed contributes it exactly once more (no double counting)
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=2.0,
+            computation=jax.lax.add,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((1, 1), (1, 1)),
+        ),
+        (jnp.arange(16, dtype=jnp.float32).reshape((4, 4)),)
+    )
+    # max with init=0, padding, and all-negative inputs (init via both padding and seed)
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=0.0,
+            computation=jax.lax.max,
+            window_dimensions=(3, 3),
+            window_strides=(1, 1),
+            padding=((1, 1), (1, 1)),
+        ),
+        (-jnp.arange(1, 17, dtype=jnp.float32).reshape((4, 4)),)
+    )
+    # add with non-zero int init value
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=3,
+            computation=jax.lax.add,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((0, 0), (0, 0)),
+        ),
+        (jnp.arange(16, dtype=jnp.int32).reshape((4, 4)),)
+    )
+    # add with non-zero int init value and padding
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=3,
+            computation=jax.lax.add,
+            window_dimensions=(2, 2),
+            window_strides=(2, 2),
+            padding=((1, 1), (1, 1)),
+        ),
+        (jnp.arange(16, dtype=jnp.int32).reshape((4, 4)),)
+    )
+    # window of all-ones dimensions still seeds with the init value
+    compare_and_ensure_no_loops(
+        partial(
+            jax.lax.reduce_window,
+            init_value=0.0,
+            computation=jax.lax.max,
+            window_dimensions=(1, 1),
+            window_strides=(1, 1),
+            padding=((0, 0), (0, 0)),
+        ),
+        (-jnp.arange(1, 17, dtype=jnp.float32).reshape((4, 4)),)
+    )
+
+
 def test_complex_reductions():
     """
     These reductions are complicated, and will be handled using while loops (potentially unrolled)
