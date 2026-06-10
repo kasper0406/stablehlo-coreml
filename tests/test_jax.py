@@ -943,6 +943,44 @@ def test_pad_int32():
     run_and_compare(partial(jnp.pad, pad_width=((1, 1), (2, 2))), (jnp.zeros((5, 5), dtype=jnp.int32),))
 
 
+def test_pad_no_runtime_pad_construction():
+    # The pad amounts are compile-time constants, so no scatter ops should be
+    # emitted to construct the pad vector at runtime
+    cml_model = run_and_compare(partial(jnp.pad, pad_width=((1, 2), (3, 4))), (jnp.zeros((5, 5)),))
+    assert "scatter_along_axis" not in get_model_instruction_types(cml_model)
+
+
+def test_pad_negative():
+    def pad_fn(padding_config, padding_value=0.0, dtype=jnp.float32):
+        return partial(jax.lax.pad, padding_value=dtype(padding_value), padding_config=padding_config)
+
+    # Negative (crop) on some dims, positive (pad) on others
+    run_and_compare_specific_input(
+        pad_fn(((-2, 3, 0), (4, -5, 0))),
+        (jnp.arange(10 * 20, dtype=jnp.float32).reshape(10, 20),),
+    )
+    # Negative on both edges of the same dim
+    run_and_compare_specific_input(
+        pad_fn(((-1, -2, 0), (2, 2, 0)), padding_value=1.5),
+        (jnp.arange(8 * 6, dtype=jnp.float32).reshape(8, 6),),
+    )
+    # Pure crop (all edges negative or zero)
+    run_and_compare_specific_input(
+        pad_fn(((-3, -1, 0), (0, -4, 0))),
+        (jnp.arange(10 * 12, dtype=jnp.float32).reshape(10, 12),),
+    )
+    # Rank 3 mixing negative, zero and positive edges
+    run_and_compare_specific_input(
+        pad_fn(((-1, 2, 0), (0, 0, 0), (3, -2, 0)), padding_value=-7.25),
+        (jnp.arange(4 * 5 * 6, dtype=jnp.float32).reshape(4, 5, 6),),
+    )
+    # int32 with negative padding
+    run_and_compare_specific_input(
+        pad_fn(((-2, 2, 0), (1, -3, 0)), padding_value=7, dtype=jnp.int32),
+        (jnp.arange(6 * 9, dtype=jnp.int32).reshape(6, 9),),
+    )
+
+
 def test_remainder():
     run_and_compare(jnp.remainder, (
         jnp.array([10, 20, 30], dtype=jnp.int32), jnp.array([3, 7, 11], dtype=jnp.int32)
@@ -1246,10 +1284,6 @@ def test_round_nearest_even():
 
 
 def test_logistic():
-    import numpy as np
-    from jax._src.interpreters import mlir as jax_mlir
-    from jax._src.lib.mlir import ir
-
     # Current JAX decomposes `jax.lax.logistic` into primitive ops instead of
     # emitting `stablehlo.logistic`, so handcraft a module to exercise the op,
     # since other StableHLO producers emit it directly.

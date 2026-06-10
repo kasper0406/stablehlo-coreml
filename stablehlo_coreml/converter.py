@@ -102,6 +102,7 @@ from .utils import (
     range_along_dim,
     safe_cast_to_int32,
     update_tensor_by_slice,
+    zero_tensor,
 )
 
 
@@ -452,24 +453,33 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             raise ValueError("Interior padding is not supported")
 
         operand_rank = len(op.operand.type.shape)
-        indices = np.arange(2 * operand_rank, dtype=np.int32)
-        pad = np.zeros_like(indices)
-        pad = mb.scatter_along_axis(
-            data=pad,
-            indices=indices[::2],
-            mode="update",
-            updates=np.array(op.edge_padding_low, dtype=np.int32)
-        )
-        pad = mb.scatter_along_axis(
-            data=pad,
-            indices=indices[1::2],
-            mode="update",
-            updates=np.array(op.edge_padding_high, dtype=np.int32)
-        )
+        padding_low = safe_cast_to_int32(op.edge_padding_low, "edge_padding_low")
+        padding_high = safe_cast_to_int32(op.edge_padding_high, "edge_padding_high")
 
-        cml_padding_value = context[op.padding_value.get_name()]
-        cml_op = pad_with_cast(x=operand, pad=pad, mode="constant", constant_val=cml_padding_value)
-        context.add_result(op.result, cml_op)
+        # StableHLO allows negative edge padding, which crops elements from the
+        # corresponding edge. `mb.pad` does not support negative values, so we
+        # handle the negative components with a `slice_by_index` crop, and the
+        # non-negative components with a regular pad. Since interior padding is
+        # rejected above, each edge is either cropped or padded (never both),
+        # so the order of the two operations does not matter.
+        result = operand
+        if np.any(padding_low < 0) or np.any(padding_high < 0):
+            begin = np.maximum(-padding_low, 0).tolist()
+            # For dims cropped at the high edge, a negative end index counts
+            # from the end of the dimension. Un-cropped dims are masked out, so
+            # this also works for symbolic shapes.
+            end = np.minimum(padding_high, 0).tolist()
+            end_mask = (padding_high >= 0).tolist()
+            result = mb.slice_by_index(x=result, begin=begin, end=end, end_mask=end_mask)
+
+        pad = np.zeros(2 * operand_rank, dtype=np.int32)
+        pad[0::2] = np.maximum(padding_low, 0)
+        pad[1::2] = np.maximum(padding_high, 0)
+
+        if np.any(pad > 0) or result is operand:
+            cml_padding_value = context[op.padding_value.get_name()]
+            result = pad_with_cast(x=result, pad=pad, mode="constant", constant_val=cml_padding_value)
+        context.add_result(op.result, result)
 
     @register_stablehlo_op
     def op_sqrt(self, context: TranslationContext, op: SqrtOp):
@@ -1314,7 +1324,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         result_types = [result.type for result in op.results]
         reduction_results = [
             mb.transpose(
-                x=np.zeros(result_type.shape, dtype=get_numpy_type(result_type.element_type)),
+                x=zero_tensor(result_type.shape, get_numpy_type(result_type.element_type)),
                 perm=permutation,
             )
             for result_type in result_types

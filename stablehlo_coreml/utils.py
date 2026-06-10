@@ -54,6 +54,13 @@ def fix_scalar_tensor(tensor):
     return tensor
 
 
+def zero_tensor(shape, dtype):
+    """Create a zero tensor without embedding a dense zero constant."""
+    if len(shape) == 0:
+        return np.zeros(shape, dtype=dtype)
+    return mb.tile(x=np.zeros((1,) * len(shape), dtype=dtype), reps=shape)
+
+
 def _flatten_list(lst):
     flat_list = []
     for item in lst:
