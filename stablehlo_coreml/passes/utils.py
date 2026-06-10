@@ -8,4 +8,6 @@ def register_optimizations():
     custom_passes = [remove_noop_slice_update]
 
     for custom_pass in custom_passes:
-        DEFAULT_HLO_PIPELINE.append_pass(f"common::{custom_pass.__name__}")
+        pass_name = f"common::{custom_pass.__name__}"
+        if pass_name not in DEFAULT_HLO_PIPELINE.passes:
+            DEFAULT_HLO_PIPELINE.append_pass(pass_name)
