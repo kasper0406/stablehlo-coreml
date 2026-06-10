@@ -1172,11 +1172,25 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         inputs = [context[input.get_name()] for input in op.inputs]
         init_values = [context[init_value.get_name()] for init_value in op.init_values]
 
-        # Pad the inputs if required before attempting simple match
+        # Pad the inputs if required before attempting simple match.
+        # XLA reduces each window over its in-bounds elements only, seeded with the
+        # init value exactly once per window (the seed itself is folded in by the
+        # reduction implementations). Padded elements must therefore act as the
+        # identity of the computation: for idempotent reductions (max/min/or/and)
+        # padding with the init value is equivalent, but for add/mul we must pad
+        # with the actual identity (0/1) to avoid counting the padded elements.
         if op.padding:
+            _, _, mode = match_computation(op.body)
+            identities = {"add": 0, "mul": 1}
             padding = np.reshape(np.array(op.padding, dtype=np.int32), (2 * inputs_rank,))
+
+            def padding_value(input, init_value):
+                if mode in identities:
+                    return np.array(identities[mode], dtype=get_numpy_type(input))
+                return mb.reduce_max(x=init_value)
+
             inputs = [
-                pad_with_cast(x=input, pad=padding, constant_val=mb.reduce_max(x=init_value))
+                pad_with_cast(x=input, pad=padding, constant_val=padding_value(input, init_value))
                 for input, init_value in zip(inputs, init_values)
             ]
 

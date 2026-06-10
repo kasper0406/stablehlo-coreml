@@ -59,6 +59,16 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
     x = inputs[0]
     rank = len(window_dimensions)
 
+    # Per the StableHLO spec, the init value participates in every window's reduction:
+    #   result = reduce(window_elements, init_value)
+    # The pooling/conv ops below do not know about the init value, so we fold it in
+    # exactly once after pooling. Note that padded elements are handled separately
+    # (the converter pads the input with the init value before calling this function).
+    mil_init_fold = {"max": mb.maximum, "min": mb.minimum, "add": mb.add}[mode]
+
+    def fold_init_value(res):
+        return mil_init_fold(x=res, y=init_values[0])
+
     # CoreML pool/conv instructions support up to 3 spatial dimensions for sliding windows.
     spatial_rank = 0
     for i in range(rank):
@@ -67,7 +77,8 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
             break
 
     if spatial_rank == 0:
-        return x
+        # Even for windows of size 1, the init value still seeds each window's reduction.
+        return fold_init_value(x)
 
     if spatial_rank > 3:
         return None
@@ -118,7 +129,9 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
 
     final_res = mb.reshape(x=pool_res, shape=out_shape)
 
-    return final_res
+    # Fold in the init value after any cast back to the original dtype, so that the
+    # init value (which has the original input dtype) is combined in its own dtype.
+    return fold_init_value(final_res)
 
 
 def compute_reduction(converter, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
