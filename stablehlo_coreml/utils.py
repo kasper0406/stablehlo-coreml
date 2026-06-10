@@ -98,7 +98,8 @@ def _resolve_slice_spec(tensor, slice_spec) -> ResolvedSliceSpec:
             start_indices.append(spec.start or 0)
             end_indices.append(spec.stop or tensor.shape[dim_counter])
             strides.append(spec.step or 1)
-            shape.append(end_indices[-1] - start_indices[-1] // strides[-1])
+            # A slice [start:end:stride] selects ceil((end - start) / stride) elements
+            shape.append(-(-(end_indices[-1] - start_indices[-1]) // strides[-1]))
             dim_counter += 1
         elif isinstance(spec, type(Ellipsis)):
             if any([isinstance(s, type(Ellipsis)) for s in slice_spec[i+1:]]):
