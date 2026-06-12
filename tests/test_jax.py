@@ -946,8 +946,8 @@ def test_ceil():
 
 
 def test_clamp():
-    run_and_compare(partial(jnp.clip, a_min=0.0, a_max=1.0), (jnp.array([-1.0, 0.5, 2.0], dtype=jnp.float32),))
-    run_and_compare(partial(jnp.clip, a_min=-5, a_max=5), (jnp.array([-10, 0, 10], dtype=jnp.int32),))
+    run_and_compare(partial(jnp.clip, min=0.0, max=1.0), (jnp.array([-1.0, 0.5, 2.0], dtype=jnp.float32),))
+    run_and_compare(partial(jnp.clip, min=-5, max=5), (jnp.array([-10, 0, 10], dtype=jnp.int32),))
 
 
 def test_sort():

@@ -31,7 +31,7 @@ dependencies = [
     # However, the code relies on the mlir StableHLO python bindings, and currently they are not published to pip
     # and the only pre-built stand-alone library is only built for linux.
     # Onces https://github.com/openxla/stablehlo/issues/2346 is resolved, this dependency can be switch to stablehlo instead.
-    "jax>=0.9.1,<0.10",
+    "jax>=0.9.1,<0.11",
 ]
 
 [tool.hatch.version]
@@ -49,11 +49,11 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "flax>=0.12.5",
+    "flax>=0.12.7",
     "flatbuffers",
     "einops",
     "pillow",
-    "equinox>=0.13.6",
+    "equinox>=0.13.8",
     "pytest-cov",
 ]
 
@@ -69,11 +69,11 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "torch>=2.9.1",
+    "torch>=2.12.0",
     "torchvision",
     "torchax",
     "flax", # torchax wants flax to be installed
-    "transformers>=5.3.0",
+    "transformers>=5.12.0",
 ]
 
 [tool.hatch.envs.lint]
