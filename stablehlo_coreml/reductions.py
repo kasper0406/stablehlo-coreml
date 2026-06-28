@@ -38,9 +38,16 @@ def match_computation(hlo_body):
         AndOp: (None, mb.logical_and, "and"),
     }
 
+    # Ops for which the operand order does not matter
+    commutative_ops = (MaxOp, MinOp, AddOp, MulOp, OrOp, AndOp)
+
     for generic_reduce_op_type, mil_equivalents in simple_matches.items():
         if len(ops) == 2 and isinstance(ops[0], generic_reduce_op_type) and isinstance(ops[1], ReturnOp):
-            if list(ops[0].operands) == args and list(ops[1].operands) == list(ops[0].results):
+            operands = list(ops[0].operands)
+            operands_match = operands == args or (
+                issubclass(generic_reduce_op_type, commutative_ops) and operands == args[::-1]
+            )
+            if operands_match and list(ops[1].operands) == list(ops[0].results):
                 return mil_equivalents
 
     return None, None, None

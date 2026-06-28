@@ -2,9 +2,18 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
+from jax._src.interpreters import mlir as jax_mlir
+from jax._src.lib.mlir import ir
+from jax.lax import GatherDimensionNumbers, ScatterDimensionNumbers
 
-from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_specific_input
+from tests.utils import (
+    get_model_instruction_types,
+    run_and_compare,
+    run_and_compare_hlo_module,
+    run_and_compare_specific_input,
+)
 
 
 def test_addition():
@@ -153,6 +162,34 @@ def test_boolean_reductions():
     compare_and_ensure_no_loops(partial(jnp.any, axis=0), (int_3d,))
     compare_and_ensure_no_loops(partial(jnp.all, axis=0), (int_2d,))
     compare_and_ensure_no_loops(partial(jnp.all, axis=1), (int_3d,))
+
+
+def test_reduce_with_reversed_operands():
+    """A reduce body written as `add(arg1, arg0)` should still match the fast
+    MIL reduction path for commutative ops, instead of falling back to the
+    slow while-loop implementation."""
+    mlir_text = """
+    module {
+      func.func public @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
+        %init = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+        %0 = "stablehlo.reduce"(%arg0, %init) ({
+          ^bb0(%a: tensor<f32>, %b: tensor<f32>):
+            %sum = stablehlo.add %b, %a : tensor<f32>
+            stablehlo.return %sum : tensor<f32>
+        }) {dimensions = array<i64: 1>} : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+        return %0 : tensor<2xf32>
+      }
+    }
+    """
+    context = jax_mlir.make_ir_context()
+    hlo_module = ir.Module.parse(mlir_text, context=context)
+
+    x = np.arange(6, dtype=np.float32).reshape(2, 3)
+    cml_model = run_and_compare_hlo_module(hlo_module, (x,), x.sum(axis=1))
+
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_sum" in ops
+    assert "while_loop" not in ops
 
 
 def test_reduce_window():
@@ -417,8 +454,6 @@ def test_take():
 
 
 def test_gather():
-    from jax.lax import GatherDimensionNumbers
-
     def wrapped_gather(dimension_numbers, slice_sizes):
         @jax.jit
         def internal_gather(operand, start_indices):
@@ -520,8 +555,6 @@ def test_gather():
 
 
 def test_complex_gather():
-    from jax.lax import GatherDimensionNumbers
-
     def wrapped_gather(dimension_numbers, slice_sizes):
         @jax.jit
         def internal_gather(operand, start_indices):
@@ -586,8 +619,6 @@ def test_complex_gather():
 def test_large_gather():
     # Test gather with large indices to verify if optimization is necessary
     # and if it works correctly.
-    from jax.lax import GatherDimensionNumbers
-
     def wrapped_gather(dimension_numbers, slice_sizes):
         @jax.jit
         def internal_gather(operand, start_indices):
@@ -676,8 +707,6 @@ def test_simple_scatter():
 
 
 def test_scatter_with_dimension_numbers():
-    from jax.lax import ScatterDimensionNumbers
-
     def wrapped_scatter_add(dimension_numbers):
         @jax.jit
         def internal_scatter_add(operand, scatter_indices, updates):

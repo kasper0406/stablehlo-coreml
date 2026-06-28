@@ -634,13 +634,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if sort_keys is None:
             raise ValueError("Unrecognized comparator format")
 
-        # Apply the sort
-        sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
-        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
-
         # Given CoreML's argsort is unstable we are not able to handle multiple sort keys
         if len(sort_keys) > 1:
             raise ValueError("Having more than one sort key is not supported because MIL's argsort is not supported")
+
+        # Apply the sort
+        sort_dim, (key, ascending) = op.dimension.value, sort_keys[-1]
+        indices = mb.argsort(x=key, axis=sort_dim, ascending=ascending)
         # The following code would be used if CoreML had a stable argsort
         # for key, ascending in sort_keys[-2::-1]:
         #     gathered_key = mb.gather_along_axis(x=key, indices=indices, axis=sort_dim)
@@ -725,14 +725,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             result_idx = op.broadcast_dimensions[i]
             reshaped_operand_shape[result_idx] = op_shape
 
-        x = mb.reshape(x=x, shape=reshaped_operand_shape)
+        if reshaped_operand_shape != list(op.operand.type.shape):
+            x = mb.reshape(x=x, shape=reshaped_operand_shape)
 
         result_tiling = [1] * result_shape_rank
         for result_dim, current_shape in enumerate(reshaped_operand_shape):
             # Replicate data along dimension `dim` until the result dimension matches
             assert result_shape[result_dim] % current_shape == 0
             result_tiling[result_dim] = result_shape[result_dim] // current_shape
-        x = mb.tile(x=x, reps=result_tiling)
+        if any(rep != 1 for rep in result_tiling):
+            x = mb.tile(x=x, reps=result_tiling)
 
         context.add_result(op.result, x)
 
