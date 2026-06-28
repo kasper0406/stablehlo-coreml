@@ -22,6 +22,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     Atan2Op,
     BroadcastInDimOp,
     CaseOp,
+    CbrtOp,
     CeilOp,
     ClampOp,
     CompareOp,
@@ -47,6 +48,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     IotaOp,
     IsFiniteOp,
     Log1pOp,
+    LogisticOp,
     LogOp,
     MaxOp,
     MinOp,
@@ -62,6 +64,7 @@ from jaxlib.mlir.dialects.stablehlo import (
     ReshapeOp,
     ReturnOp,
     ReverseOp,
+    RoundNearestEvenOp,
     RoundOp,
     RsqrtOp,
     ScatterOp,
@@ -367,9 +370,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             rounded_magnitude = mb.floor(x=shifted)
             result = mb.mul(x=rounded_magnitude, y=mb.sign(x=operand))
             context.add_result(op.result, result)
-        # elif op.OPERATION_NAME == 'stablehlo.round_nearest_even':
+        elif op.OPERATION_NAME == 'stablehlo.round_nearest_even':
+            # MIL's `round` rounds half-way cases to the nearest even integer
+            # (verified against the CoreML CPU runtime), matching the
+            # `stablehlo.round_nearest_even` semantics.
+            context.add_result(op.result, mb.round(x=operand))
         else:
             raise ValueError(f"Unsupported RoundOp type of {op.OPERATION_NAME}")
+
+    @register_stablehlo_op
+    def op_round_nearest_even(self, context: TranslationContext, op: RoundNearestEvenOp):
+        # `RoundNearestEvenOp` is a distinct op class from `RoundOp`, but the
+        # handling is shared in `op_round`, dispatching on `OPERATION_NAME`.
+        self.op_round(context, op)
 
     @register_stablehlo_op
     def op_neg(self, context: TranslationContext, op: NegOp):
@@ -461,6 +474,19 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     @register_stablehlo_op
     def op_sqrt(self, context: TranslationContext, op: SqrtOp):
         self.__simple_unary_op(context, mb.sqrt, op)
+
+    @register_stablehlo_op
+    def op_cbrt(self, context: TranslationContext, op: CbrtOp):
+        # cbrt(x) = sign(x) * |x|^(1/3)
+        # A plain `pow(x, 1/3)` would produce NaN for negative x.
+        operand = context[op.operand.get_name()]
+        magnitude = mb.pow(x=mb.abs(x=operand), y=1.0 / 3.0)
+        result = mb.mul(x=magnitude, y=mb.sign(x=operand))
+        context.add_result(op.result, result)
+
+    @register_stablehlo_op
+    def op_logistic(self, context: TranslationContext, op: LogisticOp):
+        self.__simple_unary_op(context, mb.sigmoid, op)
 
     @register_stablehlo_op
     def op_constant(self, context: TranslationContext, op: ConstantOp):

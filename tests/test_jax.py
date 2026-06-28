@@ -1231,6 +1231,44 @@ def test_afz():
     run_and_compare_specific_input(ties, (jnp.array([-0.5, 0.5, 5.5, -4.5]),))
 
 
+def test_cbrt():
+    x = jnp.array([-27.0, -8.0, -1.0, -0.3, 0.0, 0.5, 1.0, 8.0, 27.0])
+    assert "stablehlo.cbrt" in jax.jit(jnp.cbrt).lower(x).as_text()
+    run_and_compare_specific_input(jnp.cbrt, (x,))
+
+
+def test_round_nearest_even():
+    # `jnp.round` lowers to `stablehlo.round_nearest_even`, which rounds
+    # half-way cases to the nearest even integer (banker's rounding)
+    x = jnp.array([0.5, 1.5, 2.5, -0.5, -1.5, 3.5, -2.5, 0.4999, -1.5001, 7.0])
+    assert "stablehlo.round_nearest_even" in jax.jit(jnp.round).lower(x).as_text()
+    run_and_compare_specific_input(jnp.round, (x,))
+
+
+def test_logistic():
+    import numpy as np
+    from jax._src.interpreters import mlir as jax_mlir
+    from jax._src.lib.mlir import ir
+
+    # Current JAX decomposes `jax.lax.logistic` into primitive ops instead of
+    # emitting `stablehlo.logistic`, so handcraft a module to exercise the op,
+    # since other StableHLO producers emit it directly.
+    mlir_text = """
+    module {
+      func.func public @main(%arg0: tensor<6xf32>) -> tensor<6xf32> {
+        %0 = stablehlo.logistic %arg0 : tensor<6xf32>
+        return %0 : tensor<6xf32>
+      }
+    }
+    """
+    context = jax_mlir.make_ir_context()
+    hlo_module = ir.Module.parse(mlir_text, context=context)
+
+    x = np.array([-10.0, -2.0, -0.5, 0.0, 1.0, 8.0], dtype=np.float32)
+    expected = np.asarray(jax.nn.sigmoid(x))
+    run_and_compare_hlo_module(hlo_module, (x,), (expected,))
+
+
 def test_xor():
     run_and_compare(jnp.logical_xor, (
         jnp.array([False, False, True, True]),
