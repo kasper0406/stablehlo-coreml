@@ -249,6 +249,24 @@ def test_symbolic_multi_dim():
     run_and_compare_symbolic(f, specs, test_shapes)
 
 
+def test_symbolic_negative_pad():
+    """Negative padding crops correctly when an input axis is symbolic."""
+    def f(x):
+        return jax.lax.pad(
+            x,
+            padding_value=jnp.array(1.5, dtype=x.dtype),
+            padding_config=((2, 3, 0), (1, -2, 0)),
+        )
+
+    (n,) = _sym("n")
+    specs = [jax.ShapeDtypeStruct((n, 5), jnp.float32)]
+    test_shapes = [
+        (np.arange(2 * 5, dtype=np.float32).reshape(2, 5),),
+        (np.arange(7 * 5, dtype=np.float32).reshape(7, 5),),
+    ]
+    run_and_compare_symbolic(f, specs, test_shapes)
+
+
 # ---------------------------------------------------------------------------
 # Attention-like pattern (the motivating use case)
 # ---------------------------------------------------------------------------

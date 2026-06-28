@@ -5,7 +5,7 @@ from coremltools.converters.mil.mil import types
 from jaxlib.mlir.dialects.stablehlo import AddOp, AndOp, DivOp, MaxOp, MinOp, MulOp, OrOp, ReturnOp, SubtractOp
 
 from .translation_context import TranslationContext
-from .utils import dtype_str, get_numpy_type, index_by_slices, iterate_indexes_in_shapes, update_tensor_by_slice
+from .utils import dtype_str, get_numpy_type, index_by_slices, iterate_indexes_in_shapes, update_tensor_by_slice, zero_tensor
 
 
 def match_computation(hlo_body):
@@ -199,12 +199,7 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
             for acc, result in zip(partial_results, reduction_results)
         ]
 
-    mil_results = [
-        np.zeros(result_type.shape, dtype=get_numpy_type(result_type))
-        if len(result_type.shape) == 0 else
-        mb.tile(x=np.zeros((1,) * len(result_type.shape), dtype=get_numpy_type(result_type)), reps=result_type.shape)
-        for result_type in result_types
-    ]
+    mil_results = [zero_tensor(result_type.shape, get_numpy_type(result_type)) for result_type in result_types]
     mil_results = iterate_indexes_in_shapes(compute_reduction_loop, [result_shape], mil_results, unroll_limit=5)
     return mil_results
 
