@@ -71,7 +71,11 @@ extra-dependencies = [
     "pytest",
     "torch>=2.12.0",
     "torchvision",
-    "torchax",
+    # torchax 0.0.13 imports removed PyTorch 2.13 named-tensor overloads
+    # (aten.prod.dim_Dimname) at module import. google/torchax#102 is on
+    # 0.0.14.dev* nightlies (no stable 0.0.14 yet). Pin the post-fix nightly
+    # exactly so hatch/pip will install the pre-release without --pre.
+    "torchax==0.0.14.dev20260814",
     "flax", # torchax wants flax to be installed
     "transformers>=5.12.0",
 ]
