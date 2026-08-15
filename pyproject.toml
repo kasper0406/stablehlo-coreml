@@ -69,8 +69,12 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "torch>=2.12.0",
-    "torchvision",
+    # torchax 0.0.13 still references named-tensor Dimname overloads
+    # (aten.prod.dim_Dimname) that PyTorch 2.13 removed. torchvision 0.28
+    # requires torch==2.13.0, so keep both below that pair until a stable
+    # torchax release drops Dimname (google/torchax#102 is only on nightlies).
+    "torch>=2.12.0,<2.13",
+    "torchvision>=0.27.0,<0.28",
     "torchax",
     "flax", # torchax wants flax to be installed
     "transformers>=5.12.0",
