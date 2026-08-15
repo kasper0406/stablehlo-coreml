@@ -113,29 +113,18 @@ See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 
 ## Graph optimization passes
 
-`build_pass_pipeline()` extends coremltools' default pipeline with a set of MIL graph
-passes that clean up and fuse the patterns the StableHLO lowering produces:
-
-| Pass | What it does |
-|------|--------------|
-| `remove_broadcast_tiles` | Drops the `tile` ops that StableHLO's explicit broadcasting produces when the consumer broadcasts natively (also keeps scalar constants from being materialised at full size). |
-| `fuse_reduce_keep_dims` | Folds `reduce_*(keep_dims=False) → reshape` into `reduce_*(keep_dims=True)`, unlocking coremltools' own `reduce_mean` fusions. |
-| `remove_noop_slice_update` | Removes full-tensor `slice_update`s. |
-| `replace_decomposed_softmax` | Replaces JAX's decomposed softmax (`reduce_max → sub → exp → reduce_sum → real_div`) with MIL `softmax`. |
-| `fuse_attention_to_sdpa` | Fuses `matmul → [scale] → [mask] → softmax → matmul` into `scaled_dot_product_attention` (bool/additive/constant masks, GQA layouts, explicit or Gemma-style scaling, and PyTorch's `_safe_softmax` wrapper). |
-| `fuse_logit_softcap` | Fuses `tanh(x / cap) * cap` into `scaled_tanh`. |
-| `fuse_gelu_erfc` | Fuses the `erfc`-based exact GELU emitted by `jax.nn.gelu(approximate=False)` into MIL `gelu` (`chlo.erf`/`chlo.erfc` are mapped to MIL `erf` by the converter). |
-
-Passes are registered under the `common::` namespace and can be removed or configured
-like any coremltools pass, e.g.
+`build_pass_pipeline()` extends coremltools' default pipeline with a set of graph passes
+that clean up and fuse the patterns produced by the StableHLO lowering — for example
+attention blocks become a single `scaled_dot_product_attention` op, decomposed softmax /
+GELU / logit soft-capping become their native Core ML ops, and redundant broadcasts are
+removed. The passes live in `stablehlo_coreml/passes/` and are registered under the
+`common::` namespace, so they can be removed or configured like any coremltools pass:
 
 ```python
 pipeline = build_pass_pipeline()
 pipeline.remove_passes(["common::fuse_attention_to_sdpa"])
-# A `select` fill of exactly -inf always becomes a boolean SDPA mask. Use one for
-# finite fill values as well (-1e9, `torch.finfo(dtype).min`) -- cheaper, but a
-# fully masked row becomes NaN instead of the uniform distribution the original
-# graph produced:
+# Use a boolean SDPA mask even for finite mask fill values such as -1e9 (cheaper, but a
+# fully masked row becomes NaN instead of a uniform distribution):
 pipeline.set_options("common::fuse_attention_to_sdpa", {"finite_fill_mask": "bool"})
 ```
 

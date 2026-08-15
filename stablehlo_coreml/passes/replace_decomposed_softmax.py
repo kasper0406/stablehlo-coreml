@@ -19,13 +19,15 @@ pass matches the part that actually defines softmax::
     real_div(exp(z), broadcast(reduce_sum(exp(z), axis)))  ==  softmax(z, axis)
 
 and then, as a bonus, peels a leading ``sub(x, c)`` off ``z`` whenever ``c`` is
-constant along ``axis`` -- softmax is invariant under such a shift, so the whole
-``reduce_max``/``maximum``/``reshape`` chain becomes dead. That covers the
-``maximum(-inf, .)`` clamps and the permuted layouts for free.
+constant along ``axis`` and is not a statically known non-finite value --
+softmax is invariant under such a shift, so the whole ``reduce_max``/
+``maximum``/``reshape`` chain becomes dead. That covers the ``maximum(-inf,
+.)`` clamps and the permuted layouts for free.
 """
 
 import logging
 
+import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
@@ -141,6 +143,7 @@ def _match(real_div_op):
         and sole_consumer(softmax_input) is exp_op
         and shapes_equal(sub_op.inputs["x"].shape, full_shape)
         and _is_constant_along(sub_op.inputs["y"], axis, rank)
+        and not _is_statically_nonfinite(sub_op.inputs["y"])
     ):
         softmax_input = sub_op.inputs["x"]
 
@@ -172,6 +175,19 @@ def _is_constant_along(var, axis: int, rank: int) -> bool:
         return False
     padded = (1,) * (rank - len(shape)) + shape
     return dims_equal(padded[axis], 1)
+
+
+def _is_statically_nonfinite(var) -> bool:
+    """True if a compile-time shift contains NaN or infinity."""
+    val = getattr(var, "val", None)
+    if val is None:
+        op = getattr(var, "op", None)
+        if op is not None and op.op_type == "fill":
+            return _is_statically_nonfinite(op.inputs.get("value"))
+        return False
+
+    arr = np.asarray(val)
+    return np.issubdtype(arr.dtype, np.floating) and not bool(np.all(np.isfinite(arr)))
 
 
 @block_context_manager
@@ -224,8 +240,9 @@ class replace_decomposed_softmax(AbstractGraphPass):
     ``tile`` ops broadcasting the sum back to the input shape and the ``cast``
     pair that JAX adds around ``reduce_sum`` for fp16 inputs are matched as
     well. The subtraction is only peeled off when the subtrahend is constant
-    along the softmax axis (which is what makes softmax invariant under it);
-    otherwise the ``sub`` output becomes the softmax input.
+    along the softmax axis (which is what makes softmax invariant under it)
+    and is not statically known to contain NaN or infinity; otherwise the
+    ``sub`` output becomes the softmax input.
     """
 
     def apply(self, prog):

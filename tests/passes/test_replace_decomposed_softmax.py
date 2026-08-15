@@ -152,6 +152,17 @@ class TestReplaceDecomposedSoftmax:
         _apply(prog)
         assert get_op_types_in_program(prog) == ["sub", "softmax"]
 
+    def test_keeps_a_statically_nonfinite_shift(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
+        def prog(x):
+            shifted = mb.sub(x=x, y=np.float32(np.inf))
+            exponentiated = mb.exp(x=shifted)
+            total = mb.reduce_sum(x=exponentiated, axes=[1], keep_dims=True)
+            return mb.real_div(x=exponentiated, y=total)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["sub", "softmax"]
+
     def test_uses_the_reduce_sum_axis(self):
         """The softmax axis is the one the sum reduces over, not the max's."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])

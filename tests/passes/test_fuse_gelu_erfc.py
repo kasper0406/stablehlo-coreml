@@ -99,6 +99,14 @@ class TestFuseGeluErfc:
         _apply(prog)
         assert "gelu" not in get_op_types_in_program(prog)
 
+    def test_not_fused_for_a_nearby_factor(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 8))])
+        def prog(x):
+            return _erfc_gelu(x, factor=0.7062)
+
+        _apply(prog)
+        assert "gelu" not in get_op_types_in_program(prog)
+
     def test_not_fused_without_the_negation(self):
         """`0.5 * x * (1 - erf(x/sqrt(2)))` is not GELU (it is x - gelu(x))."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(4, 8))])

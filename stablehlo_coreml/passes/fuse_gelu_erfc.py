@@ -34,7 +34,8 @@ _HALF_TOLERANCE = 1e-4
 _ONE_TOLERANCE = 1e-4
 # The erf argument must be -x/sqrt(2); the factor is compared with this tolerance.
 _FACTOR = -1.0 / math.sqrt(2.0)
-_FACTOR_TOLERANCE = 1e-3
+# Wide enough for fp16 rounding, but not for merely GELU-like formulae.
+_FACTOR_TOLERANCE = 1e-4
 
 # Upper bound on the number of scaling/negation ops peeled off the erf argument.
 # The converter emits at most two (a negate and a multiply); the bound just keeps

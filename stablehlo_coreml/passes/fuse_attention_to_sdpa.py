@@ -65,9 +65,6 @@ _LAYOUT_OPS = frozenset({"reshape", "expand_dims", "squeeze", "transpose"})
 # A `select` fill at or below this value means "mask this key out".
 _MASK_FILL_THRESHOLD = -1e4
 
-# Tolerance when checking that a detected scale cancels SDPA's 1/sqrt(E).
-_SCALE_TOLERANCE = 1e-3
-
 # Ops that a boolean predicate may be routed through without changing which
 # rows it selects (a `tile` only when it merely broadcasts).
 _PREDICATE_LAYOUT_OPS = frozenset({"reshape", "expand_dims", "squeeze", "cast"})
@@ -936,7 +933,7 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
     # -- scale: SDPA always divides by sqrt(E) ------------------------------
     scale = 1.0 if pattern.scale is None else float(pattern.scale)
     factor = scale * math.sqrt(embedding)
-    if abs(factor - 1.0) >= _SCALE_TOLERANCE:
+    if factor != 1.0:
         query = mb.mul(
             x=query,
             y=_np_scalar(factor, query.dtype),

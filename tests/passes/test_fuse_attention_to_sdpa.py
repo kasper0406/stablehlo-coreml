@@ -282,11 +282,25 @@ class TestFuseAttentionToSdpa:
         _apply(prog)
         ops = get_op_types_in_program(prog)
         factor = scale * math.sqrt(E)
-        if abs(factor - 1.0) < 1e-3:
+        if factor == 1.0:
             assert ops == ["scaled_dot_product_attention"]
         else:
             assert ops == ["mul", "scaled_dot_product_attention"]
             np.testing.assert_allclose(_ops(prog)[-2].y.val, factor, rtol=1e-5)
+
+    def test_near_builtin_scale_is_preserved(self):
+        scale = np.float32(0.4999)
+
+        @mb.program(input_specs=_qkv_specs(), opset_version=ct.target.iOS18)
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            scaled = mb.mul(x=scores, y=scale)
+            weights = mb.softmax(x=scaled, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["mul", "scaled_dot_product_attention"]
+        np.testing.assert_allclose(_ops(prog)[-2].y.val, float(scale) * math.sqrt(E), rtol=1e-7)
 
     def test_transposed_key(self):
         """`transpose_y=False` means the key still has to be transposed."""
