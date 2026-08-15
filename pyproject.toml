@@ -69,13 +69,13 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    # torchax 0.0.13 still references named-tensor Dimname overloads
-    # (aten.prod.dim_Dimname) that PyTorch 2.13 removed. torchvision 0.28
-    # requires torch==2.13.0, so keep both below that pair until a stable
-    # torchax release drops Dimname (google/torchax#102 is only on nightlies).
-    "torch>=2.12.0,<2.13",
-    "torchvision>=0.27.0,<0.28",
-    "torchax",
+    "torch>=2.12.0",
+    "torchvision",
+    # torchax 0.0.13 imports removed PyTorch 2.13 named-tensor overloads
+    # (aten.prod.dim_Dimname) at module import. google/torchax#102 is on
+    # 0.0.14.dev* nightlies (no stable 0.0.14 yet). Pin the post-fix nightly
+    # exactly so hatch/pip will install the pre-release without --pre.
+    "torchax==0.0.14.dev20260814",
     "flax", # torchax wants flax to be installed
     "transformers>=5.12.0",
 ]
