@@ -143,26 +143,51 @@ def convert(
     return converter.convert(module)
 
 
+def _composite_wrapped_op_names() -> list[str]:
+    """The CHLO op names that the converter has a dedicated composite handler for."""
+    return sorted(
+        name for name in StableHloConverter._composite_ops_registry if name.startswith("chlo.")
+    )
+
+
 def _normalize_module(module: ir.Module) -> None:
     """Normalize an incoming StableHLO module in-place before conversion.
 
-    Two passes are applied in sequence:
+    Three passes are applied in sequence:
 
-    1. ``chlo-legalize-to-stablehlo`` – lowers any raw CHLO ops that appear
-       *outside* a ``stablehlo.composite`` wrapper (e.g. from the
-       ``jax.jit().lower().compiler_ir('stablehlo')`` path) to their StableHLO
-       equivalents.  Ops already wrapped in a composite are intentionally left
-       untouched; the composite handlers in the converter map them directly to
-       CoreML primitives, bypassing the (potentially unsupported) stablehlo
-       decompositions.
+    1. ``stablehlo-wrap-in-composite`` – wraps the raw CHLO ops we have a
+       dedicated handler for (see :func:`_composite_wrapped_op_names`) in a
+       ``stablehlo.composite``, keeping their decomposition in a separate
+       private function.  ``jax.export`` already does this for some CHLO ops,
+       but ``jax.jit().lower().compiler_ir('stablehlo')`` hands us the raw CHLO
+       ops; wrapping makes both paths behave the same.  It also covers ops that
+       ``jax.export`` does *not* wrap (notably ``chlo.erfc``).
 
-    2. ``stablehlo-legalize-deprecated-ops`` – rewrites any deprecated
+    2. ``chlo-legalize-to-stablehlo`` – lowers any remaining CHLO ops (the ones
+       we have no handler for, plus the bodies of the decomposition functions)
+       to their StableHLO equivalents.  Ops wrapped in a composite are
+       intentionally left untouched; the composite handlers in the converter map
+       them directly to CoreML primitives, bypassing the (potentially
+       unsupported, and always much larger) stablehlo decompositions.
+
+    3. ``stablehlo-legalize-deprecated-ops`` – rewrites any deprecated
        StableHLO ops to their current equivalents, keeping the converter
        insulated from older serialized modules.
+
+    The decomposition functions created by step 1 are private, so
+    :meth:`StableHloConverter.convert` skips them; they are only walked when a
+    composite has no registered handler.
     """
     stablehlo_dialect.register_stablehlo_passes()
+
+    passes = []
+    op_names = ",".join(_composite_wrapped_op_names())
+    if op_names:
+        passes.append(f"stablehlo-wrap-in-composite{{op-names={op_names}}}")
+    passes.append("func.func(chlo-legalize-to-stablehlo, stablehlo-legalize-deprecated-ops)")
+
     pm = passmanager.PassManager.parse(
-        "builtin.module(func.func(chlo-legalize-to-stablehlo, stablehlo-legalize-deprecated-ops))",
+        f"builtin.module({','.join(passes)})",
         context=module.context,
     )
     pm.run(module.operation)
@@ -286,6 +311,20 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         values, indices = mb.topk(x=x, k=k, ascending=not largest)
         context.add_result(op.results[0], values)
         context.add_result(op.results[1], indices)
+
+    @register_composite_op("chlo.erf")
+    def _op_composite_chlo_erf(self, context: TranslationContext, op: CompositeOp):
+        # CoreML has erf natively; the stablehlo decomposition is a ~40 op
+        # rational polynomial.
+        x = context[op.inputs[0].get_name()]
+        context.add_result(op.results[0], mb.erf(x=x))
+
+    @register_composite_op("chlo.erfc")
+    def _op_composite_chlo_erfc(self, context: TranslationContext, op: CompositeOp):
+        x = context[op.inputs[0].get_name()]
+        # erfc(x) = 1 - erf(x). Keeping the `1 - erf(...)` shape also lets the
+        # `fuse_gelu_erfc` MIL pass recognise an exact GELU.
+        context.add_result(op.results[0], mb.sub(x=1.0, y=mb.erf(x=x)))
 
     @register_composite_op("chlo.asin")
     def _op_composite_chlo_asin(self, context: TranslationContext, op: CompositeOp):

@@ -5,7 +5,7 @@ import pytest
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 
-from tests.utils import flatten, run_and_compare_hlo_module
+from tests.utils import flatten, get_model_instruction_types, run_and_compare_hlo_module
 
 torch = pytest.importorskip("torch")
 torchvision = pytest.importorskip("torchvision")
@@ -89,7 +89,18 @@ def _filter_unused_inputs(jaxpr, inputs):
     return [inputs[i].detach().numpy() for i in used_input_indices]
 
 
-def evaluate_pytorch_model(model, inputs, compute_units=ct.ComputeUnit.CPU_ONLY):
+def evaluate_pytorch_model(
+    model,
+    inputs,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+    expected_op_counts: dict[str, int] | None = None,
+):
+    """Convert `model`, check it against PyTorch, and return the CoreML model.
+
+    `expected_op_counts` asserts how often the named MIL ops occur in the
+    converted model, which is how the graph passes (SDPA fusion, GELU fusion,
+    ...) are regression tested on real architectures.
+    """
     hlo_module, module_inputs = export_to_stablehlo_module(model, inputs)
 
     model_outputs = model(*inputs)
@@ -119,7 +130,7 @@ def evaluate_pytorch_model(model, inputs, compute_units=ct.ComputeUnit.CPU_ONLY)
                              "This likely means the model has uninitialized weights")
 
     # These models are quite big, so tolerances are relaxed
-    run_and_compare_hlo_module(
+    cml_model = run_and_compare_hlo_module(
         hlo_module,
         module_inputs,
         expected_outputs,
@@ -128,6 +139,13 @@ def evaluate_pytorch_model(model, inputs, compute_units=ct.ComputeUnit.CPU_ONLY)
         rtol=5e-02,
         compute_units=compute_units,
     )
+
+    if expected_op_counts is not None:
+        ops = get_model_instruction_types(cml_model)
+        actual = {op_type: ops.count(op_type) for op_type in expected_op_counts}
+        assert actual == expected_op_counts
+
+    return cml_model
 
 
 # ==============================================================================
@@ -153,7 +171,15 @@ def test_tinyllama():
     prompt = "Hello, my name is"
     inputs = tokenizer(prompt, return_tensors="pt")
 
-    evaluate_pytorch_model(model, (inputs.input_ids, ))
+    evaluate_pytorch_model(
+        model,
+        (inputs.input_ids, ),
+        # One fused attention block per decoder layer, and no softmax left over.
+        expected_op_counts={
+            "scaled_dot_product_attention": config.num_hidden_layers,
+            "softmax": 0,
+        },
+    )
 
 
 def test_t5_small():
@@ -175,7 +201,17 @@ def test_t5_small():
     attention_mask = torch.ones_like(input_ids)
 
     # T5Model forward: (input_ids, attention_mask, decoder_input_ids, ...)
-    evaluate_pytorch_model(model, (input_ids, attention_mask, decoder_input_ids))
+    # Encoder self-attention + decoder self- and cross-attention. The relative
+    # position bias is folded into a constant additive mask on the scores.
+    attention_blocks = config.num_layers + 2 * config.num_decoder_layers
+    evaluate_pytorch_model(
+        model,
+        (input_ids, attention_mask, decoder_input_ids),
+        expected_op_counts={
+            "scaled_dot_product_attention": attention_blocks,
+            "softmax": 0,
+        },
+    )
 
 
 def test_distilbert():
@@ -189,7 +225,14 @@ def test_distilbert():
     model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of distilbert", return_tensors="pt")
-    evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
+    evaluate_pytorch_model(
+        model,
+        (inputs.input_ids, inputs.attention_mask),
+        expected_op_counts={
+            "scaled_dot_product_attention": config.n_layers,
+            "softmax": 0,
+        },
+    )
 
 
 def test_gpt2():
@@ -203,7 +246,16 @@ def test_gpt2():
     model = AutoModel.from_config(config)
 
     input_ids = tokenizer("this is a test of gpt2", return_tensors="pt").input_ids
-    evaluate_pytorch_model(model, (input_ids, ))
+    evaluate_pytorch_model(
+        model,
+        (input_ids, ),
+        expected_op_counts={
+            "scaled_dot_product_attention": config.n_layer,
+            "softmax": 0,
+            # gpt2 uses the tanh GELU approximation, which coremltools fuses.
+            "gelu": config.n_layer,
+        },
+    )
 
 
 def test_bert():
@@ -217,7 +269,14 @@ def test_bert():
     model = AutoModel.from_config(config)
 
     inputs = tokenizer("this is a test of bert", return_tensors="pt")
-    evaluate_pytorch_model(model, (inputs.input_ids, inputs.attention_mask))
+    evaluate_pytorch_model(
+        model,
+        (inputs.input_ids, inputs.attention_mask),
+        expected_op_counts={
+            "scaled_dot_product_attention": config.num_hidden_layers,
+            "softmax": 0,
+        },
+    )
 
 
 # ==============================================================================
@@ -245,10 +304,16 @@ def test_whisper_tiny():
 
     # Whisper forward: (input_features, attention_mask, decoder_input_ids, ...)
     # Temporary workaround: Whisper hits a CoreML CPU backend bug, so allow all compute units.
+    # Encoder self-attention + decoder self- and cross-attention.
+    attention_blocks = config.encoder_layers + 2 * config.decoder_layers
     evaluate_pytorch_model(
         model,
         (input_features, attention_mask, decoder_input_ids),
         compute_units=ct.ComputeUnit.ALL,
+        expected_op_counts={
+            "scaled_dot_product_attention": attention_blocks,
+            "softmax": 0,
+        },
     )
 
 
@@ -265,7 +330,17 @@ def test_convnext_tiny():
 def test_vit_b_16():
     inputs = (torch.randn(1, 3, 224, 224), )
     model = torchvision.models.vit_b_16(weights="DEFAULT")
-    evaluate_pytorch_model(model, inputs)
+    # torch's `_safe_softmax` wrapper is peeled off, so every block fuses.
+    # ViT's exact (erf) GELU is not fused: torchax expands `erf` into a
+    # polynomial that neither coremltools nor `fuse_gelu_erfc` recognises.
+    evaluate_pytorch_model(
+        model,
+        inputs,
+        expected_op_counts={
+            "scaled_dot_product_attention": len(model.encoder.layers),
+            "softmax": 0,
+        },
+    )
 
 
 def test_efficientnet_b0():

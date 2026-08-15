@@ -29,16 +29,22 @@ To convert a StableHLO module:
 
 ```python
 import coremltools as ct
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec, convert
+from stablehlo_coreml import StateSpec, build_pass_pipeline, convert
 
 mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
 )
 ```
+
+`build_pass_pipeline()` returns a fresh `ct.PassPipeline` built from
+`ct.PassPipeline.DEFAULT` with the stablehlo-coreml graph passes inserted at the right
+places. Pass your own `base` pipeline to customise it, e.g.
+`build_pass_pipeline(my_pipeline)`. The pre-built `stablehlo_coreml.DEFAULT_HLO_PIPELINE`
+is the same thing, constructed once at import time — copy it before mutating it.
 
 ### Obtaining a StableHLO Module from JAX
 
@@ -85,7 +91,7 @@ cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
 )
 
 state = cml_model.make_state()
@@ -104,6 +110,34 @@ fp16). They are removed from the model's inputs, and the outputs that update
 them are dropped.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
+
+## Graph optimization passes
+
+`build_pass_pipeline()` extends coremltools' default pipeline with a set of MIL graph
+passes that clean up and fuse the patterns the StableHLO lowering produces:
+
+| Pass | What it does |
+|------|--------------|
+| `remove_broadcast_tiles` | Drops the `tile` ops that StableHLO's explicit broadcasting produces when the consumer broadcasts natively (also keeps scalar constants from being materialised at full size). |
+| `fuse_reduce_keep_dims` | Folds `reduce_*(keep_dims=False) → reshape` into `reduce_*(keep_dims=True)`, unlocking coremltools' own `reduce_mean` fusions. |
+| `remove_noop_slice_update` | Removes full-tensor `slice_update`s. |
+| `replace_decomposed_softmax` | Replaces JAX's decomposed softmax (`reduce_max → sub → exp → reduce_sum → real_div`) with MIL `softmax`. |
+| `fuse_attention_to_sdpa` | Fuses `matmul → [scale] → [mask] → softmax → matmul` into `scaled_dot_product_attention` (bool/additive/constant masks, GQA layouts, explicit or Gemma-style scaling, and PyTorch's `_safe_softmax` wrapper). |
+| `fuse_logit_softcap` | Fuses `tanh(x / cap) * cap` into `scaled_tanh`. |
+| `fuse_gelu_erfc` | Fuses the `erfc`-based exact GELU emitted by `jax.nn.gelu(approximate=False)` into MIL `gelu` (`chlo.erf`/`chlo.erfc` are mapped to MIL `erf` by the converter). |
+
+Passes are registered under the `common::` namespace and can be removed or configured
+like any coremltools pass, e.g.
+
+```python
+pipeline = build_pass_pipeline()
+pipeline.remove_passes(["common::fuse_attention_to_sdpa"])
+# A `select` fill of exactly -inf always becomes a boolean SDPA mask. Use one for
+# finite fill values as well (-1e9, `torch.finfo(dtype).min`) -- cheaper, but a
+# fully masked row becomes NaN instead of the uniform distribution the original
+# graph produced:
+pipeline.set_options("common::fuse_attention_to_sdpa", {"finite_fill_mask": "bool"})
+```
 
 ## Dynamic / symbolic shapes
 

@@ -345,6 +345,39 @@ def run_and_compare(
     )
 
 
+def run_and_compare_jit_lowering(
+    jax_func,
+    inputs,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+):
+    """
+    Same as `run_and_compare_specific_input`, but takes the StableHLO module from
+    `jax.jit(...).lower(...).compiler_ir("stablehlo")` instead of `jax.export`.
+
+    That path hands the converter raw CHLO ops (`jax.export` legalizes most of
+    them away first), so it exercises the composite handlers for ops such as
+    `chlo.erf` / `chlo.erfc`.
+    """
+    jax_func = jax.jit(jax_func)
+    hlo_module = jax_func.lower(*flatten(inputs)).compiler_ir("stablehlo")
+
+    jax_input_values = __nest_flat_jax_input_to_input_spec(inputs, flatten(inputs))
+    expected_output = jax_func(*jax_input_values)
+
+    return run_and_compare_hlo_module(
+        hlo_module,
+        inputs,
+        expected_output,
+        max_complexity=max_complexity,
+        atol=atol,
+        rtol=rtol,
+        compute_units=compute_units,
+    )
+
+
 def get_model_instruction_types(cml_model) -> list[str]:
     def collect_ops(ops: list) -> list[str]:
         collected_ops = []

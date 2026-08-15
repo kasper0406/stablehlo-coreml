@@ -2,6 +2,7 @@ import numpy as np
 from coremltools import _logger as logger
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 from jaxlib.mlir.dialects.stablehlo import AddOp, AndOp, DivOp, MaxOp, MinOp, MulOp, OrOp, ReturnOp, SubtractOp
 
 from .translation_context import TranslationContext
@@ -141,12 +142,67 @@ def match_simple_reduce_window(body, inputs, init_values, window_dimensions, win
     return fold_init_value(final_res)
 
 
+def _is_identity_init(mode, init_value, x) -> bool:
+    """True if `init_value` is a constant equal to the identity element of `mode`.
+
+    Combining a reduction result with the identity element is a no-op, so the
+    clamp the StableHLO spec requires can be skipped. The dtype matters for the
+    integer/boolean cases (max: the smallest representable value, min: the largest).
+    """
+    val = getattr(init_value, "val", None)
+    if val is None:
+        return False
+    arr = np.asarray(val)
+    if arr.size != 1:
+        return False
+    value = arr.reshape(-1)[0]
+
+    dtype = x.dtype
+    match mode:
+        case "add":
+            return bool(value == 0)
+        case "mul":
+            return bool(value == 1)
+        case "or":
+            return not bool(value)
+        case "and":
+            return bool(value)
+        case "max" | "min":
+            if types.is_bool(dtype):
+                return bool(value) == (mode == "min")
+            if types.is_float(dtype):
+                return bool(np.isinf(value)) and ((value < 0) == (mode == "max"))
+            if types.is_int(dtype):
+                int_info = np.iinfo(types.nptype_from_builtin(dtype))
+                return bool(value == (int_info.min if mode == "max" else int_info.max))
+    return False
+
+
+def _can_skip_init_value(mode, dimensions, inputs, init_values) -> bool:
+    """True if folding in the reduction init value can be skipped entirely.
+
+    This requires the init value to be the identity element of the reduction, and
+    every reduced dimension to be statically known to be non-empty (for an empty
+    reduction, the MIL reduce op result is undefined, so the init value must stay).
+    """
+    if len(inputs) != 1 or len(init_values) != 1:
+        return False
+    x = inputs[0]
+    for dim in dimensions:
+        size = x.shape[dim]
+        if is_symbolic(size) or int(size) == 0:
+            return False
+    return _is_identity_init(mode, init_values[0], x)
+
+
 def compute_reduction(converter, context: TranslationContext, inputs, dimensions, body, init_values, result_types):
     mil_reduction, mil_single_reduction, mode = match_computation(body)
     if mil_reduction and mil_single_reduction and len(inputs) == 1:
         res = mil_reduction(x=inputs[0], axes=np.array(dimensions, dtype=np.int32))
-        # Handle initial value
-        res = mil_single_reduction(x=res, y=init_values[0])
+        # Handle initial value. If it is the identity element of the reduction, combining
+        # it in is a no-op and we skip it to keep the generated program small.
+        if not _can_skip_init_value(mode, dimensions, inputs, init_values):
+            res = mil_single_reduction(x=res, y=init_values[0])
         return [res]
 
     # Boolean Or/And: MIL has no reduce_or/reduce_and, so lower via
@@ -159,7 +215,8 @@ def compute_reduction(converter, context: TranslationContext, inputs, dimensions
         else:
             res = mb.reduce_min(x=x_int, axes=axes)
         res = mb.cast(x=res, dtype="bool")
-        res = mil_single_reduction(x=res, y=init_values[0])
+        if not _can_skip_init_value(mode, dimensions, inputs, init_values):
+            res = mil_single_reduction(x=res, y=init_values[0])
         return [res]
 
     # Fall back to loop implementation
