@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from functools import partial, reduce
 
 import numpy as np
@@ -105,8 +106,25 @@ from .utils import (
     zero_tensor,
 )
 
+# Core ML can only serialize state tensors as fp16. fp32 HLO state is
+# stored as fp16 and cast to/from the computation dtype around read/write.
+_STATE_VALUE_DTYPES = frozenset({types.fp16, types.fp32})
 
-def convert(module, minimum_deployment_target: AvailableTarget):
+
+def convert(
+    module,
+    minimum_deployment_target: AvailableTarget,
+    states: Mapping[int | str, int] | None = None,
+):
+    """Convert a StableHLO module to a MIL program.
+
+    ``states`` maps function inputs that should become Core ML state
+    tensors onto the output that holds the updated value. Keys are input
+    indices or argument names; values are output indices. Those outputs
+    are written back with ``coreml_update_state`` and omitted from the
+    function results. State is stored as fp16 (a Core ML requirement);
+    fp32 values are cast around the read/write.
+    """
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
 
@@ -114,8 +132,88 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     _normalize_module(module)
 
-    converter = StableHloConverter(opset_version=minimum_deployment_target)
+    converter = StableHloConverter(opset_version=minimum_deployment_target, states=states)
     return converter.convert(module)
+
+
+def _argument_name_aliases(arg) -> list[str]:
+    names: list[str] = []
+    raw = arg.get_name()
+    if raw:
+        names.append(raw)
+        if raw.startswith("%"):
+            names.append(raw[1:])
+
+    loc = getattr(arg, "location", None)
+    loc_name = getattr(loc, "name", None) if loc is not None else None
+    if loc_name:
+        names.append(str(loc_name))
+    return names
+
+
+def _function_outputs(hlo_func: FuncOp):
+    func_type = getattr(hlo_func, "type", None)
+    if func_type is None:
+        return None
+    for attr in ("results", "outputs"):
+        values = getattr(func_type, attr, None)
+        if values is not None:
+            return values
+    return None
+
+
+def _resolve_state_map(hlo_func: FuncOp, states: Mapping[int | str, int]) -> dict[int, int]:
+    args = list(hlo_func.arguments)
+    name_to_idx: dict[str, int] = {}
+    for i, arg in enumerate(args):
+        for alias in _argument_name_aliases(arg):
+            name_to_idx.setdefault(alias, i)
+
+    results = _function_outputs(hlo_func)
+    num_outputs = len(results) if results is not None else None
+
+    resolved: dict[int, int] = {}
+    output_owners: dict[int, int] = {}
+    for key, out_idx in states.items():
+        if isinstance(out_idx, bool) or not isinstance(out_idx, int):
+            raise TypeError(f"State output index must be an int, got {out_idx!r}")
+        if isinstance(key, bool) or not isinstance(key, (int, str)):
+            raise TypeError(f"State input must be an int index or str name, got {key!r}")
+
+        if isinstance(key, int):
+            in_idx = key
+        elif key not in name_to_idx:
+            known = ", ".join(sorted(name_to_idx)) or "<none>"
+            raise ValueError(f"Unknown state input {key!r}. Known argument names: {known}")
+        else:
+            in_idx = name_to_idx[key]
+
+        if not 0 <= in_idx < len(args):
+            raise ValueError(
+                f"State input index {in_idx} is out of range for a function with {len(args)} arguments"
+            )
+        if in_idx in resolved:
+            raise ValueError(f"Function argument {in_idx} is mapped as state more than once")
+        if out_idx < 0:
+            raise ValueError(f"State output index {out_idx} is invalid")
+        if num_outputs is not None and out_idx >= num_outputs:
+            raise ValueError(
+                f"State output index {out_idx} is out of range for a function with {num_outputs} outputs"
+            )
+        if out_idx in output_owners:
+            raise ValueError(
+                f"Output {out_idx} cannot update both argument {output_owners[out_idx]} and {in_idx}"
+            )
+        if results is not None and args[in_idx].type != results[out_idx]:
+            raise ValueError(
+                f"State input {in_idx} has type {args[in_idx].type}, but output "
+                f"{out_idx} has type {results[out_idx]}"
+            )
+
+        resolved[in_idx] = out_idx
+        output_owners[out_idx] = in_idx
+
+    return resolved
 
 
 def _normalize_module(module: ir.Module) -> None:
@@ -145,10 +243,15 @@ def _normalize_module(module: ir.Module) -> None:
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 
-    def __init__(self, opset_version: int | None = None):
+    def __init__(
+        self,
+        opset_version: int | None = None,
+        states: Mapping[int | str, int] | None = None,
+    ):
         self.opset_version = AvailableTarget(opset_version) if opset_version is not None else None
         self.prog = mil.Program()
         self.func_index = {}
+        self.states = dict(states) if states else {}
 
     def convert(self, module: ir.Module) -> Program:
         logger.info("Converting graph.")
@@ -166,9 +269,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
+        state_map = _resolve_state_map(hlo_func, self.states) if self.states else {}
+
         func_inputs = {}
+        state_output_index: dict[str, int] = {}
+        state_compute_dtype: dict[str, object] = {}
         sym_counter = 0
-        for arg in hlo_func.arguments:
+        for in_idx, arg in enumerate(hlo_func.arguments):
             shape = arg.type.shape
             if shape == []:
                 shape = [1]
@@ -183,15 +290,58 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         new_shape.append(d)
                 shape = new_shape
 
-            func_inputs[arg.get_name()] = mb.placeholder(
-                shape=shape, dtype=get_mil_type_from_ir(arg.type.element_type)
-            )
+            name = arg.get_name()
+            dtype = get_mil_type_from_ir(arg.type.element_type)
+            if in_idx in state_map:
+                if any(is_symbolic(d) for d in shape):
+                    raise ValueError(f"State input {name} must have a static shape, got {shape}")
+                if dtype not in _STATE_VALUE_DTYPES:
+                    raise ValueError(
+                        f"State input {name} has dtype {dtype_str(dtype)}, "
+                        "but Core ML states must be floating point (stored as fp16)"
+                    )
+                func_inputs[name] = mb.state_tensor_placeholder(shape=shape, dtype=types.fp16)
+                state_output_index[name] = state_map[in_idx]
+                state_compute_dtype[name] = dtype
+            else:
+                func_inputs[name] = mb.placeholder(shape=shape, dtype=dtype)
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
+            state_vars = {}
             for name in func_inputs:
-                context.add_variable(name, ssa_func.inputs[name])
+                var = ssa_func.inputs[name]
+                if name in state_output_index:
+                    state_vars[name] = var
+                    var = mb.read_state(input=var)
+                    compute_dtype = state_compute_dtype[name]
+                    if compute_dtype != types.fp16:
+                        var = mb.cast(x=var, dtype=dtype_str(compute_dtype))
+                context.add_variable(name, var)
 
-            ssa_func.set_outputs(self.process_block(context, hlo_func.body.blocks[0]))
+            outputs = self.process_block(context, hlo_func.body.blocks[0])
+            if outputs is None:
+                outputs = []
+
+            consumed = set()
+            updated_states = []
+            for name, out_idx in state_output_index.items():
+                if not 0 <= out_idx < len(outputs):
+                    raise ValueError(
+                        f"State output index {out_idx} is out of range for a function "
+                        f"with {len(outputs)} outputs"
+                    )
+                value = outputs[out_idx]
+                if state_compute_dtype[name] != types.fp16:
+                    value = mb.cast(x=value, dtype="fp16")
+                updated_states.append(mb.coreml_update_state(state=state_vars[name], value=value))
+                consumed.add(out_idx)
+
+            # Core ML requires at least one output, so keep the updated
+            # state values if every result was consumed by a state write.
+            final_outputs = [out for i, out in enumerate(outputs) if i not in consumed]
+            if not final_outputs:
+                final_outputs = updated_states
+            ssa_func.set_outputs(final_outputs)
             self.prog.add_function(hlo_func.name.value, ssa_func)
 
     def process_block(self, context: TranslationContext, block: ir.Block):

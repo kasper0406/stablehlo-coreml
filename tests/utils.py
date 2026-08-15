@@ -253,6 +253,124 @@ def get_model_instruction_types(cml_model) -> list[str]:
     return all_ops
 
 
+def export_hlo_module(jax_func, inputs):
+    """Export ``jax_func`` traced at ``inputs`` to a parsed StableHLO module."""
+    jax_func = jax.jit(jax_func)
+    exported = jax_export(jax_func, inputs)
+    context = jax_mlir.make_ir_context()
+    return ir.Module.parse(exported.mlir_module(), context=context)
+
+
+def _as_numpy(value):
+    """Detach JAX arrays into a Core ML-friendly contiguous ndarray."""
+    return np.array(value, copy=True)
+
+
+def _as_output_tuple(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return (value,)
+
+
+def run_and_compare_stateful(
+    jax_func,
+    initial_inputs,
+    states,
+    extra_nonstate_steps=(),
+    *,
+    max_complexity: int = 10_000,
+    atol=1e-04,
+    rtol=1e-05,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+):
+    """Convert ``jax_func`` with ``states`` and compare multi-step predictions.
+
+    ``states`` maps input indices (or names) to the output index that holds
+    the updated state. ``extra_nonstate_steps`` are tuples of the remaining
+    (non-state) positional arguments for subsequent calls.
+    """
+    jax_func = jax.jit(jax_func)
+    hlo_module = export_hlo_module(jax_func, initial_inputs)
+    mil_program = convert(
+        hlo_module,
+        minimum_deployment_target=ct.target.iOS18,
+        states=states,
+    )
+    cml_model = _convert_mil_to_coreml(
+        mil_program,
+        max_complexity=max_complexity,
+        compute_units=compute_units,
+    )
+
+    resolved_states = {}
+    for key, out_idx in states.items():
+        if isinstance(key, int):
+            resolved_states[key] = out_idx
+        else:
+            mil_func = next(iter(mil_program.functions.values()))
+            for i, name in enumerate(mil_func.inputs):
+                aliases = {name, name.lstrip("%")}
+                if key in aliases:
+                    resolved_states[i] = out_idx
+                    break
+            else:
+                raise ValueError(f"Could not resolve state input {key!r}")
+
+    nonstate_indices = [i for i in range(len(initial_inputs)) if i not in resolved_states]
+    state_indices = [i for i in range(len(initial_inputs)) if i in resolved_states]
+    tensor_names = list(cml_model.input_description)
+    state_names = [feature.name for feature in cml_model._spec.description.state]
+
+    cml_state = cml_model.make_state()
+    for name, idx in zip(state_names, state_indices):
+        cml_state.write_state(name=name, value=_as_numpy(initial_inputs[idx]))
+
+    def run_step(args):
+        expected = _as_output_tuple(jax_func(*args))
+        cml_inputs = {
+            name: _as_numpy(args[idx])
+            for name, idx in zip(tensor_names, nonstate_indices)
+        }
+        cml_outputs = cml_model.predict(cml_inputs, state=cml_state) if cml_inputs else cml_model.predict({}, state=cml_state)
+
+        expected_tensor_outputs = [
+            expected[i] for i in range(len(expected)) if i not in resolved_states.values()
+        ]
+        output_names = list(cml_model.output_description)
+        # If every HLO result is a state update, Core ML still keeps those
+        # values as outputs; ignore the extras when comparing tensors.
+        assert len(output_names) >= len(expected_tensor_outputs)
+        for name, value in zip(output_names, expected_tensor_outputs):
+            np.testing.assert_allclose(
+                np.asarray(cml_outputs[name]),
+                np.asarray(value),
+                atol=atol,
+                rtol=rtol,
+            )
+
+        for name, in_idx in zip(state_names, state_indices):
+            np.testing.assert_allclose(
+                np.asarray(cml_state.read_state(name=name)),
+                np.asarray(expected[resolved_states[in_idx]]),
+                atol=atol,
+                rtol=rtol,
+            )
+        return expected
+
+    outputs = run_step(initial_inputs)
+    for extra in extra_nonstate_steps:
+        next_args = [None] * len(initial_inputs)
+        extra_iter = iter(extra)
+        for i in range(len(initial_inputs)):
+            if i in resolved_states:
+                next_args[i] = outputs[resolved_states[i]]
+            else:
+                next_args[i] = next(extra_iter)
+        outputs = run_step(next_args)
+
+    return cml_model
+
+
 def run_and_compare_symbolic(
     jax_func,
     symbolic_input_specs,

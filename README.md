@@ -62,6 +62,43 @@ hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 
 For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
+## Stateful models
+
+Core ML can keep tensors across `predict` calls as *state* instead of passing
+them in and out every time. Mark those tensors when converting by mapping each
+state input to the output that holds its updated value:
+
+```python
+def step(cache, x):
+    new_cache = cache + x
+    return new_cache * x, new_cache
+
+mil_program = convert(
+    hlo_module,
+    minimum_deployment_target=ct.target.iOS18,
+    states={0: 1},  # input 0 is updated by output 1
+)
+cml_model = ct.convert(
+    mil_program,
+    source="milinternal",
+    minimum_deployment_target=ct.target.iOS18,
+    pass_pipeline=DEFAULT_HLO_PIPELINE,
+)
+
+state = cml_model.make_state()
+# Remaining tensor inputs keep their StableHLO argument names.
+x_name = list(cml_model.input_description)[0]
+y = cml_model.predict({x_name: x}, state=state)
+# `cache` is updated in place; inspect or reset it with
+# state.read_state(...) / state.write_state(...)
+```
+
+Keys may be input indices or argument names. State tensors must have a static
+shape and a floating-point dtype (Core ML stores them as fp16). They do not
+appear in the model's regular inputs or outputs.
+
+See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
+
 ## Dynamic / symbolic shapes
 
 JAX models exported with symbolic dimensions are supported. Symbolic dims flow
