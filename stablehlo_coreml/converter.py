@@ -122,8 +122,11 @@ def convert(
     tensors onto the output that holds the updated value. Keys are input
     indices or argument names; values are output indices. Those outputs
     are written back with ``coreml_update_state`` and omitted from the
-    function results. State is stored as fp16 (a Core ML requirement);
-    fp32 values are cast around the read/write.
+    function results, except when every result is a state write: Core ML
+    requires at least one output, so the updated state values are then
+    kept as results (cast back to the computation dtype). State is stored
+    as fp16 (a Core ML requirement); fp32 values are cast around the
+    read/write.
     """
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
@@ -277,6 +280,11 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         sym_counter = 0
         for in_idx, arg in enumerate(hlo_func.arguments):
             shape = arg.type.shape
+            name = arg.get_name()
+            # Reject dynamic state before constructing MIL Symbols — Symbol
+            # names are process-global and would leak if we raise afterwards.
+            if in_idx in state_map and any(d == DYNAMIC_DIM_SENTINEL for d in shape):
+                raise ValueError(f"State input {name} must have a static shape, got {shape}")
             if shape == []:
                 shape = [1]
             else:
@@ -290,11 +298,8 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         new_shape.append(d)
                 shape = new_shape
 
-            name = arg.get_name()
             dtype = get_mil_type_from_ir(arg.type.element_type)
             if in_idx in state_map:
-                if any(is_symbolic(d) for d in shape):
-                    raise ValueError(f"State input {name} must have a static shape, got {shape}")
                 if dtype not in _STATE_VALUE_DTYPES:
                     raise ValueError(
                         f"State input {name} has dtype {dtype_str(dtype)}, "
@@ -338,9 +343,16 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
             # Core ML requires at least one output, so keep the updated
             # state values if every result was consumed by a state write.
+            # coreml_update_state returns the fp16 storage value; cast
+            # back to the computation dtype so the result matches HLO.
             final_outputs = [out for i, out in enumerate(outputs) if i not in consumed]
             if not final_outputs:
-                final_outputs = updated_states
+                final_outputs = []
+                for updated, name in zip(updated_states, state_output_index):
+                    compute_dtype = state_compute_dtype[name]
+                    if compute_dtype != types.fp16:
+                        updated = mb.cast(x=updated, dtype=dtype_str(compute_dtype))
+                    final_outputs.append(updated)
             ssa_func.set_outputs(final_outputs)
             self.prog.add_function(hlo_func.name.value, ssa_func)
 

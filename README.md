@@ -95,7 +95,9 @@ y = cml_model.predict({x_name: x}, state=state)
 
 Keys may be input indices or argument names. State tensors must have a static
 shape and a floating-point dtype (Core ML stores them as fp16). They do not
-appear in the model's regular inputs or outputs.
+appear in the model's regular inputs. Mapped outputs are omitted unless every
+result updates state; Core ML requires at least one output, so those updated
+values are then kept as results.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 

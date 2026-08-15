@@ -2,6 +2,7 @@ import coremltools as ct
 import jax
 import jax.numpy as jnp
 import pytest
+from coremltools.converters.mil.mil import types
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export, symbolic_shape
@@ -79,9 +80,16 @@ def test_state_only_output():
     def add_into(state, x):
         return state + x
 
+    inputs = (jnp.zeros((4,), dtype=jnp.float32), jnp.arange(4, dtype=jnp.float32))
+    hlo_module = export_hlo_module(add_into, inputs)
+    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18, states={0: 0})
+    mil_func = next(iter(mil_program.functions.values()))
+    assert len(mil_func.outputs) == 1
+    assert mil_func.outputs[0].dtype == types.fp32
+
     run_and_compare_stateful(
         add_into,
-        initial_inputs=(jnp.zeros((4,), dtype=jnp.float32), jnp.arange(4, dtype=jnp.float32)),
+        initial_inputs=inputs,
         states={0: 0},
         extra_nonstate_steps=[
             (jnp.ones((4,), dtype=jnp.float32),),
