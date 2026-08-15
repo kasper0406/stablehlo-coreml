@@ -165,7 +165,7 @@ cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
     inputs=[
         ct.TensorType(name="arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
         ct.TensorType(name="arg1", shape=(4, 3)),
