@@ -3,6 +3,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export, symbolic_shape
@@ -178,3 +179,40 @@ def test_symbolic_state_is_rejected():
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
     with pytest.raises(ValueError, match="static shape"):
         convert(hlo_module, minimum_deployment_target=ct.target.iOS18, states={0: 1})
+
+
+def test_multi_function_module_removes_unmodified_state_updates():
+    ctx = jax_mlir.make_ir_context()
+    mlir_text = """
+    module {
+      func.func public @update(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>) {
+        %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+        return %arg1, %0 : tensor<2xf32>, tensor<2xf32>
+      }
+      func.func public @no_update(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>) {
+        %0 = "stablehlo.multiply"(%arg1, %arg1) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+        return %0, %arg0 : tensor<2xf32>, tensor<2xf32>
+      }
+      func.func public @read_only(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>) {
+        %0 = "stablehlo.add"(%arg0, %arg1) : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xf32>
+        return %0, %arg0 : tensor<2xf32>, tensor<2xf32>
+      }
+    }
+    """
+    hlo_module = ir.Module.parse(mlir_text, context=ctx)
+    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18, states={0: 1})
+
+    PASS_REGISTRY["common::remove_noop_state_update"](mil_program)
+
+    update_ops = [op.op_type for op in mil_program.functions["update"].operations]
+
+    assert "coreml_update_state" in update_ops
+    assert "read_state" in update_ops
+
+    no_update_ops = [op.op_type for op in mil_program.functions["no_update"].operations]
+    assert "coreml_update_state" not in no_update_ops
+    assert "read_state" not in no_update_ops
+
+    read_only_ops = [op.op_type for op in mil_program.functions["read_only"].operations]
+    assert "coreml_update_state" not in read_only_ops
+    assert "read_state" in read_only_ops

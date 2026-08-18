@@ -24,6 +24,7 @@ from tests.utils import run_and_compare_symbolic
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _sym(spec: str):
     """Shorthand for jax.export.symbolic_shape."""
     return export.symbolic_shape(spec)
@@ -35,7 +36,9 @@ def _sym(spec: str):
 #            GetDimensionSizeOp, CustomCallOp(shape_assertion)
 # ---------------------------------------------------------------------------
 
+
 def test_symbolic_add_scalar():
+
     """x + 1.0 with symbolic first dim."""
     def f(x):
         return x + 1.0

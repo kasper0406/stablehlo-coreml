@@ -6,5 +6,5 @@ def test_register_optimizations_is_idempotent():
     register_optimizations()
     register_optimizations()
 
-    pass_name = "common::remove_noop_slice_update"
-    assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == 1
+    assert DEFAULT_HLO_PIPELINE.passes.count("common::remove_noop_slice_update") == 1
+    assert DEFAULT_HLO_PIPELINE.passes.count("common::remove_noop_state_update") == 1
