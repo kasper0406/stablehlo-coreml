@@ -61,6 +61,29 @@ hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 
 For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
+### Input names
+
+> **Breaking change.** Converted model inputs are no longer named `_arg0`,
+> `_arg1`, ... as in previous releases.
+
+An input takes its name from the StableHLO argument's MLIR name location, which
+is where JAX records the traced Python argument name (including the pytree path
+for nested arguments, e.g. `params['w']`). Arguments without such a location —
+typical for modules that were parsed from text or exported by other frontends —
+fall back to their MLIR SSA name without the leading `%`, i.e. `arg0`, `arg1`,
+... . All names are sanitized into valid Core ML identifiers, so the name on the
+final model may differ from the StableHLO one.
+
+Anywhere you refer to inputs by name — `ct.TensorType(name=...)`, the `predict`
+dictionary, `states={...}` keys — use the new names. Read them off the converted
+program rather than hardcoding them:
+
+```python
+mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
+for func in mil_program.functions.values():
+    print(list(func.inputs))
+```
+
 ## Stateful models
 
 Core ML can keep tensors across `predict` calls as *state* instead of passing
@@ -131,7 +154,9 @@ jax_exported = export(jax.jit(jax_function))(
 ```
 
 When converting to a CoreML model, specify `RangeDim` for each symbolic
-dimension so the model accepts a range of sizes at inference time:
+dimension so the model accepts a range of sizes at inference time. Note that a
+symbolic export carries no argument name locations, so the inputs fall back to
+`arg0`, `arg1`, ... (see [Input names](#input-names)):
 
 ```python
 cml_model = ct.convert(
@@ -140,8 +165,8 @@ cml_model = ct.convert(
     minimum_deployment_target=ct.target.iOS18,
     pass_pipeline=DEFAULT_HLO_PIPELINE,
     inputs=[
-        ct.TensorType(name="_arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
-        ct.TensorType(name="_arg1", shape=(4, 3)),
+        ct.TensorType(name="arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
+        ct.TensorType(name="arg1", shape=(4, 3)),
     ],
 )
 ```

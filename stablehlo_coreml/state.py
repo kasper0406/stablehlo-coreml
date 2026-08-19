@@ -1,6 +1,8 @@
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from jaxlib.mlir import ir
 from jaxlib.mlir.dialects.func import FuncOp
 
 
@@ -12,8 +14,13 @@ class StateSpec:
     name: str | None = None
 
 
-StateMapping = Mapping[int | str, int | StateSpec]
+StateMapping = Mapping[int | str, int | StateSpec | None]
 FunctionStateMapping = Mapping[str, StateMapping]
+
+# A `NameLoc` renders as `loc("name")`, or `loc("name"(<child location>))` when it
+# wraps a child location. Other kinds render differently: `loc("file":line:col)`
+# for a file location and `loc(fused[...])` / `loc(callsite(...))` for the rest.
+_NAME_LOCATION_RE = re.compile(r'^loc\("([^"\\]*)"(?:\(.*\))?\)$', re.DOTALL)
 
 
 def _argument_name_aliases(arg) -> list[str]:
@@ -30,25 +37,47 @@ def _argument_name_aliases(arg) -> list[str]:
     return names
 
 
+def _is_name_location(loc) -> bool | None:
+    """Whether ``loc`` is a ``NameLoc``, or ``None`` if it cannot be determined.
+
+    The location kind *must* be checked before reading ``name_str``: on
+    jaxlib 0.9.x (our minimum supported version) reading ``name_str`` off a
+    non-``NameLoc`` segfaults the interpreter rather than raising.
+    """
+    # jaxlib 0.9.x exposes a single `Location` type with `is_a_*` predicates.
+    is_a_name = getattr(loc, "is_a_name", None)
+    if is_a_name is not None:
+        return bool(is_a_name())
+
+    # jaxlib 0.10+ dropped the predicates and instead returns concrete
+    # `Location` subclasses such as `ir.NameLoc` and `ir.FileLineColLoc`.
+    name_loc_cls = getattr(ir, "NameLoc", None)
+    if name_loc_cls is not None:
+        return isinstance(loc, name_loc_cls)
+
+    return None
+
+
 def _argument_location_name(arg) -> str | None:
     loc = getattr(arg, "location", None)
-    name = getattr(loc, "name_str", None) if loc is not None else None
+    if loc is None:
+        return None
+
+    is_name = _is_name_location(loc)
+    if is_name is False:
+        return None
+    if is_name is None:
+        # Unknown binding: fall back to the (stable) textual form rather than
+        # risk reading `name_str` off a location that does not have one.
+        match = _NAME_LOCATION_RE.match(str(loc))
+        name = match.group(1) if match else None
+    else:
+        name = getattr(loc, "name_str", None)
     return name if isinstance(name, str) and name else None
 
 
 def preferred_argument_name(arg) -> str:
     return _argument_location_name(arg) or arg.get_name().lstrip("%")
-
-
-def _function_outputs(hlo_func: FuncOp):
-    func_type = getattr(hlo_func, "type", None)
-    if func_type is None:
-        return None
-    for attr in ("results", "outputs"):
-        values = getattr(func_type, attr, None)
-        if values is not None:
-            return values
-    return None
 
 
 def _result_info_aliases(result_info: str) -> set[str]:
@@ -74,7 +103,12 @@ def _resolve_state_output(hlo_func: FuncOp, output: int | str | None) -> int | N
         return output
 
     matches: dict[str, list[int]] = {}
-    result_attrs = getattr(hlo_func, "result_attrs", ())
+    try:
+        # `FuncOp.result_attrs` raises `KeyError` when the function carries no
+        # `res_attrs` at all, which is the case for hand-written modules.
+        result_attrs = hlo_func.result_attrs
+    except KeyError:
+        result_attrs = ()
     for index, attrs in enumerate(result_attrs):
         try:
             result_info = attrs["jax.result_info"].value
@@ -92,19 +126,23 @@ def _resolve_state_output(hlo_func: FuncOp, output: int | str | None) -> int | N
     return indices[0]
 
 
-def _coerce_state_spec(value: int | StateSpec) -> StateSpec:
+def _coerce_state_spec(value: int | StateSpec | None) -> StateSpec:
     match value:
         case StateSpec():
             spec = value
+        case None:
+            # Read-only state: the argument is exposed as state, but no output
+            # writes back to it.
+            spec = StateSpec(output=None)
         case bool():
             raise TypeError(
-                f"State specification must be a StateSpec or output index, got {value!r}"
+                f"State specification must be a StateSpec, output index, or None, got {value!r}"
             )
         case int():
             spec = StateSpec(output=value)
         case _:
             raise TypeError(
-                f"State specification must be a StateSpec or output index, got {value!r}"
+                f"State specification must be a StateSpec, output index, or None, got {value!r}"
             )
 
     if isinstance(spec.output, bool) or not isinstance(spec.output, (int, str, type(None))):
@@ -121,8 +159,8 @@ def resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, State
         for alias in _argument_name_aliases(arg):
             name_to_idx.setdefault(alias, i)
 
-    results = _function_outputs(hlo_func)
-    num_outputs = len(results) if results is not None else None
+    results = hlo_func.type.results
+    num_outputs = len(results)
 
     resolved: dict[int, StateSpec] = {}
     output_owners: dict[int, int] = {}
@@ -152,7 +190,7 @@ def resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, State
             raise ValueError(f"Core ML state name {spec.name!r} is used more than once")
         if spec.output is not None and spec.output < 0:
             raise ValueError(f"State output index {spec.output} is invalid")
-        if spec.output is not None and num_outputs is not None and spec.output >= num_outputs:
+        if spec.output is not None and spec.output >= num_outputs:
             raise ValueError(
                 f"State output index {spec.output} is out of range for a function with {num_outputs} outputs"
             )
@@ -161,7 +199,7 @@ def resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, State
                 f"Output {spec.output} cannot update both argument "
                 f"{output_owners[spec.output]} and {in_idx}"
             )
-        if spec.output is not None and results is not None and args[in_idx].type != results[spec.output]:
+        if spec.output is not None and args[in_idx].type != results[spec.output]:
             raise ValueError(
                 f"State input {in_idx} has type {args[in_idx].type}, but output "
                 f"{spec.output} has type {results[spec.output]}"
