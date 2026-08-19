@@ -13,7 +13,8 @@ from jax.export import export as _jax_export
 
 from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 from stablehlo_coreml.converter import convert
-from stablehlo_coreml.state import resolve_state_map
+from stablehlo_coreml.function_interface import sanitize_name
+from stablehlo_coreml.state import preferred_argument_name, resolve_state_map
 
 
 def jax_export(jax_func, input_spec):
@@ -173,6 +174,35 @@ def _convert_hlo_module(
     return mil_program, cml_model
 
 
+def model_io_names(cml_model):
+    """Return the ``(input, output, state)`` feature names of ``cml_model``.
+
+    ``input_description``/``output_description`` are empty for multifunction
+    models, whose features live under ``description.functions`` instead.
+    """
+    description = cml_model._spec.description
+    if description.functions:
+        function_name = cml_model.function_name or description.defaultFunctionName
+        description = next(
+            function for function in description.functions if function.name == function_name
+        )
+    return (
+        [feature.name for feature in description.input],
+        [feature.name for feature in description.output],
+        [feature.name for feature in description.state],
+    )
+
+
+def model_for_function(cml_model, function_name, compute_units=ct.ComputeUnit.CPU_ONLY):
+    """Load a single function of a multifunction Core ML model."""
+    return ct.models.MLModel(
+        cml_model.get_spec(),
+        weights_dir=cml_model.weights_dir,
+        function_name=function_name,
+        compute_units=compute_units,
+    )
+
+
 def _compare_model_outputs(
     cml_model,
     inputs,
@@ -181,23 +211,41 @@ def _compare_model_outputs(
     atol,
     rtol,
     state=None,
+    expects_no_outputs=False,
 ):
     """Predict with ``inputs`` and compare the results to ``expected_outputs``.
 
     Inputs and expected outputs are matched positionally against the model
     input/output descriptions. Only the outputs covered by ``expected_outputs``
     are compared, so any extra model output (such as ``state_update_token``) is
-    ignored.
+    ignored. ``expects_no_outputs`` marks the state-only case, where the model
+    has no tensor output beyond that token.
     """
+    input_names, output_names, _ = model_io_names(cml_model)
+    flat_inputs = flatten(inputs)
+    flat_expected = flatten(_as_tuple(expected_outputs))
+
+    # Core ML prunes inputs that the program never reads, so the model may take
+    # fewer inputs than we have values for, but never more.
+    assert len(input_names) <= len(flat_inputs), (
+        f"Model takes inputs {input_names}, but only {len(flat_inputs)} input values were given"
+    )
+    assert len(output_names) >= len(flat_expected), (
+        f"Model produces outputs {output_names}, but {len(flat_expected)} outputs were expected"
+    )
+
     cml_input_key_values = {
         input_name: _as_numpy(input_value)
-        for input_name, input_value in zip(cml_model.input_description, flatten(inputs))
+        for input_name, input_value in zip(input_names, flat_inputs)
     }
     cml_expected_outputs = {
         output_name: np.asarray(output_value)
-        for output_name, output_value
-        in zip(cml_model.output_description, flatten(_as_tuple(expected_outputs)))
+        for output_name, output_value in zip(output_names, flat_expected)
     }
+    assert cml_expected_outputs or expects_no_outputs, (
+        "No model output was compared. Model outputs: "
+        f"{output_names}, expected outputs: {flat_expected}"
+    )
 
     compare_backend(
         cml_model,
@@ -341,34 +389,50 @@ def run_and_compare_stateful(
     """
     jax_func = jax.jit(jax_func)
     hlo_module = export_hlo_module(jax_func, initial_inputs)
-    mil_program, cml_model = _convert_hlo_module(
+    _, cml_model = _convert_hlo_module(
         hlo_module,
         states=states,
         max_complexity=max_complexity,
         compute_units=compute_units,
     )
 
-    mil_func_name = mil_program.default_function_name
+    # A JAX export has exactly one public function, which we always convert
+    # into the Core ML "main" function.
+    hlo_func = next(
+        func
+        for func in hlo_module.body
+        if func.sym_visibility is None or func.sym_visibility.value == "public"
+    )
     function_states = states
     if states and all(isinstance(value, Mapping) for value in states.values()):
-        function_states = states[mil_func_name]
+        function_states = states[hlo_func.name.value]
 
-    # Map argument index -> index of the output holding the updated state
-    hlo_func = next(func for func in hlo_module.body if func.name.value == mil_func_name)
+    # Map argument index -> index of the output holding the updated state, and
+    # to the state name the caller expects the model to expose it under.
     resolved_states = {}
+    state_names = {}
     for in_idx, state_spec in resolve_state_map(hlo_func, function_states).items():
         if state_spec.output is None:
             raise ValueError("run_and_compare_stateful requires updated, not read-only, states")
         resolved_states[in_idx] = state_spec.output
+        state_names[in_idx] = state_spec.name or sanitize_name(
+            preferred_argument_name(hlo_func.arguments[in_idx])
+        )
 
     nonstate_indices = [i for i in range(len(initial_inputs)) if i not in resolved_states]
-    state_indices = [i for i in range(len(initial_inputs)) if i in resolved_states]
     state_outputs = set(resolved_states.values())
-    state_names = [feature.name for feature in cml_model._spec.description.state]
+    # Functions whose every result feeds a state only expose a state token
+    expects_no_outputs = len(state_outputs) == len(hlo_func.type.results)
+
+    _, _, model_state_names = model_io_names(cml_model)
+    assert set(model_state_names) == set(state_names.values()), (
+        f"Model exposes states {sorted(model_state_names)}, "
+        f"expected {sorted(state_names.values())}"
+    )
 
     cml_state = cml_model.make_state()
-    for name, idx in zip(state_names, state_indices):
-        cml_state.write_state(name=name, value=_as_numpy(initial_inputs[idx]))
+    for in_idx, name in state_names.items():
+        cml_state.write_state(name=name, value=_as_numpy(initial_inputs[in_idx]))
 
     def run_step(args):
         expected = _as_tuple(jax_func(*args))
@@ -383,9 +447,10 @@ def run_and_compare_stateful(
             atol=atol,
             rtol=rtol,
             state=cml_state,
+            expects_no_outputs=expects_no_outputs,
         )
 
-        for name, in_idx in zip(state_names, state_indices):
+        for in_idx, name in state_names.items():
             np.testing.assert_allclose(
                 np.asarray(cml_state.read_state(name=name)),
                 np.asarray(expected[resolved_states[in_idx]]),
