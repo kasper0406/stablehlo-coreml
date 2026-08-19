@@ -36,9 +36,8 @@ from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from .pattern_utils import (
     const_int_list,
     dims_equal,
+    is_broadcast_tile,
     normalize_axis,
-    producer_ops,
-    remove_dead_ops,
     shapes_equal,
     sole_consumer,
 )
@@ -52,7 +51,7 @@ _BROADCAST_BACK_OPS = frozenset({"reshape", "expand_dims", "squeeze", "tile", "c
 def _match(real_div_op):
     """Match a decomposed softmax ending at ``real_div_op``.
 
-    Returns ``(softmax_input, axis, matched_ops)`` or ``None``.
+    Returns ``(softmax_input, axis)`` or ``None``.
     """
     if real_div_op.op_type != "real_div":
         return None
@@ -132,9 +131,6 @@ def _match(real_div_op):
 
     # -- optionally peel `sub(x, c)`; softmax is invariant under such a shift --
     softmax_input = exp_op.inputs["x"]
-    # `producer_ops` also covers the (now dead) reduce_max chain; ops that are
-    # still live are simply not removed.
-    candidates = matched + producer_ops(softmax_input)
 
     sub_op = getattr(softmax_input, "op", None)
     if (
@@ -147,7 +143,7 @@ def _match(real_div_op):
     ):
         softmax_input = sub_op.inputs["x"]
 
-    return softmax_input, axis, candidates
+    return softmax_input, axis
 
 
 def _is_constant_along(var, axis: int, rank: int) -> bool:
@@ -158,13 +154,7 @@ def _is_constant_along(var, axis: int, rank: int) -> bool:
     """
     while True:
         op = getattr(var, "op", None)
-        if op is None or op.op_type != "tile":
-            break
-        reps = const_int_list(op.inputs.get("reps"))
-        x_shape = op.inputs["x"].shape
-        if reps is None or x_shape is None or len(reps) != len(x_shape):
-            break
-        if any(rep != 1 and not dims_equal(dim, 1) for dim, rep in zip(x_shape, reps)):
+        if op is None or not is_broadcast_tile(op):
             break
         var = op.inputs["x"]
 
@@ -205,7 +195,7 @@ def _replace_decomposed_softmax(block) -> int:
         match = _match(op)
         if match is None:
             continue
-        softmax_input, axis, candidates = match
+        softmax_input, axis = match
 
         softmax_var = mb.softmax(x=softmax_input, axis=axis, before_op=op, name=op.name + "_softmax")
         block.replace_uses_of_var_after_op(
@@ -213,7 +203,6 @@ def _replace_decomposed_softmax(block) -> int:
             old_var=op.outputs[0],
             new_var=softmax_var,
         )
-        remove_dead_ops(block, candidates)
         replaced += 1
 
     return replaced

@@ -2,14 +2,10 @@ import numpy as np
 import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 
 from stablehlo_coreml.passes.pattern_utils import (
     broadcast_shapes,
     dims_equal,
-    is_large_negative,
-    is_neg_inf,
-    remove_dead_ops,
     shapes_equal,
     sole_consumer,
     uniform_scalar_value,
@@ -70,32 +66,6 @@ class TestUniformScalarValue:
     def test_nan_const_is_none(self):
         _, captured = _build(lambda x, c: c.setdefault("v", mb.add(x=x, y=np.float32("nan"))))
         assert uniform_scalar_value(captured["v"].op.inputs["y"]) is None
-
-
-class TestNegativeValueHelpers:
-
-    def _const_var(self, value):
-        _, captured = _build(lambda x, c: c.setdefault("v", mb.add(x=x, y=value)))
-        return captured["v"].op.inputs["y"]
-
-    def test_is_neg_inf(self):
-        assert is_neg_inf(self._const_var(np.float32("-inf")))
-        assert is_neg_inf(self._const_var(np.float32(-3.4e38)))
-        assert not is_neg_inf(self._const_var(np.float32(-1e9)))
-        assert not is_neg_inf(self._const_var(np.float32("inf")))
-
-    def test_is_neg_inf_from_fill(self):
-        def build(x, captured):
-            captured["fill"] = mb.fill(shape=[4, 8], value=float("-inf"))
-            return mb.add(x=x, y=captured["fill"])
-        _, captured = _build(build)
-        assert is_neg_inf(captured["fill"])
-
-    def test_is_large_negative(self):
-        assert is_large_negative(self._const_var(np.float32(-1e9)))
-        assert is_large_negative(self._const_var(np.float32("-inf")))
-        assert not is_large_negative(self._const_var(np.float32(-1.0)))
-        assert is_large_negative(self._const_var(np.float32(-1.0)), threshold=-0.5)
 
 
 class TestShapeHelpers:
@@ -178,49 +148,3 @@ class TestSoleConsumer:
 
     def test_none(self):
         assert sole_consumer(None) is None
-
-
-class TestRemoveDeadOps:
-
-    def test_removes_dead_chain(self):
-        def build(x, captured):
-            captured["a"] = mb.mul(x=x, y=2.0)
-            captured["b"] = mb.add(x=captured["a"], y=1.0)
-            return mb.relu(x=x)
-        prog, captured = _build(build)
-        block = prog.functions["main"]
-
-        @block_context_manager
-        def run(b):
-            return remove_dead_ops(b, [captured["a"].op, captured["b"].op])
-
-        # `a` only becomes dead once `b` is gone, so the helper must iterate.
-        assert run(block) == 2
-        assert [op.op_type for op in block.operations if op.op_type != "const"] == ["relu"]
-
-    def test_keeps_live_ops(self):
-        def build(x, captured):
-            captured["a"] = mb.mul(x=x, y=2.0)
-            return mb.add(x=captured["a"], y=1.0)
-        prog, captured = _build(build)
-        block = prog.functions["main"]
-
-        @block_context_manager
-        def run(b):
-            return remove_dead_ops(b, [captured["a"].op])
-
-        assert run(block) == 0
-        assert captured["a"].op.enclosing_block is block
-
-    def test_keeps_block_outputs(self):
-        def build(x, captured):
-            captured["a"] = mb.mul(x=x, y=2.0)
-            return captured["a"]
-        prog, captured = _build(build)
-        block = prog.functions["main"]
-
-        @block_context_manager
-        def run(b):
-            return remove_dead_ops(b, [captured["a"].op])
-
-        assert run(block) == 0

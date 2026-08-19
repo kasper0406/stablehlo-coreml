@@ -19,12 +19,20 @@ from . import remove_broadcast_tiles as _remove_broadcast_tiles  # noqa: F401
 from . import remove_noop_slice_update as _remove_noop_slice_update  # noqa: F401
 from . import replace_decomposed_softmax as _replace_decomposed_softmax  # noqa: F401
 
+# The passes do not clean up after themselves; the ops they leave behind are
+# removed by coremltools' dead code elimination, interleaved between them (one
+# pass's leftovers would otherwise look like extra consumers to the next one).
+_DCE = "common::dead_code_elimination"
+
 # Cleanup passes. They run before the first `const_elimination` so that the
 # broadcast `tile`s are gone before constants get folded (otherwise a tiled
 # scalar constant is materialised at full size).
 CLEANUP_PASSES: list[str] = [
     "common::remove_broadcast_tiles",
     "common::fuse_reduce_keep_dims",
+    # `fuse_reduce_keep_dims` leaves the old reduction behind when the reshape
+    # was its sole consumer.
+    _DCE,
     "common::remove_noop_slice_update",
 ]
 
@@ -34,12 +42,16 @@ CLEANUP_PASSES: list[str] = [
 # `fuse_transpose_matmul` / DCE still run afterwards to clean up what we emit.
 #
 # Adding a fusion pass = adding a module in this package + one entry in this list
-# (and the corresponding import above).
+# followed by a `_DCE` entry (and the corresponding import above).
 FUSION_PASSES: list[str] = [
     "common::replace_decomposed_softmax",
+    _DCE,
     "common::fuse_attention_to_sdpa",
+    _DCE,
     "common::fuse_logit_softcap",
+    _DCE,
     "common::fuse_gelu_erfc",
+    _DCE,
 ]
 
 # The pass the CLEANUP group is inserted before (fallback: the front of the pipeline).
@@ -51,12 +63,15 @@ _FUSION_ANCHOR = "common::fuse_matmul_weight_bias"
 def _insert_passes(pipeline: ct.PassPipeline, pass_names: list[str], anchor: str, fallback_index: int | None) -> None:
     """Insert ``pass_names`` (in order) immediately before the first ``anchor`` pass.
 
-    Passes already present in the pipeline are left where they are. If ``anchor``
-    is not part of the pipeline, ``fallback_index`` is used instead (``None``
-    meaning "append at the end").
+    Our own passes are only inserted when they are not in the pipeline yet, so
+    re-inserting into a pipeline that already has them is a no-op. The
+    ``dead_code_elimination`` entries are always inserted along with them:
+    coremltools' default pipeline runs those elsewhere too, but we need them
+    right between our own passes. If ``anchor`` is not part of the pipeline,
+    ``fallback_index`` is used instead (``None`` meaning "append at the end").
     """
-    missing = [name for name in pass_names if name not in pipeline.passes]
-    if not missing:
+    to_insert = [name for name in pass_names if name == _DCE or name not in pipeline.passes]
+    if all(name == _DCE for name in to_insert):
         return
 
     if anchor in pipeline.passes:
@@ -66,7 +81,7 @@ def _insert_passes(pipeline: ct.PassPipeline, pass_names: list[str], anchor: str
     else:
         index = fallback_index
 
-    for offset, pass_name in enumerate(missing):
+    for offset, pass_name in enumerate(to_insert):
         pipeline.insert_pass(index=index + offset, pass_name=pass_name)
 
 

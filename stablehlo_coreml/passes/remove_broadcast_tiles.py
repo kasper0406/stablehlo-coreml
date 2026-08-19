@@ -11,12 +11,11 @@ constant weights). The pass therefore runs before the first
 
 import logging
 
-import numpy as np
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import broadcast_shapes, dims_equal, shapes_equal
+from .pattern_utils import broadcast_shapes, is_broadcast_tile, shapes_equal
 
 logger = logging.getLogger(__name__)
 
@@ -40,35 +39,6 @@ _BROADCAST_OPS = frozenset({
 _BINARY_OPERANDS = ("x", "y")
 
 
-def _is_broadcast_tile(op) -> bool:
-    """True if ``op`` is a ``tile`` that only replicates size-1 dimensions.
-
-    A tile of a dimension that is not 1 is *not* a broadcast:
-    ``tile([1, 2], reps=[2]) == [1, 2, 1, 2]`` cannot be expressed by implicit
-    broadcasting. ``reps`` must be known at compile time.
-    """
-    if op.op_type != "tile":
-        return False
-
-    reps_var = op.inputs.get("reps")
-    if reps_var is None or reps_var.val is None:
-        return False
-    reps = np.asarray(reps_var.val).reshape(-1).tolist()
-
-    x_shape = op.x.shape
-    if x_shape is None or len(reps) != len(x_shape):
-        return False
-
-    for dim, rep in zip(x_shape, reps):
-        if int(rep) == 1:
-            continue
-        # `dim` may be symbolic; only a literal 1 is safe to broadcast.
-        if dims_equal(dim, 1):
-            continue
-        return False
-    return True
-
-
 def _consumer_output_is_unchanged(consumer, tile_out, tile_in) -> bool:
     """True if replacing ``tile_out`` by ``tile_in`` keeps ``consumer``'s output shape."""
     operand_shapes = []
@@ -88,7 +58,7 @@ def _consumer_output_is_unchanged(consumer, tile_out, tile_in) -> bool:
 
 
 def _can_remove(op, block) -> bool:
-    if not _is_broadcast_tile(op):
+    if not is_broadcast_tile(op):
         return False
 
     tile_out = op.outputs[0]

@@ -5,8 +5,8 @@ The passes in this package all have to deal with the same handful of problems:
 * recognising constants that hold a single repeated value (either a ``const``
   or a ``fill`` op),
 * comparing shapes that may contain symbolic (sympy) dimensions,
-* checking that a pattern is safe to rewrite (no consumers outside the match),
-* and cleaning up the ops that became dead after a rewrite.
+* and checking that a pattern is safe to rewrite (no consumers outside the
+  match).
 
 Everything in here is intentionally conservative: whenever a property cannot be
 proven (typically because a dimension is symbolic) the helpers report the
@@ -20,14 +20,11 @@ __all__ = [
     "broadcast_shapes",
     "const_int_list",
     "dims_equal",
-    "is_large_negative",
-    "is_neg_inf",
+    "is_broadcast_tile",
     "normalize_axis",
-    "peel_back",
-    "producer_ops",
-    "remove_dead_ops",
     "shapes_equal",
     "sole_consumer",
+    "uniform_const_operand",
     "uniform_scalar_value",
 ]
 
@@ -62,20 +59,19 @@ def uniform_scalar_value(var) -> float | None:
     return float(first)
 
 
-def is_neg_inf(var) -> bool:
-    """True if ``var`` is a uniform constant that acts as negative infinity.
+def uniform_const_operand(op):
+    """For a binary op, return ``(const_value, other_var)``, or ``None``.
 
-    Values at or below ``-3e38`` (below the fp32 range) are treated as -inf,
-    matching how JAX materialises the softmax/masking constants.
+    The pair is only returned when exactly one of ``x``/``y`` is a compile-time
+    constant with all elements equal (see :func:`uniform_scalar_value`).
     """
-    value = uniform_scalar_value(var)
-    return value is not None and value <= -3e38
-
-
-def is_large_negative(var, threshold: float = -1e4) -> bool:
-    """True if ``var`` is a uniform constant ``<= threshold`` (e.g. a -1e9 mask fill)."""
-    value = uniform_scalar_value(var)
-    return value is not None and value <= threshold
+    x, y = op.inputs["x"], op.inputs["y"]
+    x_val, y_val = uniform_scalar_value(x), uniform_scalar_value(y)
+    if x_val is not None and y_val is None:
+        return x_val, y
+    if y_val is not None and x_val is None:
+        return y_val, x
+    return None
 
 
 def dims_equal(a, b) -> bool:
@@ -176,27 +172,6 @@ def normalize_axis(axis: int, rank: int) -> int | None:
     return axis
 
 
-def peel_back(var, op_types, max_ops: int | None = None):
-    """Walk backward through single-input ops whose type is in ``op_types``.
-
-    Returns ``(var, ops)`` where ``ops`` are the peeled ops in the order they
-    were encountered (i.e. from the consumer side towards the producer side).
-    """
-    ops = []
-    while True:
-        if max_ops is not None and len(ops) >= max_ops:
-            break
-        op = getattr(var, "op", None)
-        if op is None or op.op_type not in op_types:
-            break
-        x = op.inputs.get("x")
-        if x is None:
-            break
-        ops.append(op)
-        var = x
-    return var, ops
-
-
 def sole_consumer(var, ignored=()):
     """Return the single consumer op of ``var``, or ``None``.
 
@@ -218,65 +193,18 @@ def sole_consumer(var, ignored=()):
     return child_ops[0]
 
 
-def producer_ops(var, max_ops: int = 32) -> list:
-    """Collect the ops that (transitively) produce ``var``, breadth first.
+def is_broadcast_tile(op) -> bool:
+    """True if ``op`` is a ``tile`` that only replicates size-1 dimensions.
 
-    Useful to hand :func:`remove_dead_ops` the whole cone behind a rewritten
-    value: it only removes the ops that actually became dead, so passing extra
-    candidates is harmless.
+    A tile of a dimension that is not 1 is *not* a broadcast:
+    ``tile([1, 2], reps=[2]) == [1, 2, 1, 2]`` cannot be expressed by implicit
+    broadcasting. ``reps`` must be known at compile time and match the input rank.
     """
-    collected = []
-    seen = set()
-    queue = [var]
-    while queue and len(collected) < max_ops:
-        current = queue.pop(0)
-        op = getattr(current, "op", None)
-        if op is None or id(op) in seen:
-            continue
-        seen.add(id(op))
-        collected.append(op)
-        for value in op.inputs.values():
-            if isinstance(value, (list, tuple)):
-                queue.extend(value)
-            else:
-                queue.append(value)
-    return collected
-
-
-def _is_dead(op) -> bool:
-    block = op.enclosing_block
-    if block is None:
+    if op.op_type != "tile":
         return False
-    for out in op.outputs:
-        if len(out.child_ops) > 0:
-            return False
-        if out in block.outputs:
-            return False
-    return True
-
-
-def remove_dead_ops(block, ops) -> int:
-    """Remove the ops in ``ops`` that became dead, repeatedly, and return the count.
-
-    ``ops`` is a list of candidate ops (typically the ops that were matched by a
-    pattern). Only candidates whose outputs have no remaining consumers and that
-    are not block outputs are removed; the removal is repeated until a fixed
-    point so that whole chains disappear. Anything left over is picked up by
-    coremltools' ``dead_code_elimination`` later in the pipeline.
-    """
-    candidates = [op for op in ops if op is not None and op.enclosing_block is block]
-    removed = 0
-    changed = True
-    while changed:
-        changed = False
-        for op in list(candidates):
-            if op.enclosing_block is None:
-                # Already removed from the graph.
-                candidates.remove(op)
-                continue
-            if _is_dead(op):
-                op.remove_from_block()
-                candidates.remove(op)
-                removed += 1
-                changed = True
-    return removed
+    reps = const_int_list(op.inputs.get("reps"))
+    x_shape = op.inputs["x"].shape
+    if reps is None or x_shape is None or len(reps) != len(x_shape):
+        return False
+    # `dim` may be symbolic; only a literal 1 is safe to broadcast.
+    return all(rep == 1 or dims_equal(dim, 1) for dim, rep in zip(x_shape, reps))

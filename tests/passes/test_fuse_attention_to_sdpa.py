@@ -21,6 +21,7 @@ from tests.utils import get_model_instruction_types, run_and_compare
 register_optimizations()
 
 PASS_NAME = "common::fuse_attention_to_sdpa"
+DCE_PASS_NAME = "common::dead_code_elimination"
 
 # [B, H, L, S] scores from [B, H, L, E] queries and [B, H, S, E] keys.
 B, H, L, S, E = 2, 3, 5, 7, 4
@@ -32,9 +33,12 @@ TORCH_MIN_FILL = np.float32(np.finfo(np.float32).min)
 
 
 def _apply(prog, **options):
+    # The pass leaves the matched ops behind; DCE is what removes them.
     if not options:
-        return apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
-    pipeline = ct.PassPipeline([PASS_NAME], "fuse_attention")
+        result = apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
+        apply_pass_and_basic_check(prog, DCE_PASS_NAME, skip_output_shape_check=True)
+        return result
+    pipeline = ct.PassPipeline([PASS_NAME, DCE_PASS_NAME], "fuse_attention")
     pipeline.set_options(PASS_NAME, options)
     PassPipelineManager.apply_pipeline(prog, pipeline)
     return prog

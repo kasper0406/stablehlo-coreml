@@ -18,10 +18,13 @@ from tests.utils import get_model_instruction_types, run_and_compare
 register_optimizations()
 
 PASS_NAME = "common::fuse_reduce_keep_dims"
+DCE_PASS_NAME = "common::dead_code_elimination"
 
 
 def _apply(prog):
     apply_pass_and_basic_check(prog, PASS_NAME)
+    # The pass leaves the matched ops behind; DCE is what removes them.
+    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
 
 
 def _ops_of_type(prog, op_type):

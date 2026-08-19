@@ -25,7 +25,7 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import remove_dead_ops, sole_consumer, uniform_scalar_value
+from .pattern_utils import sole_consumer, uniform_const_operand, uniform_scalar_value
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +60,11 @@ def _const_scaled_operand(op):
     and the negation ``sub(0, v)`` -> ``(v, -1)``. Returns ``None`` otherwise.
     """
     if op.op_type == "mul":
-        for operand in (op.x, op.y):
-            other = _other_operand(op, operand)
-            factor = uniform_scalar_value(other)
-            if factor is not None:
-                return operand, factor
-        return None
+        scaled = uniform_const_operand(op)
+        if scaled is None:
+            return None
+        factor, operand = scaled
+        return operand, factor
 
     if op.op_type == "real_div":
         divisor = uniform_scalar_value(op.y)
@@ -88,9 +87,8 @@ def _peel_to_scaled_input(var, block):
     The first entry is ``(var, 1.0)`` itself, then every prefix of the chain with
     the accumulated factor: ``arg == entry_var * factor``.
     """
-    chain = [(var, 1.0, [])]
+    chain = [(var, 1.0)]
     factor = 1.0
-    ops = []
     current = var
     for _ in range(_MAX_PEEL_DEPTH):
         op = current.op
@@ -106,8 +104,7 @@ def _peel_to_scaled_input(var, block):
             break
         current, step = split
         factor *= step
-        ops = ops + [op]
-        chain.append((current, factor, ops))
+        chain.append((current, factor))
     return chain
 
 
@@ -116,15 +113,14 @@ def _match_half_x(var, x, block) -> bool:
     op = var.op
     if op is None or op.op_type != "mul" or op.enclosing_block is not block:
         return False
-    other = _other_operand(op, x)
-    if other is None:
+    scaled = uniform_const_operand(op)
+    if scaled is None or scaled[1] is not x:
         return False
-    half = uniform_scalar_value(other)
-    return half is not None and abs(half - 0.5) < _HALF_TOLERANCE
+    return abs(scaled[0] - 0.5) < _HALF_TOLERANCE
 
 
 def _match(mul_op, block):
-    """Return ``(x, ops)`` if ``mul_op`` computes ``0.5 * x * (1 - erf(-x/sqrt(2)))``."""
+    """Return ``x`` if ``mul_op`` computes ``0.5 * x * (1 - erf(-x/sqrt(2)))``."""
     if mul_op.op_type != "mul":
         return None
 
@@ -155,12 +151,12 @@ def _match(mul_op, block):
         if sole_consumer(half_var) is not mul_op:
             continue
 
-        for candidate, factor, scale_ops in _peel_to_scaled_input(erf_op.x, block):
+        for candidate, factor in _peel_to_scaled_input(erf_op.x, block):
             if abs(factor - _FACTOR) > _FACTOR_TOLERANCE:
                 continue
             if not _match_half_x(half_var, candidate, block):
                 continue
-            return candidate, [mul_op, sub_op, erf_op, half_op, *scale_ops]
+            return candidate
 
     return None
 
@@ -177,14 +173,12 @@ def _fuse_gelu_erfc(block) -> int:
         if len(op.blocks) > 0:
             continue
 
-        match = _match(op, block)
-        if match is None:
+        x = _match(op, block)
+        if x is None:
             continue
-        x, matched_ops = match
 
         gelu = mb.gelu(x=x, mode="EXACT", before_op=op, name=op.outputs[0].name)
         block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=gelu)
-        remove_dead_ops(block, matched_ops)
         fused += 1
 
     return fused

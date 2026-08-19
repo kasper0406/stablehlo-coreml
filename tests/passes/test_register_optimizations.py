@@ -4,7 +4,12 @@ import pytest
 from stablehlo_coreml import build_pass_pipeline, register_optimizations
 from stablehlo_coreml.passes.utils import CLEANUP_PASSES, DEFAULT_HLO_PIPELINE, FUSION_PASSES
 
-ALL_PASSES = CLEANUP_PASSES + FUSION_PASSES
+DCE_PASS_NAME = "common::dead_code_elimination"
+# The groups interleave coremltools' DCE with our own passes, so the same name
+# appears several times; only our own passes are expected in the pipeline exactly
+# once.
+ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES))
+OUR_PASSES = [name for name in ALL_PASSES if name != DCE_PASS_NAME]
 
 
 @pytest.mark.parametrize("pass_name", ALL_PASSES)
@@ -13,7 +18,7 @@ def test_pass_is_registered(pass_name):
     assert pass_name in PASS_REGISTRY
 
 
-@pytest.mark.parametrize("pass_name", ALL_PASSES)
+@pytest.mark.parametrize("pass_name", OUR_PASSES)
 def test_default_pipeline_contains_each_pass_exactly_once(pass_name):
     assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == 1
 
@@ -21,15 +26,13 @@ def test_default_pipeline_contains_each_pass_exactly_once(pass_name):
 def test_cleanup_passes_run_before_first_const_elimination():
     passes = build_pass_pipeline().passes
     first_const_elimination = passes.index("common::const_elimination")
-    for offset, pass_name in enumerate(CLEANUP_PASSES):
-        assert passes.index(pass_name) == first_const_elimination - len(CLEANUP_PASSES) + offset
+    assert passes[first_const_elimination - len(CLEANUP_PASSES):first_const_elimination] == CLEANUP_PASSES
 
 
 def test_fusion_passes_run_before_fuse_matmul_weight_bias():
     passes = build_pass_pipeline().passes
     anchor = passes.index("common::fuse_matmul_weight_bias")
-    for offset, pass_name in enumerate(FUSION_PASSES):
-        assert passes.index(pass_name) == anchor - len(FUSION_PASSES) + offset
+    assert passes[anchor - len(FUSION_PASSES):anchor] == FUSION_PASSES
 
 
 def test_build_pass_pipeline_returns_distinct_objects():
@@ -39,7 +42,7 @@ def test_build_pass_pipeline_returns_distinct_objects():
     assert first.passes is not second.passes
     assert first.passes == second.passes
 
-    first.append_pass("common::dead_code_elimination")
+    first.append_pass(DCE_PASS_NAME)
     assert first.passes != second.passes
     assert DEFAULT_HLO_PIPELINE.passes == second.passes
 
@@ -60,11 +63,11 @@ def test_build_pass_pipeline_is_idempotent():
 def test_build_pass_pipeline_with_base_missing_the_anchors():
     """Without the anchors, cleanup passes go first and fusion passes last."""
     base = ct.PassPipeline.EMPTY
-    base.passes = ["common::noop_elimination", "common::dead_code_elimination"]
+    base.passes = ["common::noop_elimination", DCE_PASS_NAME]
 
     pipeline = build_pass_pipeline(base)
     assert pipeline.passes == (
-        CLEANUP_PASSES + ["common::noop_elimination", "common::dead_code_elimination"] + FUSION_PASSES
+        CLEANUP_PASSES + ["common::noop_elimination", DCE_PASS_NAME] + FUSION_PASSES
     )
 
 
@@ -80,5 +83,5 @@ def test_register_optimizations_is_idempotent():
     register_optimizations()
     register_optimizations()
 
-    for pass_name in ALL_PASSES:
+    for pass_name in OUR_PASSES:
         assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == 1

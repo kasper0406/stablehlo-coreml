@@ -24,7 +24,7 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import remove_dead_ops, shapes_equal
+from .pattern_utils import shapes_equal
 
 logger = logging.getLogger(__name__)
 
@@ -123,9 +123,10 @@ def _fuse_reduce_keep_dims(block) -> int:
         reduce_op, axes = match
 
         # A fresh reduction with `keep_dims=True` replaces the reshape. The
-        # original reduction is left in place; it is removed below only if the
-        # reshape was its sole consumer (otherwise the other consumers, which
-        # expect the squeezed shape, keep using it).
+        # original reduction is left in place; if the reshape was its sole
+        # consumer it becomes dead and `dead_code_elimination` picks it up
+        # (otherwise the other consumers, which expect the squeezed shape, keep
+        # using it).
         keep_dims_var = getattr(mb, reduce_op.op_type)(
             x=reduce_op.x,
             axes=axes,
@@ -138,7 +139,6 @@ def _fuse_reduce_keep_dims(block) -> int:
             old_var=op.outputs[0],
             new_var=keep_dims_var,
         )
-        remove_dead_ops(block, [op, reduce_op])
         fused += 1
 
     return fused

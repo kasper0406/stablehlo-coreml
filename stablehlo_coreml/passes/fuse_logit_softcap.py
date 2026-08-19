@@ -26,7 +26,7 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import remove_dead_ops, sole_consumer, uniform_scalar_value
+from .pattern_utils import sole_consumer, uniform_const_operand
 
 logger = logging.getLogger(__name__)
 
@@ -34,24 +34,22 @@ logger = logging.getLogger(__name__)
 _TOLERANCE = 1e-4
 
 
-def _scalar_operand(op, other):
-    """Return the uniform constant value of the operand of ``op`` that is not ``other``.
+def _scalar_operand(op):
+    """Like :func:`uniform_const_operand`, but only for single-element constants.
 
-    ``None`` when ``other`` is not an operand, when the other operand is not a
-    uniform compile-time constant, or when it is not rank-0/1 (a constant with a
-    real shape would broadcast the output, which ``scaled_tanh`` cannot do).
+    Returns ``(const_value, other_var)``, or ``None`` when no operand is a
+    uniform compile-time constant or when that constant is not rank-0/1 (a
+    constant with a real shape would broadcast the output, which ``scaled_tanh``
+    cannot do).
     """
-    x, y = op.x, op.y
-    if x is other:
-        const = y
-    elif y is other:
-        const = x
-    else:
+    operand = uniform_const_operand(op)
+    if operand is None:
         return None
-
+    value, other = operand
+    const = op.y if op.x is other else op.x
     if const.shape is not None and int(np.prod(const.shape)) != 1:
         return None
-    return uniform_scalar_value(const)
+    return value, other
 
 
 def _inner_scale(tanh_op):
@@ -65,23 +63,23 @@ def _inner_scale(tanh_op):
         return tanh_op.x, 1.0
 
     if inner.op_type == "mul":
-        for operand in (inner.x, inner.y):
-            beta = _scalar_operand(inner, operand)
-            if beta is not None:
-                return operand, beta
+        scalar = _scalar_operand(inner)
+        if scalar is not None:
+            beta, operand = scalar
+            return operand, beta
         return tanh_op.x, 1.0
 
     if inner.op_type == "real_div":
         # Only `x / c` is a scaling; `c / x` is not.
-        divisor = _scalar_operand(inner, inner.x)
-        if divisor is not None and divisor != 0.0:
-            return inner.x, 1.0 / divisor
+        scalar = _scalar_operand(inner)
+        if scalar is not None and scalar[1] is inner.x and scalar[0] != 0.0:
+            return inner.x, 1.0 / scalar[0]
 
     return tanh_op.x, 1.0
 
 
 def _match(mul_op, block):
-    """Return ``(x, alpha, beta, ops)`` if ``mul_op`` completes a softcap pattern."""
+    """Return ``(x, alpha, beta)`` if ``mul_op`` completes a softcap pattern."""
     if mul_op.op_type != "mul":
         return None
 
@@ -95,19 +93,16 @@ def _match(mul_op, block):
         if sole_consumer(tanh_var) is not mul_op:
             continue
 
-        alpha = _scalar_operand(mul_op, tanh_var)
-        if alpha is None:
+        scalar = _scalar_operand(mul_op)
+        if scalar is None or scalar[1] is not tanh_var:
             continue
+        alpha = scalar[0]
 
         x, beta = _inner_scale(tanh_op)
         if abs(alpha * beta - 1.0) > _TOLERANCE:
             continue
 
-        ops = [mul_op, tanh_op]
-        scale_op = tanh_op.x.op
-        if x is not tanh_op.x and scale_op is not None:
-            ops.append(scale_op)
-        return x, alpha, beta, ops
+        return x, alpha, beta
 
     return None
 
@@ -127,7 +122,7 @@ def _fuse_logit_softcap(block) -> int:
         match = _match(op, block)
         if match is None:
             continue
-        x, alpha, beta, matched_ops = match
+        x, alpha, beta = match
 
         # `alpha`/`beta` are `const T`, with T the element type of `x`.
         dtype = types.nptype_from_builtin(x.dtype)
@@ -139,7 +134,6 @@ def _fuse_logit_softcap(block) -> int:
             name=op.outputs[0].name,
         )
         block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=capped)
-        remove_dead_ops(block, matched_ops)
         fused += 1
 
     return fused

@@ -50,10 +50,11 @@ from .pattern_utils import (
     broadcast_shapes,
     const_int_list,
     dims_equal,
+    is_broadcast_tile,
     normalize_axis,
-    remove_dead_ops,
     shapes_equal,
     sole_consumer,
+    uniform_const_operand,
     uniform_scalar_value,
 )
 
@@ -193,17 +194,6 @@ def _expand(dim) -> list[_Atom]:
     return [leaf for atom in dim for leaf in atom.leaves()]
 
 
-def _uniform_const_operand(op):
-    """For a binary op, return ``(const_value, other_var)`` if exactly one operand is uniform."""
-    x, y = op.inputs["x"], op.inputs["y"]
-    x_val, y_val = uniform_scalar_value(x), uniform_scalar_value(y)
-    if x_val is not None and y_val is None:
-        return x_val, y
-    if y_val is not None and x_val is None:
-        return y_val, x
-    return None
-
-
 def _leads_to_matmul(var, depth: int = 12) -> bool:
     """Cheap check whether ``var`` is (transitively) produced by a matmul."""
     for _ in range(depth):
@@ -219,22 +209,12 @@ def _leads_to_matmul(var, depth: int = 12) -> bool:
     return False
 
 
-def _is_broadcast_tile(op) -> bool:
-    """True when ``op`` is a ``tile`` that only broadcasts size-1 dimensions."""
-    reps = const_int_list(op.inputs.get("reps"))
-    shape = op.inputs["x"].shape
-    if reps is None or shape is None or len(reps) != len(shape):
-        return False
-    # Repeating a dimension that is not 1 interleaves elements: a real tile.
-    return all(rep == 1 or dims_equal(dim, 1) for dim, rep in zip(shape, reps))
-
-
 def _peel_broadcast_tile(var):
-    """Strip a leading broadcast ``tile``; returns ``(var, tile_op or None)``."""
+    """Strip a leading broadcast ``tile`` off ``var``."""
     op = getattr(var, "op", None)
-    if op is not None and op.op_type == "tile" and _is_broadcast_tile(op):
-        return op.inputs["x"], op
-    return var, None
+    if op is not None and is_broadcast_tile(op):
+        return op.inputs["x"]
+    return var
 
 
 def _is_uniform_neg_inf(var) -> bool:
@@ -243,12 +223,12 @@ def _is_uniform_neg_inf(var) -> bool:
     return value is not None and math.isinf(value) and value < 0
 
 
-def _peel_predicate(var, ops):
+def _peel_predicate(var, readers):
     """Peel the layout/cast/``logical_not`` ops in front of a boolean predicate.
 
     Returns ``(var, negations)``; ``negations`` counts the ``logical_not`` ops
     that were peeled, so the caller can track the polarity. The peeled ops are
-    appended to ``ops``.
+    appended to ``readers``.
     """
     negations = 0
     while True:
@@ -258,11 +238,11 @@ def _peel_predicate(var, ops):
         if op.op_type == "logical_not":
             negations += 1
         elif op.op_type == "tile":
-            if not _is_broadcast_tile(op):
+            if not is_broadcast_tile(op):
                 break
         elif op.op_type not in _PREDICATE_LAYOUT_OPS:
             break
-        ops.append(op)
+        readers.append(op)
         var = op.inputs["x"]
     return var, negations
 
@@ -275,9 +255,11 @@ class _SafeSoftmax:
     that is ``select(row_is_all_neg_inf, 0.0, softmax(x))``.
     """
 
-    def __init__(self, select_op, ops):
+    def __init__(self, select_op, readers):
         self.select_op = select_op
-        self.ops = ops
+        # The ops of the wrapper that read the scores; `_match_backward` has to
+        # know about them so they do not look like consumers escaping the match.
+        self.readers = readers
 
 
 def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
@@ -294,14 +276,14 @@ def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
     a_zeros, b_zeros = uniform_scalar_value(a) == 0.0, uniform_scalar_value(b) == 0.0
     if a is weights and b_zeros:
         # The weights survive where the condition holds.
-        weights_when_true, zeros = True, b
+        weights_when_true = True
     elif b is weights and a_zeros:
-        weights_when_true, zeros = False, a
+        weights_when_true = False
     else:
         return None
 
-    ops = [select_op]
-    base, cond_negations = _peel_predicate(cond, ops)
+    readers = [select_op]
+    base, cond_negations = _peel_predicate(cond, readers)
 
     reduce_op = getattr(base, "op", None)
     if reduce_op is None or reduce_op.op_type not in ("reduce_max", "reduce_min"):
@@ -314,9 +296,9 @@ def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
     if axes is None or len(axes) != 1 or normalize_axis(axes[0], rank) != rank - 1:
         # The reduction has to be over the softmax axis to describe a "row".
         return None
-    ops.append(reduce_op)
+    readers.append(reduce_op)
 
-    inner, inner_negations = _peel_predicate(reduce_in, ops)
+    inner, inner_negations = _peel_predicate(reduce_in, readers)
     compare_op = getattr(inner, "op", None)
     if compare_op is None or compare_op.op_type not in ("equal", "not_equal"):
         return None
@@ -331,12 +313,12 @@ def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
         # The comparison may run on the pre-/post-cast version of the scores.
         scores_op, softmax_in_op = getattr(scores, "op", None), getattr(softmax_op.x, "op", None)
         if scores_op is not None and scores_op.op_type == "cast" and scores_op.inputs["x"] is softmax_op.x:
-            ops.append(scores_op)
+            readers.append(scores_op)
         elif softmax_in_op is not None and softmax_in_op.op_type == "cast" and softmax_in_op.inputs["x"] is scores:
             pass
         else:
             return None
-    ops.append(compare_op)
+    readers.append(compare_op)
 
     # -- polarity ------------------------------------------------------------
     # `element_is_neg_inf` after the comparison and the `logical_not`s below the
@@ -360,10 +342,7 @@ def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
     if weights_when_true != row_not_all_neg_inf:
         return None
 
-    zeros_op = getattr(zeros, "op", None)
-    if zeros_op is not None:
-        ops.append(zeros_op)
-    return _SafeSoftmax(select_op, ops)
+    return _SafeSoftmax(select_op, readers)
 
 
 def _safe_softmax_is_redundant(pattern) -> bool:
@@ -391,11 +370,11 @@ def _np_scalar(value: float, dtype):
     return np.float16(value) if dtype == types.fp16 else np.float32(value)
 
 
-def _as_sequence_major(var, needs_transpose: bool, before_op, name: str, peeled):
+def _as_sequence_major(var, needs_transpose: bool, before_op, name: str):
     """Return ``var``, or its last-two-axes transpose, as a ``[batch..., seq, E]`` tensor.
 
     When ``var`` is itself such a transpose it is peeled instead of stacking a
-    second one; the peeled op is appended to ``peeled`` so it can be collected.
+    second one.
     """
     if not needs_transpose:
         return var
@@ -406,7 +385,6 @@ def _as_sequence_major(var, needs_transpose: bool, before_op, name: str, peeled)
         if perm is not None and len(perm) == rank:
             perm = [normalize_axis(p, rank) for p in perm]
             if perm == _swap_last_two(rank):
-                peeled.append(op)
                 return op.inputs["x"]
     return mb.transpose(x=var, perm=_swap_last_two(rank), before_op=before_op, name=name)
 
@@ -421,7 +399,6 @@ class _Pattern:
         self.weights_var = None
         self.back_layout_ops = []       # matmul_0 -> softmax, in execution order
         self.fwd_layout_ops = []        # softmax -> matmul_1, in execution order
-        self.ops = [softmax_op]         # every matched op (removal candidates)
         self.mask_kind = None           # None | "select" | "add"
         self.mask_var = None            # the compact condition / additive mask
         self.mask_fill = None           # the `select` fill value
@@ -497,7 +474,6 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
 
         if op_type == "matmul":
             pattern.matmul_0 = op
-            pattern.ops.append(op)
             break
 
         if op_type == "cast":
@@ -545,7 +521,7 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
                 pattern.scale = 1.0 / divisor
                 next_var = op.inputs["x"]
             else:
-                operand = _uniform_const_operand(op)
+                operand = uniform_const_operand(op)
                 if operand is None or operand[0] <= 0:
                     return False
                 pattern.scale, next_var = operand
@@ -558,7 +534,6 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
             # score layout; only element-wise application is supported.
             return False
 
-        pattern.ops.append(op)
         consumer = op
         var = next_var
 
@@ -584,7 +559,6 @@ def _match_forward(softmax_op, pattern, safe_softmax=None) -> bool:
         if consumer.op_type == "matmul":
             pattern.matmul_1 = consumer
             pattern.weights_var = var
-            pattern.ops.append(consumer)
             break
         if consumer.op_type == "cast":
             if n_casts >= 2:
@@ -594,7 +568,6 @@ def _match_forward(softmax_op, pattern, safe_softmax=None) -> bool:
             fwd_ops.append(consumer)
         else:
             return False
-        pattern.ops.append(consumer)
         var = consumer.outputs[0]
 
     pattern.fwd_layout_ops = fwd_ops
@@ -785,9 +758,7 @@ def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
     # Peel the broadcast tile the converter emits for `select`; the compact
     # condition is what we want to re-layout. A tile that replicates a dimension
     # that is not 1 is a real tile, not a broadcast, and must be kept.
-    mask_var, tile_op = _peel_broadcast_tile(mask_var)
-    if tile_op is not None:
-        pattern.ops.append(tile_op)
+    mask_var = _peel_broadcast_tile(mask_var)
 
     mask = _mask_to_sdpa_space(
         mask_var, space, softmax_op.x.shape, seq_len, before_op, softmax_op.name + "_mask"
@@ -864,7 +835,7 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
     # make a difference. Its condition reads the scores, so the backward walk
     # has to know about those ops before it checks for escaping consumers.
     safe_softmax = _match_safe_softmax(softmax_op)
-    ignored = frozenset(id(op) for op in safe_softmax.ops) if safe_softmax is not None else frozenset()
+    ignored = frozenset(id(op) for op in safe_softmax.readers) if safe_softmax is not None else frozenset()
 
     pattern = _Pattern(softmax_op)
     if not _match_backward(softmax_op, pattern, ignored):
@@ -873,8 +844,6 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
         return False
     if not _match_forward(softmax_op, pattern, safe_softmax):
         return False
-    if safe_softmax is not None:
-        pattern.ops.extend(safe_softmax.ops)
 
     matmul_0, matmul_1 = pattern.matmul_0, pattern.matmul_1
     if bool(matmul_0.transpose_x.val) or bool(matmul_1.transpose_x.val):
@@ -909,11 +878,9 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
     else:
         return False
 
-    peeled = []
-    query = _as_sequence_major(query_src, query_t, matmul_1, softmax_op.name + "_query", peeled)
-    key = _as_sequence_major(key_src, key_t, matmul_1, softmax_op.name + "_key", peeled)
-    value = _as_sequence_major(value_src, value_t, matmul_1, softmax_op.name + "_value", peeled)
-    pattern.ops.extend(peeled)
+    query = _as_sequence_major(query_src, query_t, matmul_1, softmax_op.name + "_query")
+    key = _as_sequence_major(key_src, key_t, matmul_1, softmax_op.name + "_key")
+    value = _as_sequence_major(value_src, value_t, matmul_1, softmax_op.name + "_value")
 
     if not _validate_operands(query, key, value, space.n_batch):
         return False
@@ -986,7 +953,6 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
         return False
 
     block.replace_uses_of_var_after_op(anchor_op=matmul_1, old_var=old_var, new_var=attention)
-    remove_dead_ops(block, pattern.ops)
     return True
 
 
@@ -1005,12 +971,9 @@ def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
         if op.op_type != "softmax":
             continue
         # `_try_fuse` may build some replacement ops before a late check makes it
-        # give up; drop those again so an aborted attempt leaves no trace.
-        existing = set(block.operations)
+        # give up; those are left dead in the block for `dead_code_elimination`.
         if _try_fuse(op, block, finite_fill_mask):
             fused += 1
-        else:
-            remove_dead_ops(block, [o for o in block.operations if o not in existing])
 
     return fused
 

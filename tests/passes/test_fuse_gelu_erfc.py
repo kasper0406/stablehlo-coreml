@@ -18,11 +18,14 @@ from tests.utils import get_model_instruction_types, run_and_compare, run_and_co
 register_optimizations()
 
 PASS_NAME = "common::fuse_gelu_erfc"
+DCE_PASS_NAME = "common::dead_code_elimination"
 INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
 
 def _apply(prog):
     apply_pass_and_basic_check(prog, PASS_NAME)
+    # The pass leaves the matched ops behind; DCE is what removes them.
+    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
 
 
 def _erfc_gelu(x, negate_first=True, factor=INV_SQRT2, half=0.5, one=1.0):
