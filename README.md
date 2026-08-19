@@ -29,8 +29,7 @@ To convert a StableHLO module:
 
 ```python
 import coremltools as ct
-from stablehlo_coreml.converter import convert
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec, convert
 
 mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 cml_model = ct.convert(
@@ -76,7 +75,11 @@ def step(cache, x):
 mil_program = convert(
     hlo_module,
     minimum_deployment_target=ct.target.iOS18,
-    states={0: 1},  # input 0 is updated by output 1
+    states={
+        "main": {
+            "cache": StateSpec(output=1),
+        },
+    },
 )
 cml_model = ct.convert(
     mil_program,
@@ -93,11 +96,18 @@ y = cml_model.predict({x_name: x}, state=state)
 # state.read_state(...) / state.write_state(...)
 ```
 
-Keys may be input indices or argument names. State tensors must have a static
-shape and a floating-point dtype (Core ML stores them as fp16). They do not
-appear in the model's regular inputs. Mapped outputs are omitted unless every
-result updates state; Core ML requires at least one output, so those updated
-values are then kept as results.
+The outer keys are public StableHLO function names. Inner keys may be input
+indices or argument names; JAX argument names are preserved when available.
+`StateSpec.output` identifies the function output that updates the state. It may
+be an output index, an exact JAX `result_info` name such as
+`"result['cache']"`, or the unique leaf name `"cache"`. Use `output=None` for
+read-only state, and `name=...` to override its Core ML name. A flat
+`{input: output}` mapping remains supported for single-function modules.
+
+State tensors must have a static shape and a floating-point dtype (Core ML
+stores them as fp16). They do not appear in the model's regular inputs. Updated
+outputs are omitted unless every result updates state; Core ML requires at least
+one output, so those updated values are then kept as results.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 
