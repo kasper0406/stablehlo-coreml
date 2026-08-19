@@ -89,38 +89,19 @@ cml_model = ct.convert(
 )
 
 state = cml_model.make_state()
-# Remaining tensor inputs keep their StableHLO argument names.
-x_name = list(cml_model.input_description)[0]
-y = cml_model.predict({x_name: x}, state=state)
+y = cml_model.predict({"x": x}, state=state)
 # `cache` is updated in place; inspect or reset it with
 # state.read_state(...) / state.write_state(...)
 ```
 
-The outer keys are public StableHLO function names. Inner keys may be input
-indices or argument names; JAX argument names are preserved when available.
-`StateSpec.output` identifies the function output that updates the state. It may
-be an output index, an exact JAX `result_info` name such as
-`"result['cache']"`, or the unique leaf name `"cache"`. Use `output=None` for
-read-only state, and `name=...` to override its Core ML name. A flat
-`{input: output}` mapping remains supported for single-function modules.
+Inner keys may be argument indices or names, and `StateSpec.output` an output
+index or JAX result name. Use `output=None` for read-only state and `name=...`
+to override the Core ML state name. A flat `{input: output}` mapping works for
+single-function modules.
 
-Core ML only accepts names of the form `[a-zA-Z_][a-zA-Z0-9_]*` and reserves a
-few words (`state`, `tensor`, `bool`, ...). Derived names are sanitized to that
-form up front, so a JAX pytree argument such as `params['w']` is exposed as
-`params__w__`. An explicit `name=...` that would need sanitizing is rejected at
-conversion time, telling you the valid alternative.
-
-Public StableHLO function names are preserved. A module whose only public
-function is `main` becomes an ordinary Core ML model; anything else (several
-public functions, or a single function with another name) is exported as a
-Core ML multifunction model, since Core ML requires the entry point of an
-ordinary model to be called `main`.
-
-State tensors must have a static shape and a floating-point dtype (Core ML
-stores them as fp16). They do not appear in the model's regular inputs, and the
-outputs holding their updated values are always dropped. If every result updates
-state, the model instead returns a single fixed one-element fp16 output named
-`state_update_token`, as Core ML requires at least one output.
+State tensors must have a static shape and a floating-point dtype (stored as
+fp16). They are removed from the model's inputs, and the outputs that update
+them are dropped.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 
