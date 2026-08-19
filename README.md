@@ -127,6 +127,17 @@ be an output index, an exact JAX `result_info` name such as
 read-only state, and `name=...` to override its Core ML name. A flat
 `{input: output}` mapping remains supported for single-function modules.
 
+Core ML only accepts names of the form `[a-zA-Z_][a-zA-Z0-9_]*` and reserves a
+few words (`state`, `tensor`, `bool`, ...). Derived names are sanitized to that
+form up front, so a JAX pytree argument such as `params['w']` is exposed as
+`params__w__`. An explicit `name=...` that would need sanitizing is rejected at
+conversion time, telling you the valid alternative.
+
+A module with a single public StableHLO function is always exported as the
+Core ML `main` function, whatever the StableHLO function is named; the keys of
+the state mapping still use the StableHLO name. Modules with several public
+functions are exported as a Core ML multifunction model.
+
 State tensors must have a static shape and a floating-point dtype (Core ML
 stores them as fp16). They do not appear in the model's regular inputs, and the
 outputs holding their updated values are always dropped. If every result updates
