@@ -63,7 +63,7 @@ For the JAX example to work, you will additionally need to install `absl-py` and
 
 ## Stateful models
 
-Core ML can keep tensors across `predict` calls as *state* instead of passing
+Core ML can keep tensors across model invocations as *state* instead of passing
 them in and out every time. Mark those tensors when converting by mapping each
 state input to the output that holds its updated value:
 
