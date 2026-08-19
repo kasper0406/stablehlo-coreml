@@ -1,5 +1,3 @@
-import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial, reduce
 
@@ -8,7 +6,7 @@ from coremltools import _logger as logger
 from coremltools.converters.mil import mil
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function, Program, Symbol, types
+from coremltools.converters.mil.mil import Function, Placeholder, Program, Symbol, Var, types
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
@@ -90,6 +88,14 @@ from .padding import pad_with_cast
 from .passes.utils import register_optimizations
 from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 from .sort_utils import match_sort
+from .state import (
+    FunctionStateMapping,
+    StateMapping,
+    StateSpec,
+    normalize_function_state_maps,
+    preferred_argument_name,
+    resolve_state_map,
+)
 from .translation_context import DYNAMIC_DIM_SENTINEL, TranslationContext
 from .utils import (
     auto_cast_bool,
@@ -111,18 +117,6 @@ from .utils import (
 # Core ML can only serialize state tensors as fp16. fp32 HLO state is
 # stored as fp16 and cast to/from the computation dtype around read/write.
 _STATE_VALUE_DTYPES = frozenset({types.fp16, types.fp32})
-
-
-@dataclass(frozen=True)
-class StateSpec:
-    """Describe how a StableHLO function argument is exposed as Core ML state."""
-
-    output: int | str | None
-    name: str | None = None
-
-
-StateMapping = Mapping[int | str, int | StateSpec]
-FunctionStateMapping = Mapping[str, StateMapping]
 
 
 def convert(
@@ -155,183 +149,6 @@ def convert(
     return converter.convert(module)
 
 
-def _argument_name_aliases(arg) -> list[str]:
-    names: list[str] = []
-    raw = arg.get_name()
-    if raw:
-        names.append(raw)
-        if raw.startswith("%"):
-            names.append(raw[1:])
-
-    loc_name = _argument_location_name(arg)
-    if loc_name:
-        names.append(loc_name)
-    return names
-
-
-def _argument_location_name(arg) -> str | None:
-    loc = getattr(arg, "location", None)
-    name = getattr(loc, "name_str", None) if loc is not None else None
-    return name if isinstance(name, str) and name else None
-
-
-def _preferred_argument_name(arg) -> str:
-    return _argument_location_name(arg) or arg.get_name().lstrip("%")
-
-
-def _function_outputs(hlo_func: FuncOp):
-    func_type = getattr(hlo_func, "type", None)
-    if func_type is None:
-        return None
-    for attr in ("results", "outputs"):
-        values = getattr(func_type, attr, None)
-        if values is not None:
-            return values
-    return None
-
-
-def _result_info_aliases(result_info: str) -> set[str]:
-    aliases = {result_info}
-    leaf_match = re.search(r"""\[['"]([^'"]+)['"]\]$""", result_info)
-    if leaf_match is not None:
-        aliases.add(leaf_match.group(1))
-    return aliases
-
-
-def _resolve_state_output(hlo_func: FuncOp, output: int | str | None) -> int | None:
-    if output is None or isinstance(output, int):
-        return output
-
-    matches: dict[str, list[int]] = {}
-    result_attrs = getattr(hlo_func, "result_attrs", ())
-    for index, attrs in enumerate(result_attrs):
-        try:
-            result_info = attrs["jax.result_info"].value
-        except KeyError:
-            continue
-        for alias in _result_info_aliases(result_info):
-            matches.setdefault(alias, []).append(index)
-
-    indices = matches.get(output, [])
-    if len(indices) > 1:
-        raise ValueError(f"State output name {output!r} is ambiguous")
-    if not indices:
-        known = ", ".join(repr(name) for name in sorted(matches)) or "<none>"
-        raise ValueError(f"Unknown state output {output!r}. Known output names: {known}")
-    return indices[0]
-
-
-def _coerce_state_spec(value: int | StateSpec) -> StateSpec:
-    if isinstance(value, StateSpec):
-        spec = value
-    elif isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"State specification must be a StateSpec or output index, got {value!r}")
-    else:
-        spec = StateSpec(output=value)
-
-    if isinstance(spec.output, bool) or not isinstance(spec.output, (int, str, type(None))):
-        raise TypeError(f"State output must be an int, str, or None, got {spec.output!r}")
-    if spec.name is not None and (not isinstance(spec.name, str) or not spec.name):
-        raise TypeError(f"State name must be a non-empty str or None, got {spec.name!r}")
-    return spec
-
-
-def _resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, StateSpec]:
-    args = list(hlo_func.arguments)
-    name_to_idx: dict[str, int] = {}
-    for i, arg in enumerate(args):
-        for alias in _argument_name_aliases(arg):
-            name_to_idx.setdefault(alias, i)
-
-    results = _function_outputs(hlo_func)
-    num_outputs = len(results) if results is not None else None
-
-    resolved: dict[int, StateSpec] = {}
-    output_owners: dict[int, int] = {}
-    state_names: set[str] = set()
-    for key, value in states.items():
-        spec = _coerce_state_spec(value)
-        out_idx = _resolve_state_output(hlo_func, spec.output)
-        spec = StateSpec(output=out_idx, name=spec.name)
-        if isinstance(key, bool) or not isinstance(key, (int, str)):
-            raise TypeError(f"State input must be an int index or str name, got {key!r}")
-
-        if isinstance(key, int):
-            in_idx = key
-        elif key not in name_to_idx:
-            known = ", ".join(sorted(name_to_idx)) or "<none>"
-            raise ValueError(f"Unknown state input {key!r}. Known argument names: {known}")
-        else:
-            in_idx = name_to_idx[key]
-
-        if not 0 <= in_idx < len(args):
-            raise ValueError(
-                f"State input index {in_idx} is out of range for a function with {len(args)} arguments"
-            )
-        if in_idx in resolved:
-            raise ValueError(f"Function argument {in_idx} is mapped as state more than once")
-        if spec.name is not None and spec.name in state_names:
-            raise ValueError(f"Core ML state name {spec.name!r} is used more than once")
-        if spec.output is not None and spec.output < 0:
-            raise ValueError(f"State output index {spec.output} is invalid")
-        if spec.output is not None and num_outputs is not None and spec.output >= num_outputs:
-            raise ValueError(
-                f"State output index {spec.output} is out of range for a function with {num_outputs} outputs"
-            )
-        if spec.output is not None and spec.output in output_owners:
-            raise ValueError(
-                f"Output {spec.output} cannot update both argument "
-                f"{output_owners[spec.output]} and {in_idx}"
-            )
-        if spec.output is not None and results is not None and args[in_idx].type != results[spec.output]:
-            raise ValueError(
-                f"State input {in_idx} has type {args[in_idx].type}, but output "
-                f"{spec.output} has type {results[spec.output]}"
-            )
-
-        resolved[in_idx] = spec
-        if spec.name is not None:
-            state_names.add(spec.name)
-        if spec.output is not None:
-            output_owners[spec.output] = in_idx
-
-    return resolved
-
-
-def _normalize_function_state_maps(
-    states: StateMapping | FunctionStateMapping | None,
-    public_function_names: list[str],
-) -> dict[str, StateMapping]:
-    if not states:
-        return {}
-
-    values = list(states.values())
-    has_nested_values = any(isinstance(value, Mapping) for value in values)
-    if has_nested_values:
-        if not all(isinstance(value, Mapping) for value in values):
-            raise TypeError("State mappings cannot mix function mappings with state specifications")
-        invalid_names = [name for name in states if not isinstance(name, str)]
-        if invalid_names:
-            raise TypeError(
-                f"Function names in a state mapping must be strings, got {invalid_names[0]!r}"
-            )
-        unknown = set(states) - set(public_function_names)
-        if unknown:
-            known = ", ".join(public_function_names) or "<none>"
-            raise ValueError(
-                f"Unknown public function(s) in state mapping: {', '.join(sorted(unknown))}. "
-                f"Known public functions: {known}"
-            )
-        return {name: mapping for name, mapping in states.items()}
-
-    if len(public_function_names) != 1:
-        raise ValueError(
-            "A flat state mapping is only supported for single-function modules; "
-            "map each public function name to its states"
-        )
-    return {public_function_names[0]: states}
-
-
 def _normalize_module(module: ir.Module) -> None:
     """Normalize an incoming StableHLO module in-place before conversion.
 
@@ -355,6 +172,145 @@ def _normalize_module(module: ir.Module) -> None:
         context=module.context,
     )
     pm.run(module.operation)
+
+
+@dataclass
+class _FunctionInterface:
+    inputs: dict[str, Placeholder]
+    argument_names: dict[int, str]
+    state_specs: dict[str, StateSpec]
+    state_compute_dtypes: dict[str, object]
+
+    @classmethod
+    def from_hlo(
+        cls,
+        hlo_func: FuncOp,
+        state_map: dict[int, StateSpec],
+    ) -> "_FunctionInterface":
+        inputs = {}
+        state_specs: dict[str, StateSpec] = {}
+        state_compute_dtypes: dict[str, object] = {}
+        argument_names: dict[int, str] = {}
+        used_input_names: set[str] = set()
+        explicit_state_names = {
+            spec.name: in_idx
+            for in_idx, spec in state_map.items()
+            if spec.name is not None
+        }
+        sym_counter = 0
+
+        for in_idx, arg in enumerate(hlo_func.arguments):
+            shape = arg.type.shape
+            context_name = arg.get_name()
+            state_spec = state_map.get(in_idx)
+            explicit_name = state_spec.name if state_spec is not None else None
+            name = explicit_name or preferred_argument_name(arg)
+            if explicit_name is not None:
+                if name in used_input_names:
+                    raise ValueError(
+                        f"Core ML state name {name!r} conflicts with another function input"
+                    )
+            else:
+                if name in used_input_names or (
+                    name in explicit_state_names and explicit_state_names[name] != in_idx
+                ):
+                    name = context_name.lstrip("%")
+                while name in used_input_names or (
+                    name in explicit_state_names and explicit_state_names[name] != in_idx
+                ):
+                    name = f"{name}_input"
+            used_input_names.add(name)
+            argument_names[in_idx] = name
+
+            # Reject dynamic state before constructing MIL Symbols — Symbol
+            # names are process-global and would leak if we raise afterwards.
+            if state_spec is not None and any(d == DYNAMIC_DIM_SENTINEL for d in shape):
+                raise ValueError(f"State input {name} must have a static shape, got {shape}")
+            if shape == []:
+                shape = [1]
+            else:
+                new_shape = []
+                for dim in shape:
+                    if dim == DYNAMIC_DIM_SENTINEL:
+                        new_shape.append(Symbol(f"dim_{sym_counter}"))
+                        sym_counter += 1
+                    else:
+                        new_shape.append(dim)
+                shape = new_shape
+
+            dtype = get_mil_type_from_ir(arg.type.element_type)
+            if state_spec is None:
+                inputs[name] = mb.placeholder(shape=shape, dtype=dtype)
+                continue
+            if dtype not in _STATE_VALUE_DTYPES:
+                raise ValueError(
+                    f"State input {name} has dtype {dtype_str(dtype)}, "
+                    "but Core ML states must be floating point (stored as fp16)"
+                )
+            inputs[name] = mb.state_tensor_placeholder(shape=shape, dtype=types.fp16)
+            state_specs[name] = state_spec
+            state_compute_dtypes[name] = dtype
+
+        return cls(
+            inputs=inputs,
+            argument_names=argument_names,
+            state_specs=state_specs,
+            state_compute_dtypes=state_compute_dtypes,
+        )
+
+    def bind_arguments(
+        self,
+        context: TranslationContext,
+        hlo_func: FuncOp,
+        ssa_func: Function,
+    ) -> dict[str, Var]:
+        state_vars = {}
+        for in_idx, arg in enumerate(hlo_func.arguments):
+            name = self.argument_names[in_idx]
+            var = ssa_func.inputs[name]
+            if name in self.state_specs:
+                state_vars[name] = var
+                var = mb.read_state(input=var)
+                compute_dtype = self.state_compute_dtypes[name]
+                if compute_dtype != types.fp16:
+                    var = mb.cast(x=var, dtype=dtype_str(compute_dtype))
+            context.add_variable(arg.get_name(), var)
+        return state_vars
+
+    def finalize_outputs(
+        self,
+        outputs: list[Var],
+        state_vars: dict[str, Var],
+    ) -> list[Var]:
+        consumed = set()
+        updated_states = []
+        for name, spec in self.state_specs.items():
+            if spec.output is None:
+                continue
+            out_idx = spec.output
+            if not 0 <= out_idx < len(outputs):
+                raise ValueError(
+                    f"State output index {out_idx} is out of range for a function "
+                    f"with {len(outputs)} outputs"
+                )
+            value = outputs[out_idx]
+            if self.state_compute_dtypes[name] != types.fp16:
+                value = mb.cast(x=value, dtype="fp16")
+            updated = mb.coreml_update_state(state=state_vars[name], value=value)
+            updated_states.append((updated, name))
+            consumed.add(out_idx)
+
+        final_outputs = [out for i, out in enumerate(outputs) if i not in consumed]
+        if final_outputs or not updated_states:
+            return final_outputs
+
+        # Core ML requires at least one output, so retain state-only results.
+        for updated, name in updated_states:
+            compute_dtype = self.state_compute_dtypes[name]
+            if compute_dtype != types.fp16:
+                updated = mb.cast(x=updated, dtype=dtype_str(compute_dtype))
+            final_outputs.append(updated)
+        return final_outputs
 
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
@@ -383,7 +339,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             if func.sym_visibility is None or func.sym_visibility.value == "public"
         ]
         public_function_names = [func.name.value for func in public_functions]
-        self.function_states = _normalize_function_state_maps(self.states, public_function_names)
+        self.function_states = normalize_function_state_maps(self.states, public_function_names)
 
         for func in public_functions:
             self.build_func(func)
@@ -399,121 +355,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         context = TranslationContext()  # Map from results to created variables
 
         function_states = self.function_states.get(hlo_func.name.value, {})
-        state_map = _resolve_state_map(hlo_func, function_states) if function_states else {}
+        state_map = resolve_state_map(hlo_func, function_states) if function_states else {}
+        interface = _FunctionInterface.from_hlo(hlo_func, state_map)
 
-        func_inputs = {}
-        state_specs: dict[str, StateSpec] = {}
-        state_compute_dtype: dict[str, object] = {}
-        argument_input_names: dict[int, str] = {}
-        used_input_names: set[str] = set()
-        explicit_state_names = {
-            spec.name: in_idx
-            for in_idx, spec in state_map.items()
-            if spec.name is not None
-        }
-        sym_counter = 0
-        for in_idx, arg in enumerate(hlo_func.arguments):
-            shape = arg.type.shape
-            context_name = arg.get_name()
-            state_spec = state_map.get(in_idx)
-            explicit_name = state_spec.name if state_spec is not None else None
-            name = explicit_name or _preferred_argument_name(arg)
-            if explicit_name is not None:
-                if name in used_input_names:
-                    raise ValueError(
-                        f"Core ML state name {name!r} conflicts with another function input"
-                    )
-            else:
-                if name in used_input_names or (
-                    name in explicit_state_names and explicit_state_names[name] != in_idx
-                ):
-                    name = context_name.lstrip("%")
-                while name in used_input_names or (
-                    name in explicit_state_names and explicit_state_names[name] != in_idx
-                ):
-                    name = f"{name}_input"
-            used_input_names.add(name)
-            argument_input_names[in_idx] = name
-            # Reject dynamic state before constructing MIL Symbols — Symbol
-            # names are process-global and would leak if we raise afterwards.
-            if in_idx in state_map and any(d == DYNAMIC_DIM_SENTINEL for d in shape):
-                raise ValueError(f"State input {name} must have a static shape, got {shape}")
-            if shape == []:
-                shape = [1]
-            else:
-                # Replace dynamic dims with MIL Symbols for flexible shapes
-                new_shape = []
-                for d in shape:
-                    if d == DYNAMIC_DIM_SENTINEL:
-                        new_shape.append(Symbol(f'dim_{sym_counter}'))
-                        sym_counter += 1
-                    else:
-                        new_shape.append(d)
-                shape = new_shape
-
-            dtype = get_mil_type_from_ir(arg.type.element_type)
-            if in_idx in state_map:
-                if dtype not in _STATE_VALUE_DTYPES:
-                    raise ValueError(
-                        f"State input {name} has dtype {dtype_str(dtype)}, "
-                        "but Core ML states must be floating point (stored as fp16)"
-                    )
-                func_inputs[name] = mb.state_tensor_placeholder(shape=shape, dtype=types.fp16)
-                state_specs[name] = state_map[in_idx]
-                state_compute_dtype[name] = dtype
-            else:
-                func_inputs[name] = mb.placeholder(shape=shape, dtype=dtype)
-
-        with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
-            state_vars = {}
-            for in_idx, arg in enumerate(hlo_func.arguments):
-                name = argument_input_names[in_idx]
-                var = ssa_func.inputs[name]
-                if name in state_specs:
-                    state_vars[name] = var
-                    var = mb.read_state(input=var)
-                    compute_dtype = state_compute_dtype[name]
-                    if compute_dtype != types.fp16:
-                        var = mb.cast(x=var, dtype=dtype_str(compute_dtype))
-                context.add_variable(arg.get_name(), var)
-
+        with Function(interface.inputs, opset_version=self.opset_version) as ssa_func:
+            state_vars = interface.bind_arguments(context, hlo_func, ssa_func)
             outputs = self.process_block(context, hlo_func.body.blocks[0])
-            if outputs is None:
-                outputs = []
-
-            consumed = set()
-            updated_states = []
-            for name, spec in state_specs.items():
-                if spec.output is None:
-                    continue
-                out_idx = spec.output
-                if not 0 <= out_idx < len(outputs):
-                    raise ValueError(
-                        f"State output index {out_idx} is out of range for a function "
-                        f"with {len(outputs)} outputs"
-                    )
-                value = outputs[out_idx]
-                if state_compute_dtype[name] != types.fp16:
-                    value = mb.cast(x=value, dtype="fp16")
-                updated_states.append(mb.coreml_update_state(state=state_vars[name], value=value))
-                consumed.add(out_idx)
-
-            # Core ML requires at least one output, so keep the updated
-            # state values if every result was consumed by a state write.
-            # coreml_update_state returns the fp16 storage value; cast
-            # back to the computation dtype so the result matches HLO.
-            final_outputs = [out for i, out in enumerate(outputs) if i not in consumed]
-            if not final_outputs and updated_states:
-                final_outputs = []
-                updated_state_names = [
-                    name for name, spec in state_specs.items() if spec.output is not None
-                ]
-                for updated, name in zip(updated_states, updated_state_names):
-                    compute_dtype = state_compute_dtype[name]
-                    if compute_dtype != types.fp16:
-                        updated = mb.cast(x=updated, dtype=dtype_str(compute_dtype))
-                    final_outputs.append(updated)
-            ssa_func.set_outputs(final_outputs)
+            ssa_func.set_outputs(interface.finalize_outputs(outputs or [], state_vars))
             self.prog.add_function(hlo_func.name.value, ssa_func)
 
     def process_block(self, context: TranslationContext, block: ir.Block):
