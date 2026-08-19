@@ -164,6 +164,28 @@ def test_state_name_override_takes_precedence_over_jax_argument_name():
     assert list(mil_program.functions["main"].inputs) == ["arg0", "cache"]
 
 
+@pytest.mark.parametrize("output", ["cache", "result['cache']"])
+def test_state_output_by_jax_result_name(output):
+    def step(state, x):
+        new_state = state + x
+        return {"prediction": new_state * x, "cache": new_state}
+
+    inputs = (jnp.zeros((2,), dtype=jnp.float32), jnp.ones((2,), dtype=jnp.float32))
+    named_program = convert(
+        export_hlo_module(step, inputs),
+        minimum_deployment_target=ct.target.iOS18,
+        states={"main": {"state": StateSpec(output=output)}},
+    )
+    indexed_program = convert(
+        export_hlo_module(step, inputs),
+        minimum_deployment_target=ct.target.iOS18,
+        states={"main": {"state": StateSpec(output=0)}},
+    )
+
+    assert _instruction_types(named_program) == _instruction_types(indexed_program)
+    assert len(named_program.functions["main"].outputs) == 1
+
+
 def test_function_scoped_states_export_as_multifunction():
     ctx = jax_mlir.make_ir_context()
     mlir_text = """

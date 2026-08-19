@@ -98,9 +98,11 @@ y = cml_model.predict({x_name: x}, state=state)
 
 The outer keys are public StableHLO function names. Inner keys may be input
 indices or argument names; JAX argument names are preserved when available.
-`StateSpec.output` identifies the function output that updates the state. Use
-`output=None` for read-only state, and `name=...` to override its Core ML name.
-A flat `{input: output}` mapping remains supported for single-function modules.
+`StateSpec.output` identifies the function output that updates the state. It may
+be an output index, an exact JAX `result_info` name such as
+`"result['cache']"`, or the unique leaf name `"cache"`. Use `output=None` for
+read-only state, and `name=...` to override its Core ML name. A flat
+`{input: output}` mapping remains supported for single-function modules.
 
 State tensors must have a static shape and a floating-point dtype (Core ML
 stores them as fp16). They do not appear in the model's regular inputs. Updated

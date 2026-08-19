@@ -1,3 +1,4 @@
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial, reduce
@@ -116,7 +117,7 @@ _STATE_VALUE_DTYPES = frozenset({types.fp16, types.fp32})
 class StateSpec:
     """Describe how a StableHLO function argument is exposed as Core ML state."""
 
-    output: int | None
+    output: int | str | None
     name: str | None = None
 
 
@@ -189,6 +190,37 @@ def _function_outputs(hlo_func: FuncOp):
     return None
 
 
+def _result_info_aliases(result_info: str) -> set[str]:
+    aliases = {result_info}
+    leaf_match = re.search(r"""\[['"]([^'"]+)['"]\]$""", result_info)
+    if leaf_match is not None:
+        aliases.add(leaf_match.group(1))
+    return aliases
+
+
+def _resolve_state_output(hlo_func: FuncOp, output: int | str | None) -> int | None:
+    if output is None or isinstance(output, int):
+        return output
+
+    matches: dict[str, list[int]] = {}
+    result_attrs = getattr(hlo_func, "result_attrs", ())
+    for index, attrs in enumerate(result_attrs):
+        try:
+            result_info = attrs["jax.result_info"].value
+        except KeyError:
+            continue
+        for alias in _result_info_aliases(result_info):
+            matches.setdefault(alias, []).append(index)
+
+    indices = matches.get(output, [])
+    if len(indices) > 1:
+        raise ValueError(f"State output name {output!r} is ambiguous")
+    if not indices:
+        known = ", ".join(repr(name) for name in sorted(matches)) or "<none>"
+        raise ValueError(f"Unknown state output {output!r}. Known output names: {known}")
+    return indices[0]
+
+
 def _coerce_state_spec(value: int | StateSpec) -> StateSpec:
     if isinstance(value, StateSpec):
         spec = value
@@ -197,8 +229,8 @@ def _coerce_state_spec(value: int | StateSpec) -> StateSpec:
     else:
         spec = StateSpec(output=value)
 
-    if spec.output is not None and (isinstance(spec.output, bool) or not isinstance(spec.output, int)):
-        raise TypeError(f"State output index must be an int or None, got {spec.output!r}")
+    if isinstance(spec.output, bool) or not isinstance(spec.output, (int, str, type(None))):
+        raise TypeError(f"State output must be an int, str, or None, got {spec.output!r}")
     if spec.name is not None and (not isinstance(spec.name, str) or not spec.name):
         raise TypeError(f"State name must be a non-empty str or None, got {spec.name!r}")
     return spec
@@ -219,6 +251,8 @@ def _resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, Stat
     state_names: set[str] = set()
     for key, value in states.items():
         spec = _coerce_state_spec(value)
+        out_idx = _resolve_state_output(hlo_func, spec.output)
+        spec = StateSpec(output=out_idx, name=spec.name)
         if isinstance(key, bool) or not isinstance(key, (int, str)):
             raise TypeError(f"State input must be an int index or str name, got {key!r}")
 
