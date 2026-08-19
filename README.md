@@ -105,9 +105,10 @@ read-only state, and `name=...` to override its Core ML name. A flat
 `{input: output}` mapping remains supported for single-function modules.
 
 State tensors must have a static shape and a floating-point dtype (Core ML
-stores them as fp16). They do not appear in the model's regular inputs. Updated
-outputs are omitted unless every result updates state; Core ML requires at least
-one output, so those updated values are then kept as results.
+stores them as fp16). They do not appear in the model's regular inputs, and the
+outputs holding their updated values are always dropped. If every result updates
+state, the model instead returns a single fixed one-element fp16 output named
+`state_update_token`, as Core ML requires at least one output.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 

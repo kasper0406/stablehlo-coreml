@@ -31,7 +31,7 @@ def test_accumulator_persists_across_calls():
         _accumulator,
         initial_inputs=(initial_state, jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32)),
         states={"main": {"state": StateSpec(output=1)}},
-        extra_nonstate_steps=[
+        subsequent_inputs=[
             (jnp.array([0.5, -1.0, 2.0], dtype=jnp.float32),),
             (jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32),),
         ],
@@ -71,7 +71,7 @@ def test_multiple_states():
         step,
         initial_inputs=(zeros, zeros + 1.0, x0),
         states={0: 1, 1: 2},
-        extra_nonstate_steps=[
+        subsequent_inputs=[
             (jnp.full((2, 3), 0.5, dtype=jnp.float32),),
         ],
     )
@@ -86,13 +86,15 @@ def test_state_only_output():
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18, states={0: 0})
     mil_func = next(iter(mil_program.functions.values()))
     assert len(mil_func.outputs) == 1
-    assert mil_func.outputs[0].dtype == types.fp32
+    assert mil_func.outputs[0].name == "state_update_token"
+    assert mil_func.outputs[0].shape == (1,)
+    assert mil_func.outputs[0].dtype == types.fp16
 
     run_and_compare_stateful(
         add_into,
         initial_inputs=inputs,
         states={0: 0},
-        extra_nonstate_steps=[
+        subsequent_inputs=[
             (jnp.ones((4,), dtype=jnp.float32),),
         ],
     )

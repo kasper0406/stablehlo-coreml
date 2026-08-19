@@ -11,8 +11,9 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export as _jax_export
 
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE
 from stablehlo_coreml.converter import convert
+from stablehlo_coreml.state import resolve_state_map
 
 
 def jax_export(jax_func, input_spec):
@@ -133,6 +134,81 @@ def _convert_mil_to_coreml(
     return ct.convert(mil_program, **convert_kwargs)
 
 
+def _as_tuple(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return (value,)
+
+
+def _as_numpy(value):
+    """Detach JAX arrays into a Core ML-friendly contiguous ndarray."""
+    return np.array(value, copy=True)
+
+
+def _convert_hlo_module(
+    hlo_module,
+    *,
+    states=None,
+    max_complexity: int = 10_000,
+    compute_units=ct.ComputeUnit.CPU_ONLY,
+    ct_inputs=None,
+):
+    """Convert a StableHLO module to ``(mil_program, cml_model)``.
+
+    ``states`` is forwarded to :func:`convert`. ``ct_inputs`` is
+    either a list of ``ct.TensorType``s, or a callable that builds one from the
+    converted MIL program.
+    """
+    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18, states=states)
+
+    if callable(ct_inputs):
+        ct_inputs = ct_inputs(mil_program)
+
+    cml_model = _convert_mil_to_coreml(
+        mil_program,
+        max_complexity=max_complexity,
+        compute_units=compute_units,
+        ct_inputs=ct_inputs,
+    )
+    return mil_program, cml_model
+
+
+def _compare_model_outputs(
+    cml_model,
+    inputs,
+    expected_outputs,
+    *,
+    atol,
+    rtol,
+    state=None,
+):
+    """Predict with ``inputs`` and compare the results to ``expected_outputs``.
+
+    Inputs and expected outputs are matched positionally against the model
+    input/output descriptions. Only the outputs covered by ``expected_outputs``
+    are compared, so any extra model output (such as ``state_update_token``) is
+    ignored.
+    """
+    cml_input_key_values = {
+        input_name: _as_numpy(input_value)
+        for input_name, input_value in zip(cml_model.input_description, flatten(inputs))
+    }
+    cml_expected_outputs = {
+        output_name: np.asarray(output_value)
+        for output_name, output_value
+        in zip(cml_model.output_description, flatten(_as_tuple(expected_outputs)))
+    }
+
+    compare_backend(
+        cml_model,
+        cml_input_key_values,
+        cml_expected_outputs,
+        atol=atol,
+        rtol=rtol,
+        state=state,
+    )
+
+
 def run_and_compare_hlo_module(
     hlo_module,
     inputs,
@@ -143,29 +219,13 @@ def run_and_compare_hlo_module(
     rtol=1e-05,
     compute_units=ct.ComputeUnit.CPU_ONLY,
 ):
-    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
-
-    cml_model = _convert_mil_to_coreml(
-        mil_program,
+    _, cml_model = _convert_hlo_module(
+        hlo_module,
         max_complexity=max_complexity,
         compute_units=compute_units,
     )
 
-    # Generate random inputs that matches cml_model input spec
-    cml_input_key_values = {}
-    for input_name, input_value in zip(cml_model.input_description, flatten(inputs)):
-        cml_input_key_values[input_name] = input_value
-
-    # TODO(knielsen): Is there a nicer way of doing this?
-    if not isinstance(expected_outputs, (list, tuple)):
-        expected_outputs = (expected_outputs, )
-
-    # Prepare the output for comparison
-    cml_expected_outputs = {}
-    for output_name, output_value in zip(cml_model.output_description, flatten(expected_outputs)):
-        cml_expected_outputs[output_name] = np.asarray(output_value)
-
-    compare_backend(cml_model, cml_input_key_values, cml_expected_outputs, atol=atol, rtol=rtol)
+    _compare_model_outputs(cml_model, inputs, expected_outputs, atol=atol, rtol=rtol)
 
     return cml_model
 
@@ -262,22 +322,11 @@ def export_hlo_module(jax_func, inputs):
     return ir.Module.parse(exported.mlir_module(), context=context)
 
 
-def _as_numpy(value):
-    """Detach JAX arrays into a Core ML-friendly contiguous ndarray."""
-    return np.array(value, copy=True)
-
-
-def _as_output_tuple(value):
-    if isinstance(value, (list, tuple)):
-        return tuple(value)
-    return (value,)
-
-
 def run_and_compare_stateful(
     jax_func,
     initial_inputs,
     states,
-    extra_nonstate_steps=(),
+    subsequent_inputs=(),
     *,
     max_complexity: int = 10_000,
     atol=1e-04,
@@ -287,15 +336,16 @@ def run_and_compare_stateful(
     """Convert ``jax_func`` with ``states`` and compare multi-step predictions.
 
     ``states`` is either a single-function state mapping or a function-scoped
-    mapping. ``extra_nonstate_steps`` are tuples of the remaining (non-state)
-    positional arguments for subsequent calls.
+    mapping. ``subsequent_inputs`` are tuples of the remaining (non-state)
+    positional arguments for each subsequent call.
     """
     jax_func = jax.jit(jax_func)
     hlo_module = export_hlo_module(jax_func, initial_inputs)
-    mil_program = convert(
+    mil_program, cml_model = _convert_hlo_module(
         hlo_module,
-        minimum_deployment_target=ct.target.iOS18,
         states=states,
+        max_complexity=max_complexity,
+        compute_units=compute_units,
     )
 
     mil_func_name = mil_program.default_function_name
@@ -303,32 +353,17 @@ def run_and_compare_stateful(
     if states and all(isinstance(value, Mapping) for value in states.values()):
         function_states = states[mil_func_name]
 
+    # Map argument index -> index of the output holding the updated state
+    hlo_func = next(func for func in hlo_module.body if func.name.value == mil_func_name)
     resolved_states = {}
-    for key, state_spec in function_states.items():
-        out_idx = state_spec.output if isinstance(state_spec, StateSpec) else state_spec
-        if out_idx is None:
+    for in_idx, state_spec in resolve_state_map(hlo_func, function_states).items():
+        if state_spec.output is None:
             raise ValueError("run_and_compare_stateful requires updated, not read-only, states")
-        if isinstance(key, int):
-            resolved_states[key] = out_idx
-        else:
-            mil_func = mil_program.functions[mil_func_name]
-            for i, name in enumerate(mil_func.inputs):
-                aliases = {name, name.lstrip("%")}
-                if key in aliases:
-                    resolved_states[i] = out_idx
-                    break
-            else:
-                raise ValueError(f"Could not resolve state input {key!r}")
-
-    cml_model = _convert_mil_to_coreml(
-        mil_program,
-        max_complexity=max_complexity,
-        compute_units=compute_units,
-    )
+        resolved_states[in_idx] = state_spec.output
 
     nonstate_indices = [i for i in range(len(initial_inputs)) if i not in resolved_states]
     state_indices = [i for i in range(len(initial_inputs)) if i in resolved_states]
-    tensor_names = list(cml_model.input_description)
+    state_outputs = set(resolved_states.values())
     state_names = [feature.name for feature in cml_model._spec.description.state]
 
     cml_state = cml_model.make_state()
@@ -336,27 +371,19 @@ def run_and_compare_stateful(
         cml_state.write_state(name=name, value=_as_numpy(initial_inputs[idx]))
 
     def run_step(args):
-        expected = _as_output_tuple(jax_func(*args))
-        cml_inputs = {
-            name: _as_numpy(args[idx])
-            for name, idx in zip(tensor_names, nonstate_indices)
-        }
-        cml_outputs = cml_model.predict(cml_inputs, state=cml_state) if cml_inputs else cml_model.predict({}, state=cml_state)
-
+        expected = _as_tuple(jax_func(*args))
+        # Outputs that update state are not exposed by the Core ML model
         expected_tensor_outputs = [
-            expected[i] for i in range(len(expected)) if i not in resolved_states.values()
+            value for i, value in enumerate(expected) if i not in state_outputs
         ]
-        output_names = list(cml_model.output_description)
-        # If every HLO result is a state update, Core ML still keeps those
-        # values as outputs; ignore the extras when comparing tensors.
-        assert len(output_names) >= len(expected_tensor_outputs)
-        for name, value in zip(output_names, expected_tensor_outputs):
-            np.testing.assert_allclose(
-                np.asarray(cml_outputs[name]),
-                np.asarray(value),
-                atol=atol,
-                rtol=rtol,
-            )
+        _compare_model_outputs(
+            cml_model,
+            [args[idx] for idx in nonstate_indices],
+            expected_tensor_outputs,
+            atol=atol,
+            rtol=rtol,
+            state=cml_state,
+        )
 
         for name, in_idx in zip(state_names, state_indices):
             np.testing.assert_allclose(
@@ -368,14 +395,14 @@ def run_and_compare_stateful(
         return expected
 
     outputs = run_step(initial_inputs)
-    for extra in extra_nonstate_steps:
+    for next_nonstate_inputs in subsequent_inputs:
         next_args = [None] * len(initial_inputs)
-        extra_iter = iter(extra)
+        nonstate_iter = iter(next_nonstate_inputs)
         for i in range(len(initial_inputs)):
             if i in resolved_states:
                 next_args[i] = outputs[resolved_states[i]]
             else:
-                next_args[i] = next(extra_iter)
+                next_args[i] = next(nonstate_iter)
         outputs = run_step(next_args)
 
     return cml_model
@@ -412,50 +439,36 @@ def run_and_compare_symbolic(
     context = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(exported.mlir_module(), context=context)
 
-    mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
+    def build_ct_inputs(mil_program):
+        # Build ct.TensorType inputs with RangeDim for symbolic dimensions
+        ct_inputs = []
+        for func in mil_program.functions.values():
+            for inp_name, inp in func.inputs.items():
+                ct_shape = []
+                for dim in inp.shape:
+                    if isinstance(dim, Symbol):
+                        ct_shape.append(ct.RangeDim(1, range_dim_max, default=1))
+                    else:
+                        ct_shape.append(int(dim))
+                ct_inputs.append(ct.TensorType(name=inp_name, shape=ct_shape))
+            break  # only first (main) function
+        return ct_inputs
 
-    # Build ct.TensorType inputs with RangeDim for symbolic dimensions
-    ct_inputs = []
-    for func in mil_program.functions.values():
-        for inp_name, inp in func.inputs.items():
-            ct_shape = []
-            for dim in inp.shape:
-                if isinstance(dim, Symbol):
-                    ct_shape.append(ct.RangeDim(1, range_dim_max, default=1))
-                else:
-                    ct_shape.append(int(dim))
-            ct_inputs.append(ct.TensorType(name=inp_name, shape=ct_shape))
-        break  # only first (main) function
-
-    cml_model = _convert_mil_to_coreml(
-        mil_program,
+    _, cml_model = _convert_hlo_module(
+        hlo_module,
         max_complexity=max_complexity,
         compute_units=compute_units,
-        ct_inputs=ct_inputs,
+        ct_inputs=build_ct_inputs,
     )
 
-    input_names = list(cml_model.input_description)
-    output_names = list(cml_model.output_description)
-
     for concrete_inputs in test_shapes:
-        if not isinstance(concrete_inputs, (list, tuple)):
-            concrete_inputs = (concrete_inputs,)
-
-        expected_output = jax_func(*concrete_inputs)
-        if not isinstance(expected_output, (list, tuple)):
-            expected_output = (expected_output,)
-
-        cml_input_dict = {}
-        for name, val in zip(input_names, flatten(concrete_inputs)):
-            cml_input_dict[name] = np.asarray(val)
-
-        cml_expected = {}
-        for name, val in zip(output_names, flatten(expected_output)):
-            cml_expected[name] = np.asarray(val)
-
-        compare_backend(
-            cml_model, cml_input_dict, cml_expected,
-            atol=atol, rtol=rtol,
+        concrete_inputs = _as_tuple(concrete_inputs)
+        _compare_model_outputs(
+            cml_model,
+            concrete_inputs,
+            jax_func(*concrete_inputs),
+            atol=atol,
+            rtol=rtol,
         )
 
     return cml_model
