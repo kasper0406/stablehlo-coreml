@@ -475,7 +475,7 @@ def test_pytree_state_name_is_sanitized():
     )
 
 
-def test_single_public_function_is_exported_as_main():
+def test_single_non_main_function_is_exported_as_multifunction():
     ctx = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(
         """
@@ -490,9 +490,11 @@ def test_single_public_function_is_exported_as_main():
     )
     mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 
-    assert list(mil_program.functions) == ["main"]
-    assert mil_program.default_function_name == "main"
-    assert not mil_program.export_as_multifunction
+    # Only a lone "main" can be an ordinary Core ML model; any other function
+    # name is kept by exporting a multifunction model.
+    assert list(mil_program.functions) == ["forward"]
+    assert mil_program.default_function_name == "forward"
+    assert mil_program.export_as_multifunction
 
     cml_model = ct.convert(
         mil_program,
@@ -509,7 +511,7 @@ def test_single_public_function_is_exported_as_main():
     np.testing.assert_allclose(outputs[output_names[0]], [4.0, 6.0], atol=1e-3)
 
 
-def test_single_public_function_with_state_is_exported_as_main():
+def test_single_non_main_function_with_state_keeps_its_name():
     ctx = jax_mlir.make_ir_context()
     hlo_module = ir.Module.parse(
         """
@@ -529,7 +531,8 @@ def test_single_public_function_with_state_is_exported_as_main():
         states={"forward": {"arg0": StateSpec(output=1, name="cache")}},
     )
 
-    assert list(mil_program.functions) == ["main"]
+    assert list(mil_program.functions) == ["forward"]
+    assert mil_program.export_as_multifunction
     cml_model = ct.convert(
         mil_program,
         source="milinternal",

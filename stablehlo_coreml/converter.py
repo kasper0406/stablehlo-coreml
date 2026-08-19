@@ -196,24 +196,21 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         public_function_names = [func.name.value for func in public_functions]
         self.function_states = normalize_function_state_maps(self.states, public_function_names)
 
-        # A module with a single public function is exported as an ordinary
-        # (non-multifunction) model, whose entry point Core ML requires to be
-        # called "main". State mappings stay keyed by the HLO function name.
-        single_function = len(public_functions) == 1
-
         for func in public_functions:
-            self.build_func(func, "main" if single_function else func.name.value)
+            self.build_func(func)
 
+        # Core ML requires the entry point of an ordinary (single-function)
+        # model to be called "main". Anything else — several public functions,
+        # or a lone function with another name — is exported as a multifunction
+        # model, which keeps the StableHLO function names.
         if public_function_names:
             self.prog.default_function_name = (
-                "main"
-                if single_function or "main" in public_function_names
-                else public_function_names[0]
+                "main" if "main" in public_function_names else public_function_names[0]
             )
-        self.prog.export_as_multifunction = len(public_function_names) > 1
+        self.prog.export_as_multifunction = public_function_names != ["main"]
         return self.prog
 
-    def build_func(self, hlo_func: FuncOp, mil_func_name: str | None = None):
+    def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
         function_states = self.function_states.get(hlo_func.name.value, {})
@@ -224,7 +221,7 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             state_bindings = interface.bind_arguments(context, hlo_func, ssa_func)
             outputs = self.process_block(context, hlo_func.body.blocks[0])
             ssa_func.set_outputs(interface.finalize_outputs(outputs or [], state_bindings))
-            self.prog.add_function(mil_func_name or hlo_func.name.value, ssa_func)
+            self.prog.add_function(hlo_func.name.value, ssa_func)
 
     def process_block(self, context: TranslationContext, block: ir.Block):
         outputs = None

@@ -396,8 +396,7 @@ def run_and_compare_stateful(
         compute_units=compute_units,
     )
 
-    # A JAX export has exactly one public function, which we always convert
-    # into the Core ML "main" function.
+    # A JAX export has exactly one public function, "main".
     hlo_func = next(
         func
         for func in hlo_module.body

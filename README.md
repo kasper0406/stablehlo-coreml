@@ -133,10 +133,11 @@ form up front, so a JAX pytree argument such as `params['w']` is exposed as
 `params__w__`. An explicit `name=...` that would need sanitizing is rejected at
 conversion time, telling you the valid alternative.
 
-A module with a single public StableHLO function is always exported as the
-Core ML `main` function, whatever the StableHLO function is named; the keys of
-the state mapping still use the StableHLO name. Modules with several public
-functions are exported as a Core ML multifunction model.
+Public StableHLO function names are preserved. A module whose only public
+function is `main` becomes an ordinary Core ML model; anything else (several
+public functions, or a single function with another name) is exported as a
+Core ML multifunction model, since Core ML requires the entry point of an
+ordinary model to be called `main`.
 
 State tensors must have a static shape and a floating-point dtype (Core ML
 stores them as fp16). They do not appear in the model's regular inputs, and the
