@@ -1,4 +1,5 @@
 import copy
+from collections.abc import Mapping
 
 import coremltools as ct
 import jax
@@ -10,7 +11,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export as _jax_export
 
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec
 from stablehlo_coreml.converter import convert
 
 
@@ -285,9 +286,9 @@ def run_and_compare_stateful(
 ):
     """Convert ``jax_func`` with ``states`` and compare multi-step predictions.
 
-    ``states`` maps input indices (or names) to the output index that holds
-    the updated state. ``extra_nonstate_steps`` are tuples of the remaining
-    (non-state) positional arguments for subsequent calls.
+    ``states`` is either a single-function state mapping or a function-scoped
+    mapping. ``extra_nonstate_steps`` are tuples of the remaining (non-state)
+    positional arguments for subsequent calls.
     """
     jax_func = jax.jit(jax_func)
     hlo_module = export_hlo_module(jax_func, initial_inputs)
@@ -296,18 +297,21 @@ def run_and_compare_stateful(
         minimum_deployment_target=ct.target.iOS18,
         states=states,
     )
-    cml_model = _convert_mil_to_coreml(
-        mil_program,
-        max_complexity=max_complexity,
-        compute_units=compute_units,
-    )
+
+    mil_func_name = mil_program.default_function_name
+    function_states = states
+    if states and all(isinstance(value, Mapping) for value in states.values()):
+        function_states = states[mil_func_name]
 
     resolved_states = {}
-    for key, out_idx in states.items():
+    for key, state_spec in function_states.items():
+        out_idx = state_spec.output if isinstance(state_spec, StateSpec) else state_spec
+        if out_idx is None:
+            raise ValueError("run_and_compare_stateful requires updated, not read-only, states")
         if isinstance(key, int):
             resolved_states[key] = out_idx
         else:
-            mil_func = next(iter(mil_program.functions.values()))
+            mil_func = mil_program.functions[mil_func_name]
             for i, name in enumerate(mil_func.inputs):
                 aliases = {name, name.lstrip("%")}
                 if key in aliases:
@@ -315,6 +319,12 @@ def run_and_compare_stateful(
                     break
             else:
                 raise ValueError(f"Could not resolve state input {key!r}")
+
+    cml_model = _convert_mil_to_coreml(
+        mil_program,
+        max_complexity=max_complexity,
+        compute_units=compute_units,
+    )
 
     nonstate_indices = [i for i in range(len(initial_inputs)) if i not in resolved_states]
     state_indices = [i for i in range(len(initial_inputs)) if i in resolved_states]

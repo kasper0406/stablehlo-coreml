@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from dataclasses import dataclass
 from functools import partial, reduce
 
 import numpy as np
@@ -111,22 +112,36 @@ from .utils import (
 _STATE_VALUE_DTYPES = frozenset({types.fp16, types.fp32})
 
 
+@dataclass(frozen=True)
+class StateSpec:
+    """Describe how a StableHLO function argument is exposed as Core ML state."""
+
+    output: int | None
+    name: str | None = None
+
+
+StateMapping = Mapping[int | str, int | StateSpec]
+FunctionStateMapping = Mapping[str, StateMapping]
+
+
 def convert(
     module,
     minimum_deployment_target: AvailableTarget,
-    states: Mapping[int | str, int] | None = None,
+    states: StateMapping | FunctionStateMapping | None = None,
 ):
     """Convert a StableHLO module to a MIL program.
 
-    ``states`` maps function inputs that should become Core ML state
-    tensors onto the output that holds the updated value. Keys are input
-    indices or argument names; values are output indices. Those outputs
-    are written back with ``coreml_update_state`` and omitted from the
-    function results, except when every result is a state write: Core ML
-    requires at least one output, so the updated state values are then
-    kept as results (cast back to the computation dtype). State is stored
-    as fp16 (a Core ML requirement); fp32 values are cast around the
-    read/write.
+    ``states`` maps public function names to their state arguments. Each
+    argument maps to a :class:`StateSpec` identifying the output that
+    updates it, or ``None`` for read-only state. A flat argument mapping
+    and integer output values remain supported for single-function
+    modules.
+
+    State arguments may be identified by index or by their JAX/MLIR name.
+    Updated outputs are omitted from the function results, except when
+    every result is a state write: Core ML requires at least one output,
+    so the updated values are then kept as results. State is stored as
+    fp16; fp32 values are cast around the read/write.
     """
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
@@ -147,11 +162,20 @@ def _argument_name_aliases(arg) -> list[str]:
         if raw.startswith("%"):
             names.append(raw[1:])
 
-    loc = getattr(arg, "location", None)
-    loc_name = getattr(loc, "name", None) if loc is not None else None
+    loc_name = _argument_location_name(arg)
     if loc_name:
-        names.append(str(loc_name))
+        names.append(loc_name)
     return names
+
+
+def _argument_location_name(arg) -> str | None:
+    loc = getattr(arg, "location", None)
+    name = getattr(loc, "name_str", None) if loc is not None else None
+    return name if isinstance(name, str) and name else None
+
+
+def _preferred_argument_name(arg) -> str:
+    return _argument_location_name(arg) or arg.get_name().lstrip("%")
 
 
 def _function_outputs(hlo_func: FuncOp):
@@ -165,7 +189,22 @@ def _function_outputs(hlo_func: FuncOp):
     return None
 
 
-def _resolve_state_map(hlo_func: FuncOp, states: Mapping[int | str, int]) -> dict[int, int]:
+def _coerce_state_spec(value: int | StateSpec) -> StateSpec:
+    if isinstance(value, StateSpec):
+        spec = value
+    elif isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"State specification must be a StateSpec or output index, got {value!r}")
+    else:
+        spec = StateSpec(output=value)
+
+    if spec.output is not None and (isinstance(spec.output, bool) or not isinstance(spec.output, int)):
+        raise TypeError(f"State output index must be an int or None, got {spec.output!r}")
+    if spec.name is not None and (not isinstance(spec.name, str) or not spec.name):
+        raise TypeError(f"State name must be a non-empty str or None, got {spec.name!r}")
+    return spec
+
+
+def _resolve_state_map(hlo_func: FuncOp, states: StateMapping) -> dict[int, StateSpec]:
     args = list(hlo_func.arguments)
     name_to_idx: dict[str, int] = {}
     for i, arg in enumerate(args):
@@ -175,11 +214,11 @@ def _resolve_state_map(hlo_func: FuncOp, states: Mapping[int | str, int]) -> dic
     results = _function_outputs(hlo_func)
     num_outputs = len(results) if results is not None else None
 
-    resolved: dict[int, int] = {}
+    resolved: dict[int, StateSpec] = {}
     output_owners: dict[int, int] = {}
-    for key, out_idx in states.items():
-        if isinstance(out_idx, bool) or not isinstance(out_idx, int):
-            raise TypeError(f"State output index must be an int, got {out_idx!r}")
+    state_names: set[str] = set()
+    for key, value in states.items():
+        spec = _coerce_state_spec(value)
         if isinstance(key, bool) or not isinstance(key, (int, str)):
             raise TypeError(f"State input must be an int index or str name, got {key!r}")
 
@@ -197,26 +236,66 @@ def _resolve_state_map(hlo_func: FuncOp, states: Mapping[int | str, int]) -> dic
             )
         if in_idx in resolved:
             raise ValueError(f"Function argument {in_idx} is mapped as state more than once")
-        if out_idx < 0:
-            raise ValueError(f"State output index {out_idx} is invalid")
-        if num_outputs is not None and out_idx >= num_outputs:
+        if spec.name is not None and spec.name in state_names:
+            raise ValueError(f"Core ML state name {spec.name!r} is used more than once")
+        if spec.output is not None and spec.output < 0:
+            raise ValueError(f"State output index {spec.output} is invalid")
+        if spec.output is not None and num_outputs is not None and spec.output >= num_outputs:
             raise ValueError(
-                f"State output index {out_idx} is out of range for a function with {num_outputs} outputs"
+                f"State output index {spec.output} is out of range for a function with {num_outputs} outputs"
             )
-        if out_idx in output_owners:
+        if spec.output is not None and spec.output in output_owners:
             raise ValueError(
-                f"Output {out_idx} cannot update both argument {output_owners[out_idx]} and {in_idx}"
+                f"Output {spec.output} cannot update both argument "
+                f"{output_owners[spec.output]} and {in_idx}"
             )
-        if results is not None and args[in_idx].type != results[out_idx]:
+        if spec.output is not None and results is not None and args[in_idx].type != results[spec.output]:
             raise ValueError(
                 f"State input {in_idx} has type {args[in_idx].type}, but output "
-                f"{out_idx} has type {results[out_idx]}"
+                f"{spec.output} has type {results[spec.output]}"
             )
 
-        resolved[in_idx] = out_idx
-        output_owners[out_idx] = in_idx
+        resolved[in_idx] = spec
+        if spec.name is not None:
+            state_names.add(spec.name)
+        if spec.output is not None:
+            output_owners[spec.output] = in_idx
 
     return resolved
+
+
+def _normalize_function_state_maps(
+    states: StateMapping | FunctionStateMapping | None,
+    public_function_names: list[str],
+) -> dict[str, StateMapping]:
+    if not states:
+        return {}
+
+    values = list(states.values())
+    has_nested_values = any(isinstance(value, Mapping) for value in values)
+    if has_nested_values:
+        if not all(isinstance(value, Mapping) for value in values):
+            raise TypeError("State mappings cannot mix function mappings with state specifications")
+        invalid_names = [name for name in states if not isinstance(name, str)]
+        if invalid_names:
+            raise TypeError(
+                f"Function names in a state mapping must be strings, got {invalid_names[0]!r}"
+            )
+        unknown = set(states) - set(public_function_names)
+        if unknown:
+            known = ", ".join(public_function_names) or "<none>"
+            raise ValueError(
+                f"Unknown public function(s) in state mapping: {', '.join(sorted(unknown))}. "
+                f"Known public functions: {known}"
+            )
+        return {name: mapping for name, mapping in states.items()}
+
+    if len(public_function_names) != 1:
+        raise ValueError(
+            "A flat state mapping is only supported for single-function modules; "
+            "map each public function name to its states"
+        )
+    return {public_function_names[0]: states}
 
 
 def _normalize_module(module: ir.Module) -> None:
@@ -249,12 +328,13 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
     def __init__(
         self,
         opset_version: int | None = None,
-        states: Mapping[int | str, int] | None = None,
+        states: StateMapping | FunctionStateMapping | None = None,
     ):
         self.opset_version = AvailableTarget(opset_version) if opset_version is not None else None
         self.prog = mil.Program()
         self.func_index = {}
         self.states = dict(states) if states else {}
+        self.function_states: dict[str, StateMapping] = {}
 
     def convert(self, module: ir.Module) -> Program:
         logger.info("Converting graph.")
@@ -263,24 +343,63 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         for func in module.body:
             self.func_index[func.name.value] = func
 
-        for func in module.body:
-            if func.sym_visibility is None or func.sym_visibility.value == "public":
-                self.build_func(func)
+        public_functions = [
+            func
+            for func in module.body
+            if func.sym_visibility is None or func.sym_visibility.value == "public"
+        ]
+        public_function_names = [func.name.value for func in public_functions]
+        self.function_states = _normalize_function_state_maps(self.states, public_function_names)
 
+        for func in public_functions:
+            self.build_func(func)
+
+        if public_function_names:
+            self.prog.default_function_name = (
+                "main" if "main" in public_function_names else public_function_names[0]
+            )
+        self.prog.export_as_multifunction = len(public_function_names) > 1
         return self.prog
 
     def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
-        state_map = _resolve_state_map(hlo_func, self.states) if self.states else {}
+        function_states = self.function_states.get(hlo_func.name.value, {})
+        state_map = _resolve_state_map(hlo_func, function_states) if function_states else {}
 
         func_inputs = {}
-        state_output_index: dict[str, int] = {}
+        state_specs: dict[str, StateSpec] = {}
         state_compute_dtype: dict[str, object] = {}
+        argument_input_names: dict[int, str] = {}
+        used_input_names: set[str] = set()
+        explicit_state_names = {
+            spec.name: in_idx
+            for in_idx, spec in state_map.items()
+            if spec.name is not None
+        }
         sym_counter = 0
         for in_idx, arg in enumerate(hlo_func.arguments):
             shape = arg.type.shape
-            name = arg.get_name()
+            context_name = arg.get_name()
+            state_spec = state_map.get(in_idx)
+            explicit_name = state_spec.name if state_spec is not None else None
+            name = explicit_name or _preferred_argument_name(arg)
+            if explicit_name is not None:
+                if name in used_input_names:
+                    raise ValueError(
+                        f"Core ML state name {name!r} conflicts with another function input"
+                    )
+            else:
+                if name in used_input_names or (
+                    name in explicit_state_names and explicit_state_names[name] != in_idx
+                ):
+                    name = context_name.lstrip("%")
+                while name in used_input_names or (
+                    name in explicit_state_names and explicit_state_names[name] != in_idx
+                ):
+                    name = f"{name}_input"
+            used_input_names.add(name)
+            argument_input_names[in_idx] = name
             # Reject dynamic state before constructing MIL Symbols — Symbol
             # names are process-global and would leak if we raise afterwards.
             if in_idx in state_map and any(d == DYNAMIC_DIM_SENTINEL for d in shape):
@@ -306,22 +425,23 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
                         "but Core ML states must be floating point (stored as fp16)"
                     )
                 func_inputs[name] = mb.state_tensor_placeholder(shape=shape, dtype=types.fp16)
-                state_output_index[name] = state_map[in_idx]
+                state_specs[name] = state_map[in_idx]
                 state_compute_dtype[name] = dtype
             else:
                 func_inputs[name] = mb.placeholder(shape=shape, dtype=dtype)
 
         with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
             state_vars = {}
-            for name in func_inputs:
+            for in_idx, arg in enumerate(hlo_func.arguments):
+                name = argument_input_names[in_idx]
                 var = ssa_func.inputs[name]
-                if name in state_output_index:
+                if name in state_specs:
                     state_vars[name] = var
                     var = mb.read_state(input=var)
                     compute_dtype = state_compute_dtype[name]
                     if compute_dtype != types.fp16:
                         var = mb.cast(x=var, dtype=dtype_str(compute_dtype))
-                context.add_variable(name, var)
+                context.add_variable(arg.get_name(), var)
 
             outputs = self.process_block(context, hlo_func.body.blocks[0])
             if outputs is None:
@@ -329,7 +449,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
 
             consumed = set()
             updated_states = []
-            for name, out_idx in state_output_index.items():
+            for name, spec in state_specs.items():
+                if spec.output is None:
+                    continue
+                out_idx = spec.output
                 if not 0 <= out_idx < len(outputs):
                     raise ValueError(
                         f"State output index {out_idx} is out of range for a function "
@@ -346,9 +469,12 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             # coreml_update_state returns the fp16 storage value; cast
             # back to the computation dtype so the result matches HLO.
             final_outputs = [out for i, out in enumerate(outputs) if i not in consumed]
-            if not final_outputs:
+            if not final_outputs and updated_states:
                 final_outputs = []
-                for updated, name in zip(updated_states, state_output_index):
+                updated_state_names = [
+                    name for name, spec in state_specs.items() if spec.output is not None
+                ]
+                for updated, name in zip(updated_states, updated_state_names):
                     compute_dtype = state_compute_dtype[name]
                     if compute_dtype != types.fp16:
                         updated = mb.cast(x=updated, dtype=dtype_str(compute_dtype))
