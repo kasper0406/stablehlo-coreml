@@ -5,7 +5,7 @@ from coremltools import _logger as logger
 from coremltools.converters.mil import mil
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function, Program, Symbol, types
+from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil.mil.ops.defs._utils import (
     promote_input_dtypes,
 )
@@ -82,11 +82,18 @@ from jaxlib.mlir.dialects.stablehlo import (
     XorOp,
 )
 
+from .function_interface import _FunctionInterface
 from .ops_register import StableHloOpsRegistry, register_composite_op, register_stablehlo_op
 from .padding import pad_with_cast
 from .passes.utils import register_optimizations
 from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 from .sort_utils import match_sort
+from .state import (
+    FunctionStateMapping,
+    StateMapping,
+    normalize_function_state_maps,
+    resolve_state_map,
+)
 from .translation_context import DYNAMIC_DIM_SENTINEL, TranslationContext
 from .utils import (
     auto_cast_bool,
@@ -106,7 +113,25 @@ from .utils import (
 )
 
 
-def convert(module, minimum_deployment_target: AvailableTarget):
+def convert(
+    module,
+    minimum_deployment_target: AvailableTarget,
+    states: StateMapping | FunctionStateMapping | None = None,
+):
+    """Convert a StableHLO module to a MIL program.
+
+    ``states`` maps public function names to their state arguments. Each
+    argument maps to a :class:`StateSpec` identifying the output that
+    updates it, or ``None`` for read-only state. A flat argument mapping
+    and integer output values remain supported for single-function
+    modules.
+
+    State arguments may be identified by index or by their JAX/MLIR name.
+    Updated outputs are omitted from the function results. When every result
+    is a state write, a one-element token is returned because Core ML requires
+    at least one tensor output. State is stored as fp16; fp32 values are cast
+    around the read/write.
+    """
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
 
@@ -114,7 +139,7 @@ def convert(module, minimum_deployment_target: AvailableTarget):
 
     _normalize_module(module)
 
-    converter = StableHloConverter(opset_version=minimum_deployment_target)
+    converter = StableHloConverter(opset_version=minimum_deployment_target, states=states)
     return converter.convert(module)
 
 
@@ -145,10 +170,16 @@ def _normalize_module(module: ir.Module) -> None:
 
 class StableHloConverter(metaclass=StableHloOpsRegistry):
 
-    def __init__(self, opset_version: int | None = None):
+    def __init__(
+        self,
+        opset_version: int | None = None,
+        states: StateMapping | FunctionStateMapping | None = None,
+    ):
         self.opset_version = AvailableTarget(opset_version) if opset_version is not None else None
         self.prog = mil.Program()
         self.func_index = {}
+        self.states = dict(states) if states else {}
+        self.function_states: dict[str, StateMapping] = {}
 
     def convert(self, module: ir.Module) -> Program:
         logger.info("Converting graph.")
@@ -157,41 +188,39 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         for func in module.body:
             self.func_index[func.name.value] = func
 
-        for func in module.body:
-            if func.sym_visibility is None or func.sym_visibility.value == "public":
-                self.build_func(func)
+        public_functions = [
+            func
+            for func in module.body
+            if func.sym_visibility is None or func.sym_visibility.value == "public"
+        ]
+        public_function_names = [func.name.value for func in public_functions]
+        self.function_states = normalize_function_state_maps(self.states, public_function_names)
 
+        for func in public_functions:
+            self.build_func(func)
+
+        # Core ML requires the entry point of an ordinary (single-function)
+        # model to be called "main". Anything else — several public functions,
+        # or a lone function with another name — is exported as a multifunction
+        # model, which keeps the StableHLO function names.
+        if public_function_names:
+            self.prog.default_function_name = (
+                "main" if "main" in public_function_names else public_function_names[0]
+            )
+        self.prog.export_as_multifunction = public_function_names != ["main"]
         return self.prog
 
     def build_func(self, hlo_func: FuncOp):
         context = TranslationContext()  # Map from results to created variables
 
-        func_inputs = {}
-        sym_counter = 0
-        for arg in hlo_func.arguments:
-            shape = arg.type.shape
-            if shape == []:
-                shape = [1]
-            else:
-                # Replace dynamic dims with MIL Symbols for flexible shapes
-                new_shape = []
-                for d in shape:
-                    if d == DYNAMIC_DIM_SENTINEL:
-                        new_shape.append(Symbol(f'dim_{sym_counter}'))
-                        sym_counter += 1
-                    else:
-                        new_shape.append(d)
-                shape = new_shape
+        function_states = self.function_states.get(hlo_func.name.value, {})
+        state_map = resolve_state_map(hlo_func, function_states) if function_states else {}
+        interface = _FunctionInterface.from_hlo(hlo_func, state_map)
 
-            func_inputs[arg.get_name()] = mb.placeholder(
-                shape=shape, dtype=get_mil_type_from_ir(arg.type.element_type)
-            )
-
-        with Function(func_inputs, opset_version=self.opset_version) as ssa_func:
-            for name in func_inputs:
-                context.add_variable(name, ssa_func.inputs[name])
-
-            ssa_func.set_outputs(self.process_block(context, hlo_func.body.blocks[0]))
+        with Function(interface.inputs, opset_version=self.opset_version) as ssa_func:
+            state_bindings = interface.bind_arguments(context, hlo_func, ssa_func)
+            outputs = self.process_block(context, hlo_func.body.blocks[0])
+            ssa_func.set_outputs(interface.finalize_outputs(outputs or [], state_bindings))
             self.prog.add_function(hlo_func.name.value, ssa_func)
 
     def process_block(self, context: TranslationContext, block: ir.Block):

@@ -29,8 +29,7 @@ To convert a StableHLO module:
 
 ```python
 import coremltools as ct
-from stablehlo_coreml.converter import convert
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE
+from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec, convert
 
 mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 cml_model = ct.convert(
@@ -62,6 +61,50 @@ hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 
 For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
+## Stateful models
+
+Core ML can keep tensors across model invocations as *state* instead of passing
+them in and out every time. Mark those tensors when converting by mapping each
+state input to the output that holds its updated value:
+
+```python
+def step(cache, x):
+    new_cache = cache + x
+    return new_cache * x, new_cache
+
+mil_program = convert(
+    hlo_module,
+    minimum_deployment_target=ct.target.iOS18,
+    states={
+        "main": {
+            "cache": StateSpec(output=1),
+        },
+    },
+)
+cml_model = ct.convert(
+    mil_program,
+    source="milinternal",
+    minimum_deployment_target=ct.target.iOS18,
+    pass_pipeline=DEFAULT_HLO_PIPELINE,
+)
+
+state = cml_model.make_state()
+y = cml_model.predict({"x": x}, state=state)
+# `cache` is updated in place; inspect or reset it with
+# state.read_state(...) / state.write_state(...)
+```
+
+Inner keys may be argument indices or names, and `StateSpec.output` an output
+index or JAX result name. Use `output=None` for read-only state and `name=...`
+to override the Core ML state name. A flat `{input: output}` mapping works for
+single-function modules.
+
+State tensors must have a static shape and a floating-point dtype (stored as
+fp16). They are removed from the model's inputs, and the outputs that update
+them are dropped.
+
+See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
+
 ## Dynamic / symbolic shapes
 
 JAX models exported with symbolic dimensions are supported. Symbolic dims flow
@@ -90,8 +133,8 @@ cml_model = ct.convert(
     minimum_deployment_target=ct.target.iOS18,
     pass_pipeline=DEFAULT_HLO_PIPELINE,
     inputs=[
-        ct.TensorType(name="_arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
-        ct.TensorType(name="_arg1", shape=(4, 3)),
+        ct.TensorType(name="arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
+        ct.TensorType(name="arg1", shape=(4, 3)),
     ],
 )
 ```
