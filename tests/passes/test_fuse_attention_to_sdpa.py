@@ -69,6 +69,33 @@ def _qkv_specs():
     ]
 
 
+def _predict(prog, **inputs):
+    """Convert ``prog`` and run it; returns the single output as an ndarray."""
+    model = ct.convert(
+        prog,
+        source="milinternal",
+        minimum_deployment_target=ct.target.iOS18,
+        compute_units=ct.ComputeUnit.CPU_ONLY,
+        # Keep fp32 throughout; the default pipeline would otherwise downcast and
+        # leave only ~1e-3 of accuracy to compare against.
+        compute_precision=ct.precision.FLOAT32,
+    )
+    names = [feature.name for feature in model.get_spec().description.input]
+    result = model.predict({name: inputs[name] for name in names})
+    return np.array(next(iter(result.values())))
+
+
+def _reference_attention(q, k, v, mask=None, fill=-1e9):
+    """``softmax(q @ k^T [+ mask]) @ v`` in numpy, over the last two axes."""
+    scores = np.matmul(q, np.swapaxes(k, -2, -1))
+    if mask is not None:
+        scores = np.where(mask, scores, np.float32(fill))
+    scores = scores - scores.max(axis=-1, keepdims=True)
+    weights = np.exp(scores)
+    weights /= weights.sum(axis=-1, keepdims=True)
+    return np.matmul(weights, v)
+
+
 class TestFuseAttentionToSdpa:
     """Unit tests on hand-built MIL programs."""
 
@@ -554,6 +581,165 @@ class TestFuseAttentionToSdpa:
         assert get_op_types_in_program(prog) == ops_after_first
 
 
+class TestUnitQueryLength:
+    """The autoregressive decode step: a single query row.
+
+    ``dot_general`` on a ``[1, H, 1, E] x [1, H, S, E]`` pair lowers to a rank-3
+    ``matmul`` over ``[H, 1, S]``, and the converter puts the leading batch axis
+    back afterwards with ``reshape [H, 1, 1, S] -> transpose [1, H, 1, S]``.
+
+    That reshape places a *second* size-1 axis right next to the query axis, so
+    which of the two holds the query rows cannot be decided from the sizes -- and
+    the transpose then moves the two apart, dropping the query axis into the
+    batch position. It makes no difference to the elements (a size-1 axis is
+    always indexed 0), and the pass must not be confused by it.
+    """
+
+    HEADS, KEYS, EMBED = 3, 7, 4
+
+    @classmethod
+    def _specs(cls, *extra):
+        return [
+            mb.TensorSpec(shape=(cls.HEADS, 1, cls.EMBED)),
+            mb.TensorSpec(shape=(cls.HEADS, cls.KEYS, cls.EMBED)),
+            mb.TensorSpec(shape=(cls.HEADS, cls.KEYS, cls.EMBED)),
+            *extra,
+        ]
+
+    def test_unit_query_axis_is_fused(self):
+        heads, keys, embedding = self.HEADS, self.KEYS, self.EMBED
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=self._specs())
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)              # [H, 1, S]
+            split = mb.reshape(x=scores, shape=[heads, 1, 1, keys])     # [H, 1, 1, S]
+            moved = mb.transpose(x=split, perm=[2, 0, 1, 3])            # [1, H, 1, S]
+            weights = mb.softmax(x=moved, axis=-1)
+            merged = mb.reshape(x=weights, shape=[heads, 1, keys])      # [H, 1, S]
+            return mb.matmul(x=merged, y=v, transpose_y=False)
+
+        _apply(prog)
+        ops = get_op_types_in_program(prog)
+        assert ops.count("scaled_dot_product_attention") == 1
+        assert "softmax" not in ops
+        assert "matmul" not in ops
+        assert_model_is_valid(
+            prog,
+            {"q": (heads, 1, embedding), "k": (heads, keys, embedding), "v": (heads, keys, embedding)},
+            minimum_deployment_target=ct.target.iOS18,
+            backend=("mlprogram", "fp32"),
+        )
+
+    def test_unit_query_axis_with_key_mask_is_fused(self):
+        """The decode mask is one flag per key, shared by every head."""
+        heads, keys = self.HEADS, self.KEYS
+        mask_spec = mb.TensorSpec(shape=(1, 1, 1, keys), dtype=types.bool)
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=self._specs(mask_spec))
+        def prog(q, k, v, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            split = mb.reshape(x=scores, shape=[heads, 1, 1, keys])
+            moved = mb.transpose(x=split, perm=[2, 0, 1, 3])
+            masked = mb.select(cond=mask, a=moved, b=NEG_INF)
+            weights = mb.softmax(x=masked, axis=-1)
+            merged = mb.reshape(x=weights, shape=[heads, 1, keys])
+            return mb.matmul(x=merged, y=v, transpose_y=False)
+
+        _apply(prog)
+        ops = get_op_types_in_program(prog)
+        assert ops.count("scaled_dot_product_attention") == 1
+        assert "softmax" not in ops
+        sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
+        # A pure key mask collapses to [1, 1, S] in the rank-3 matmul space.
+        assert tuple(sdpa.attn_mask.shape) == (1, 1, keys)
+
+    def test_unit_query_axis_with_per_head_mask_is_fused(self):
+        """A mask that varies per head has to be re-laid out in matmul space."""
+        heads, keys = self.HEADS, self.KEYS
+        mask_spec = mb.TensorSpec(shape=(1, heads, 1, keys), dtype=types.bool)
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=self._specs(mask_spec))
+        def prog(q, k, v, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            split = mb.reshape(x=scores, shape=[heads, 1, 1, keys])
+            moved = mb.transpose(x=split, perm=[2, 0, 1, 3])
+            masked = mb.select(cond=mask, a=moved, b=NEG_INF)
+            weights = mb.softmax(x=masked, axis=-1)
+            merged = mb.reshape(x=weights, shape=[heads, 1, keys])
+            return mb.matmul(x=merged, y=v, transpose_y=False)
+
+        _apply(prog)
+        ops = get_op_types_in_program(prog)
+        assert ops.count("scaled_dot_product_attention") == 1
+        sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
+        assert tuple(sdpa.attn_mask.shape) == (heads, 1, keys)
+
+    def test_unit_query_axis_keeps_the_original_numerics(self):
+        heads, keys, embedding = self.HEADS, self.KEYS, self.EMBED
+        mask_spec = mb.TensorSpec(shape=(1, 1, 1, keys), dtype=types.bool)
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=self._specs(mask_spec))
+        def prog(q, k, v, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            split = mb.reshape(x=scores, shape=[heads, 1, 1, keys])
+            moved = mb.transpose(x=split, perm=[2, 0, 1, 3])
+            masked = mb.select(cond=mask, a=moved, b=FINITE_FILL)
+            weights = mb.softmax(x=masked, axis=-1)
+            merged = mb.reshape(x=weights, shape=[heads, 1, keys])
+            return mb.matmul(x=merged, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog).count("scaled_dot_product_attention") == 1
+
+        rng = np.random.RandomState(0)
+        q = rng.randn(heads, 1, embedding).astype(np.float32)
+        k = rng.randn(heads, keys, embedding).astype(np.float32)
+        v = rng.randn(heads, keys, embedding).astype(np.float32)
+        mask = (np.arange(keys) < keys - 2).reshape(1, 1, 1, keys)
+
+        expected = _reference_attention(q, k, v, mask.reshape(1, 1, keys), fill=float(FINITE_FILL))
+        # Core ML has no boolean model input; it exposes the mask as fp32.
+        got = _predict(prog, q=q, k=k, v=v, mask=mask.astype(np.float32))
+        np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
+
+    def test_not_fused_when_a_transpose_permutes_real_batch_axes(self):
+        """A unit query axis must not make a genuine batch permutation look free."""
+        b0, b1, keys, embedding = 2, 3, 7, 4
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=[
+            mb.TensorSpec(shape=(b0, b1, 1, embedding)),
+            mb.TensorSpec(shape=(b0, b1, keys, embedding)),
+            mb.TensorSpec(shape=(b1, b0, keys, embedding)),
+        ])
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)      # [b0, b1, 1, S]
+            swapped = mb.transpose(x=scores, perm=[1, 0, 2, 3])  # [b1, b0, 1, S]
+            weights = mb.softmax(x=swapped, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert _sdpa_ops(prog) == 0
+
+    def test_not_fused_when_the_softmax_axis_merges_a_real_batch_axis(self):
+        """``[B, 1, S] -> [1, B * S]`` reduces over more than the key axis."""
+        batch, keys, embedding = 2, 7, 4
+
+        @mb.program(opset_version=ct.target.iOS18, input_specs=[
+            mb.TensorSpec(shape=(batch, 1, embedding)),
+            mb.TensorSpec(shape=(batch, keys, embedding)),
+            mb.TensorSpec(shape=(batch, keys, embedding)),
+        ])
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)             # [B, 1, S]
+            merged = mb.reshape(x=scores, shape=[1, 1, batch * keys])  # [1, 1, B * S]
+            weights = mb.softmax(x=merged, axis=-1)
+            split = mb.reshape(x=weights, shape=[batch, 1, keys])
+            return mb.matmul(x=split, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert _sdpa_ops(prog) == 0
+
+
 class TestSafeSoftmaxWrapper:
     """`torch._safe_softmax` zeroes rows that are entirely -inf; peel that."""
 
@@ -757,6 +943,18 @@ class TestRegroup:
         assert self._sizes(_regroup(atoms, [4, 1])) == [[1, 4], [1]]
         assert self._sizes(_regroup([_Atom(1), _Atom(4), _Atom(1)], [4])) == [[1, 4, 1]]
 
+    def test_a_unit_atom_lands_in_an_arbitrary_unit_dimension(self):
+        """`[H, 1, S] -> [H, 1, 1, S]` cannot tell the two size-1 axes apart.
+
+        The query atom ends up in the *second* of them; a following transpose may
+        then carry it anywhere. Matching therefore compares layouts by their
+        non-unit atoms only -- a size-1 axis never reorders elements.
+        """
+        atoms = [_Atom(3), _Atom(1), _Atom(7)]
+        grouped = _regroup(atoms, [3, 1, 1, 7])
+        assert self._sizes(grouped) == [[3], [], [1], [7]]
+        assert grouped[2][0] is atoms[1]
+
     def test_axes_are_split_and_merged(self):
         atoms = [_Atom(2), _Atom(15)]
         assert self._sizes(_regroup(atoms, [6, 5])) == [[2, 3], [5]]
@@ -802,6 +1000,46 @@ class TestFuseAttentionToSdpaEndToEnd:
             jax.ShapeDtypeStruct((1, 7, 2, 4), jnp.float32),      # b s k h
             jax.ShapeDtypeStruct((1, 7, 2, 4), jnp.float32),      # b s k h
             jax.ShapeDtypeStruct((1, 5, 7), jnp.bool_),           # b t s
+        ])
+        self._assert_fused(cml_model)
+
+    def test_decode_step_attention_with_unit_query_length(self):
+        """One query row against the whole cache -- the autoregressive hot path."""
+        def attention(q, k, v, valid):
+            scores = jnp.einsum("bhld,bhsd->bhls", q, k) / jnp.sqrt(4.0)
+            scores = jnp.where(valid[:, None, None, :], scores, -1e9)
+            weights = jax.nn.softmax(scores, axis=-1)
+            return jnp.einsum("bhls,bhsd->bhld", weights, v)
+
+        cml_model = run_and_compare(attention, [
+            jax.ShapeDtypeStruct((1, 3, 1, 4), jnp.float32),
+            jax.ShapeDtypeStruct((1, 3, 7, 4), jnp.float32),
+            jax.ShapeDtypeStruct((1, 3, 7, 4), jnp.float32),
+            jax.ShapeDtypeStruct((1, 7), jnp.bool_),
+        ])
+        self._assert_fused(cml_model)
+
+    def test_gqa_decode_step_attention(self):
+        """A Gemma-style decode step: one query row, grouped KV heads."""
+        heads, kv_heads, keys, embedding = 4, 2, 7, 4
+
+        def attention(q, k, v, valid):
+            k = jnp.repeat(k, heads // kv_heads, axis=2)
+            v = jnp.repeat(v, heads // kv_heads, axis=2)
+            scores = jnp.matmul(
+                jnp.transpose(q, (0, 2, 1, 3)),
+                jnp.swapaxes(jnp.transpose(k, (0, 2, 1, 3)), -2, -1),
+            )
+            scores = jnp.where(valid[None, None, None, :], scores, -1e9)
+            weights = jax.nn.softmax(scores, axis=-1)
+            out = jnp.matmul(weights, jnp.transpose(v, (0, 2, 1, 3)))
+            return jnp.transpose(out, (0, 2, 1, 3)).reshape(1, 1, heads * embedding)
+
+        cml_model = run_and_compare(attention, [
+            jax.ShapeDtypeStruct((1, 1, heads, embedding), jnp.float32),
+            jax.ShapeDtypeStruct((1, keys, kv_heads, embedding), jnp.float32),
+            jax.ShapeDtypeStruct((1, keys, kv_heads, embedding), jnp.float32),
+            jax.ShapeDtypeStruct((keys,), jnp.bool_),
         ])
         self._assert_fused(cml_model)
 
