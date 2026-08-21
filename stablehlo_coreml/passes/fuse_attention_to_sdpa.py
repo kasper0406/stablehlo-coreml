@@ -25,9 +25,19 @@ result axes of ``matmul_0``, and the pass tracks that re-grouping symbolically
 * how a mask expressed in softmax space maps onto SDPA's ``[..., L, S]``
   attention scores.
 
-Whenever that cannot be established (symbolic dimensions where concrete ones
-are needed, a result axis split across the softmax axis, an intermediate value
-that is consumed elsewhere, ...) the pass leaves the graph alone.
+Size-1 axes are the one thing the re-grouping cannot pin down: a reshape that
+introduces or drops one next to another (``[H, L, S] -> [H, L, 1, S]``, which
+the converter emits to restore a batch axis) may attach it to either, and a
+following transpose then moves the two apart. It also makes no difference --
+an axis of size 1 is always indexed 0, so it never reorders elements -- and
+layouts are therefore compared by their non-unit atoms only (see
+:func:`_ordering`). Without that, a query sequence length of 1, i.e. every
+autoregressive decode step, would never fuse.
+
+Whenever the re-grouping cannot be established (symbolic dimensions where
+concrete ones are needed, a result axis split across the softmax axis, an
+intermediate value that is consumed elsewhere, ...) the pass leaves the graph
+alone.
 
 PyTorch's ``_safe_softmax`` wrapper -- ``select(row_is_all_neg_inf, 0.0,
 softmax(x))``, which several HuggingFace models lower literally -- is peeled off
@@ -192,6 +202,30 @@ def _track_layout(layout: list[list[_Atom]], ops) -> list[list[_Atom]] | None:
 def _expand(dim) -> list[_Atom]:
     """Expand a dimension's atoms to their (current) leaves."""
     return [leaf for atom in dim for leaf in atom.leaves()]
+
+
+def _ordering(atoms) -> list[_Atom]:
+    """The atoms of ``atoms`` that carry ordering information: the non-unit ones.
+
+    An axis of size 1 always has index 0, so it contributes nothing to the
+    flattened element offset -- two atom sequences describe the same element
+    order exactly when their non-unit atoms agree. Dimension sizes are not lost
+    either: a unit atom multiplies a group's size by 1.
+
+    That matters because a reshape which introduces or removes a size-1 axis
+    next to another one is genuinely ambiguous. ``[H, 1, S] -> [H, 1, 1, S]``
+    (the reshape the converter emits around ``dot_general`` when the query
+    sequence length is 1) can put the query atom in either unit axis, and a
+    following transpose then moves the two apart. Comparing layouts by their
+    ordering atoms makes that choice irrelevant instead of a match failure.
+    """
+    return [atom for atom in atoms if atom.size != 1]
+
+
+def _same_ordering(a, b) -> bool:
+    """True when two atom sequences describe the same element order."""
+    a, b = _ordering(a), _ordering(b)
+    return len(a) == len(b) and all(x is y for x, y in zip(a, b))
 
 
 def _leads_to_matmul(var, depth: int = 12) -> bool:
@@ -420,8 +454,9 @@ class _Space:
         self.s_atom = s_atom
         self.l_atom = l_atom
         self.batch_atoms = batch_atoms
+        # Every layout kept here holds ordering atoms only (see `_ordering`).
         self.softmax_layout = softmax_layout
-        self.l_leaves = None if l_atom is None else l_atom.leaves()
+        self.l_leaves = None if l_atom is None else _ordering(l_atom.leaves())
         self.l_prime = l_prime
 
     @property
@@ -433,8 +468,8 @@ class _Space:
         """The atom order of SDPA's ``[batch..., L, S]`` score space."""
         order = []
         for atom in self.batch_atoms:
-            order.extend(atom.leaves())
-        return order + list(self.l_leaves) + [self.s_atom]
+            order.extend(_ordering(atom.leaves()))
+        return order + list(self.l_leaves) + _ordering([self.s_atom])
 
     @property
     def is_score_space(self) -> bool:
@@ -444,11 +479,11 @@ class _Space:
         if len(self.softmax_layout) != self.n_batch + 2:
             return False
         for atom, dim in zip(self.batch_atoms, self.softmax_layout):
-            if [id(a) for a in dim] != [id(a) for a in atom.leaves()]:
+            if not _same_ordering(dim, atom.leaves()):
                 return False
-        if self.softmax_layout[-1] != [self.s_atom]:
+        if not _same_ordering(self.softmax_layout[-1], [self.s_atom]):
             return False
-        return [id(a) for a in self.softmax_layout[-2]] == [id(a) for a in self.l_leaves]
+        return _same_ordering(self.softmax_layout[-2], self.l_leaves)
 
 
 def _match_backward(softmax_op, pattern, ignored=()) -> bool:
@@ -574,6 +609,26 @@ def _match_forward(softmax_op, pattern, safe_softmax=None) -> bool:
     return True
 
 
+def _softmax_axis_atom(dim, m_atom: _Atom, n_atom: _Atom) -> _Atom | None:
+    """The result axis of ``matmul_0`` that the softmax axis ``dim`` is made of.
+
+    ``None`` when the softmax axis is not exactly one whole result axis: it
+    reduces over a batch axis, over several axes at once, or over only part of
+    one. Unit atoms that drifted into the axis are ignored -- they add nothing
+    to it -- unless the axis is degenerate and consists of nothing else.
+    """
+    ordering = _ordering(dim)
+    if len(ordering) > 1:
+        return None
+    if ordering:
+        atom = ordering[0]
+        return atom if atom is m_atom or atom is n_atom else None
+    # Every atom of the axis has size 1, so there is a single key and no
+    # ordering to compare. Fall back to the axis being a result axis verbatim.
+    whole = [atom for atom in dim if atom is m_atom or atom is n_atom]
+    return whole[0] if len(whole) == 1 else None
+
+
 def _analyse_space(pattern) -> _Space | None:
     """Work out the S/L roles and the row permutation between the two matmuls."""
     scores_shape = tuple(pattern.matmul_0.outputs[0].shape)
@@ -592,17 +647,14 @@ def _analyse_space(pattern) -> _Space | None:
     batch_atoms, m_atom, n_atom = atoms[:n_batch], atoms[-2], atoms[-1]
 
     layout = _track_layout([[atom] for atom in atoms], pattern.back_layout_ops)
-    if not layout or len(layout[-1]) != 1:
+    if not layout:
         return None
 
-    s_atom = layout[-1][0]
-    if s_atom is m_atom:
-        l_atom = n_atom
-    elif s_atom is n_atom:
-        l_atom = m_atom
-    else:
+    s_atom = _softmax_axis_atom(layout[-1], m_atom, n_atom)
+    if s_atom is None:
         # Softmax reduces over a batch axis, or over only part of a result axis.
         return None
+    l_atom = n_atom if s_atom is m_atom else m_atom
 
     weights_layout = _track_layout(layout, pattern.fwd_layout_ops)
     if weights_layout is None or len(weights_layout) != n_batch + 2:
@@ -613,15 +665,15 @@ def _analyse_space(pattern) -> _Space | None:
     if s_atom.children is not None:
         # The key axis itself was split; it is no longer a single SDPA axis.
         return None
-    if _expand(weights_layout[-1]) != [s_atom]:
+    if not _same_ordering(_expand(weights_layout[-1]), [s_atom]):
         return None
     for atom, dim in zip(batch_atoms, weights_layout):
         # The batch layout of both matmuls has to agree: SDPA keeps it as is.
-        if _expand(dim) != atom.leaves():
+        if not _same_ordering(_expand(dim), atom.leaves()):
             return None
 
-    l_leaves = l_atom.leaves()
-    l_prime = _expand(weights_layout[n_batch])
+    l_leaves = _ordering(l_atom.leaves())
+    l_prime = _ordering(_expand(weights_layout[n_batch]))
     if len(l_prime) != len(l_leaves) or {id(a) for a in l_prime} != {id(a) for a in l_leaves}:
         return None
 
@@ -632,7 +684,7 @@ def _analyse_space(pattern) -> _Space | None:
         s_atom=s_atom,
         l_atom=l_atom,
         batch_atoms=batch_atoms,
-        softmax_layout=[_expand(dim) for dim in layout],
+        softmax_layout=[_ordering(_expand(dim)) for dim in layout],
         l_prime=l_prime,
     )
 
@@ -722,7 +774,11 @@ def _mask_to_sdpa_space(mask_var, space, softmax_shape, seq_len, before_op, name
         var = mb.tile(x=var, reps=reps, before_op=before_op, name=name + "_tile")
 
     # Split softmax space into one axis per atom, then reorder to [batch..., L, S].
+    # The layout holds ordering atoms only, so the split drops the size-1 axes;
+    # the final reshape below puts the [batch..., L, S] shape back.
     flat_atoms = [atom for dim in space.softmax_layout for atom in dim]
+    if not flat_atoms:
+        return None
     var = mb.reshape(
         x=var,
         shape=[atom.size for atom in flat_atoms],
