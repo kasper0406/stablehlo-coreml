@@ -31,7 +31,7 @@ dependencies = [
     # However, the code relies on the mlir StableHLO python bindings, and currently they are not published to pip
     # and the only pre-built stand-alone library is only built for linux.
     # Onces https://github.com/openxla/stablehlo/issues/2346 is resolved, this dependency can be switch to stablehlo instead.
-    "jax>=0.9.1,<0.11",
+    "jax>=0.9.1",
 ]
 
 [tool.hatch.version]
@@ -49,7 +49,8 @@ parallel = true
 
 extra-dependencies = [
     "pytest",
-    "flax>=0.12.7",
+    # flax < 0.12.9 fails to import against jax 0.11 (jax.experimental.hijax changes)
+    "flax>=0.12.9",
     "flatbuffers",
     "einops",
     "pillow",
@@ -75,8 +76,8 @@ extra-dependencies = [
     # (aten.prod.dim_Dimname) at module import. google/torchax#102 is on
     # 0.0.14.dev* nightlies (no stable 0.0.14 yet). Pin the post-fix nightly
     # exactly so hatch/pip will install the pre-release without --pre.
-    "torchax==0.0.14.dev20260814",
-    "flax", # torchax wants flax to be installed
+    "torchax==0.0.14.dev20260820",
+    "flax>=0.12.9", # torchax wants flax to be installed; 0.12.9 needed for jax 0.11
     "transformers>=5.12.0",
 ]
 
