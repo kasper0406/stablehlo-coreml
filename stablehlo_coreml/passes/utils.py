@@ -102,11 +102,3 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
 
 
 DEFAULT_HLO_PIPELINE: ct.PassPipeline = build_pass_pipeline()
-
-
-def register_optimizations() -> None:
-    """Ensure all stablehlo-coreml passes are registered with coremltools.
-
-    Kept for backwards compatibility; importing this module already registers
-    them, so this function is a no-op that is safe to call repeatedly.
-    """

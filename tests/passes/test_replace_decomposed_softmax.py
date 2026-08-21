@@ -11,10 +11,7 @@ from coremltools.converters.mil.testing_utils import (
     get_op_types_in_program,
 )
 
-from stablehlo_coreml import register_optimizations
 from tests.utils import get_model_instruction_types, run_and_compare
-
-register_optimizations()
 
 PASS_NAME = "common::replace_decomposed_softmax"
 DCE_PASS_NAME = "common::dead_code_elimination"

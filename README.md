@@ -111,23 +111,6 @@ them are dropped.
 
 See [`tests/test_stateful.py`](tests/test_stateful.py) for multi-step examples.
 
-## Graph optimization passes
-
-`build_pass_pipeline()` extends coremltools' default pipeline with a set of graph passes
-that clean up and fuse the patterns produced by the StableHLO lowering — for example
-attention blocks become a single `scaled_dot_product_attention` op, decomposed softmax /
-GELU / logit soft-capping become their native Core ML ops, and redundant broadcasts are
-removed. The passes live in `stablehlo_coreml/passes/` and are registered under the
-`common::` namespace, so they can be removed or configured like any coremltools pass:
-
-```python
-pipeline = build_pass_pipeline()
-pipeline.remove_passes(["common::fuse_attention_to_sdpa"])
-# Use a boolean SDPA mask even for finite mask fill values such as -1e9 (cheaper, but a
-# fully masked row becomes NaN instead of a uniform distribution):
-pipeline.set_options("common::fuse_attention_to_sdpa", {"finite_fill_mask": "bool"})
-```
-
 ## Dynamic / symbolic shapes
 
 JAX models exported with symbolic dimensions are supported. Symbolic dims flow

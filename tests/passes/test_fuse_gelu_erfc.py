@@ -12,10 +12,7 @@ from coremltools.converters.mil.testing_utils import (
     get_op_types_in_program,
 )
 
-from stablehlo_coreml import register_optimizations
 from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_jit_lowering
-
-register_optimizations()
 
 PASS_NAME = "common::fuse_gelu_erfc"
 DCE_PASS_NAME = "common::dead_code_elimination"

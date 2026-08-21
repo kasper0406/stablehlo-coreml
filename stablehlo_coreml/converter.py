@@ -85,7 +85,6 @@ from jaxlib.mlir.dialects.stablehlo import (
 from .function_interface import _FunctionInterface
 from .ops_register import StableHloOpsRegistry, register_composite_op, register_stablehlo_op
 from .padding import pad_with_cast
-from .passes.utils import register_optimizations
 from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
 from .sort_utils import match_sort
 from .state import (
@@ -134,8 +133,6 @@ def convert(
     """
     if minimum_deployment_target < AvailableTarget.iOS18:
         raise ValueError("Converting to <iOS18 is not supported")
-
-    register_optimizations()
 
     _normalize_module(module)
 

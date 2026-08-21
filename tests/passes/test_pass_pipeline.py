@@ -1,7 +1,7 @@
 import coremltools as ct
 import pytest
 
-from stablehlo_coreml import build_pass_pipeline, register_optimizations
+from stablehlo_coreml import build_pass_pipeline
 from stablehlo_coreml.passes.utils import CLEANUP_PASSES, DEFAULT_HLO_PIPELINE, FUSION_PASSES
 
 DCE_PASS_NAME = "common::dead_code_elimination"
@@ -77,11 +77,3 @@ def test_build_pass_pipeline_preserves_pass_options():
 
     pipeline = build_pass_pipeline(base)
     assert "common::const_elimination" in pipeline._pass_options
-
-
-def test_register_optimizations_is_idempotent():
-    register_optimizations()
-    register_optimizations()
-
-    for pass_name in OUR_PASSES:
-        assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == 1

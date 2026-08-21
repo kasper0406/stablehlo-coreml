@@ -7,9 +7,8 @@ from coremltools.converters.mil.testing_utils import (
     get_op_types_in_program,
 )
 
-from stablehlo_coreml import register_optimizations
-
-register_optimizations()
+# Importing the package registers the passes with coremltools' PASS_REGISTRY.
+import stablehlo_coreml  # noqa: F401
 
 
 class TestRemoveNoopSliceUpdate:
