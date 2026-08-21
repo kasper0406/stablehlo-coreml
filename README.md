@@ -29,16 +29,22 @@ To convert a StableHLO module:
 
 ```python
 import coremltools as ct
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE, StateSpec, convert
+from stablehlo_coreml import StateSpec, build_pass_pipeline, convert
 
 mil_program = convert(hlo_module, minimum_deployment_target=ct.target.iOS18)
 cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
 )
 ```
+
+`build_pass_pipeline()` returns a fresh `ct.PassPipeline` built from
+`ct.PassPipeline.DEFAULT` with the stablehlo-coreml graph passes inserted at the right
+places. Pass your own `base` pipeline to customise it, e.g.
+`build_pass_pipeline(my_pipeline)`. The pre-built `stablehlo_coreml.DEFAULT_HLO_PIPELINE`
+is the same thing, constructed once at import time — copy it before mutating it.
 
 ### Obtaining a StableHLO Module from JAX
 
@@ -85,7 +91,7 @@ cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
 )
 
 state = cml_model.make_state()
@@ -131,7 +137,7 @@ cml_model = ct.convert(
     mil_program,
     source="milinternal",
     minimum_deployment_target=ct.target.iOS18,
-    pass_pipeline=DEFAULT_HLO_PIPELINE,
+    pass_pipeline=build_pass_pipeline(),
     inputs=[
         ct.TensorType(name="arg0", shape=(ct.RangeDim(1, 2048, 1), 4)),
         ct.TensorType(name="arg1", shape=(4, 3)),

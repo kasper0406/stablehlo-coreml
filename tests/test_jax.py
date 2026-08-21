@@ -12,6 +12,7 @@ from tests.utils import (
     get_model_instruction_types,
     run_and_compare,
     run_and_compare_hlo_module,
+    run_and_compare_jit_lowering,
     run_and_compare_specific_input,
 )
 
@@ -190,6 +191,51 @@ def test_reduce_with_reversed_operands():
     ops = get_model_instruction_types(cml_model)
     assert "reduce_sum" in ops
     assert "while_loop" not in ops
+
+
+def test_reduction_identity_init_is_not_emitted():
+    """A reduce whose init value is the identity element does not need the clamp.
+
+    `jnp.max` uses -inf as the init value, `jnp.sum` uses 0, `jnp.prod` uses 1;
+    combining the result with those is a no-op, so no `maximum`/`add`/`mul` op
+    should be emitted on top of the reduction.
+    """
+    cml_model = run_and_compare(partial(jnp.max, axis=1), (jnp.zeros((2, 3, 4)),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_max" in ops
+    assert "maximum" not in ops
+
+    cml_model = run_and_compare(partial(jnp.min, axis=1), (jnp.zeros((2, 3, 4)),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_min" in ops
+    assert "minimum" not in ops
+
+    cml_model = run_and_compare(partial(jnp.sum, axis=1), (jnp.zeros((2, 3, 4)),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_sum" in ops
+    assert "add" not in ops
+
+    cml_model = run_and_compare(partial(jnp.prod, axis=1), (jnp.zeros((2, 3, 4)),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_prod" in ops
+    assert "mul" not in ops
+
+    # Integer max reduction: the identity is iinfo.min
+    cml_model = run_and_compare(partial(jnp.max, axis=1), (jnp.zeros((2, 3, 4), dtype=jnp.int32),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_max" in ops
+    assert "maximum" not in ops
+
+
+def test_reduction_non_identity_init_is_emitted():
+    """A non-identity init value must still be folded into the reduction result."""
+    def reduce_max_with_init(x):
+        return jax.lax.reduce(x, np.float32(5.0), jax.lax.max, (1,))
+
+    cml_model = run_and_compare(reduce_max_with_init, (jnp.zeros((2, 3, 4)),))
+    ops = get_model_instruction_types(cml_model)
+    assert "reduce_max" in ops
+    assert "maximum" in ops
 
 
 def test_reduce_window():
@@ -438,6 +484,57 @@ def test_trigonmetry():
         (jnp.zeros((50, 20), dtype=jnp.float16), jnp.zeros((50, 20), dtype=jnp.float16),),
         rtol=1e-05 / jnp.finfo(jnp.float32).eps * jnp.finfo(jnp.float16).eps
     )
+
+
+def test_erf():
+    """`chlo.erf` maps straight to `mb.erf` on both lowering paths."""
+    inputs = (jnp.linspace(-3, 3, 30, dtype=jnp.float32).reshape(5, 6),)
+
+    for cml_model in (
+        run_and_compare_specific_input(jax.lax.erf, inputs),
+        run_and_compare_jit_lowering(jax.lax.erf, inputs),
+    ):
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("erf") == 1
+        # No trace of the ~40 op polynomial the chlo decomposition would give.
+        assert len([op for op in ops if op != "const"]) == 1
+
+
+def test_erfc():
+    """`chlo.erfc` maps to `1 - erf(x)` when it survives as a composite."""
+    inputs = (jnp.linspace(-3, 3, 30, dtype=jnp.float32).reshape(5, 6),)
+
+    cml_model = run_and_compare_jit_lowering(jax.lax.erfc, inputs)
+    ops = get_model_instruction_types(cml_model)
+    assert ops.count("erf") == 1
+    assert ops.count("sub") == 1
+
+    # `jax.export` expands `chlo.erfc` before we get to see the module (unlike
+    # `chlo.erf`, it has no composite representation there), so that path keeps
+    # the polynomial. Only the numerics are checked.
+    run_and_compare_specific_input(jax.lax.erfc, inputs)
+
+
+def test_composite_ops_via_jit_lowering():
+    """`jax.jit(...).lower()` hands us raw CHLO; the converter wraps it in composites.
+
+    Without that the CHLO ops would be legalized into large polynomials instead
+    of being mapped to the corresponding CoreML primitive.
+    """
+    x = jnp.linspace(-0.9, 0.9, 30, dtype=jnp.float32).reshape(5, 6)
+
+    expected_op = {
+        jnp.arcsin: "asin",
+        jnp.arccos: "acos",
+        jnp.sinh: "sinh",
+        jnp.cosh: "cosh",
+    }
+    for jax_func, op_type in expected_op.items():
+        cml_model = run_and_compare_jit_lowering(jax_func, (x,))
+        assert get_model_instruction_types(cml_model).count(op_type) == 1
+
+    cml_model = run_and_compare_jit_lowering(partial(jax.lax.top_k, k=3), (x,))
+    assert get_model_instruction_types(cml_model).count("topk") == 1
 
 
 def test_is_finite():
