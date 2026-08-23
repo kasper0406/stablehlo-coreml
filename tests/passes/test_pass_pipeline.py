@@ -2,13 +2,18 @@ import coremltools as ct
 import pytest
 
 from stablehlo_coreml import build_pass_pipeline
-from stablehlo_coreml.passes.utils import CLEANUP_PASSES, DEFAULT_HLO_PIPELINE, FUSION_PASSES
+from stablehlo_coreml.passes.utils import (
+    CLEANUP_PASSES,
+    DEFAULT_HLO_PIPELINE,
+    FUSION_PASSES,
+    LATE_FUSION_PASSES,
+)
 
 DCE_PASS_NAME = "common::dead_code_elimination"
 # The groups interleave coremltools' DCE with our own passes, so the same name
 # appears several times; only our own passes are expected in the pipeline exactly
 # once.
-ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES))
+ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES))
 OUR_PASSES = [name for name in ALL_PASSES if name != DCE_PASS_NAME]
 
 
@@ -33,6 +38,13 @@ def test_fusion_passes_run_before_fuse_matmul_weight_bias():
     passes = build_pass_pipeline().passes
     anchor = passes.index("common::fuse_matmul_weight_bias")
     assert passes[anchor - len(FUSION_PASSES):anchor] == FUSION_PASSES
+
+
+def test_late_fusion_passes_run_after_fuse_reduce_mean():
+    """`fuse_rmsnorm` needs the `reduce_mean` that coremltools' pass creates."""
+    passes = build_pass_pipeline().passes
+    anchor = passes.index("common::fuse_reduce_mean") + 1
+    assert passes[anchor:anchor + len(LATE_FUSION_PASSES)] == LATE_FUSION_PASSES
 
 
 def test_build_pass_pipeline_returns_distinct_objects():
@@ -67,7 +79,10 @@ def test_build_pass_pipeline_with_base_missing_the_anchors():
 
     pipeline = build_pass_pipeline(base)
     assert pipeline.passes == (
-        CLEANUP_PASSES + ["common::noop_elimination", DCE_PASS_NAME] + FUSION_PASSES
+        CLEANUP_PASSES
+        + ["common::noop_elimination", DCE_PASS_NAME]
+        + FUSION_PASSES
+        + LATE_FUSION_PASSES
     )
 
 

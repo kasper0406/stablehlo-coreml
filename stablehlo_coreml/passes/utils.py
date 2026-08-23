@@ -15,6 +15,7 @@ from . import fuse_attention_to_sdpa as _fuse_attention_to_sdpa  # noqa: F401
 from . import fuse_gelu_erfc as _fuse_gelu_erfc  # noqa: F401
 from . import fuse_logit_softcap as _fuse_logit_softcap  # noqa: F401
 from . import fuse_reduce_keep_dims as _fuse_reduce_keep_dims  # noqa: F401
+from . import fuse_rmsnorm as _fuse_rmsnorm  # noqa: F401
 from . import remove_broadcast_tiles as _remove_broadcast_tiles  # noqa: F401
 from . import remove_noop_slice_update as _remove_noop_slice_update  # noqa: F401
 from . import replace_decomposed_softmax as _replace_decomposed_softmax  # noqa: F401
@@ -54,28 +55,47 @@ FUSION_PASSES: list[str] = [
     _DCE,
 ]
 
+# Late fusion passes. They run right *after* `common::fuse_reduce_mean`, because
+# that is the pass that turns the converter's `reduce_sum -> mul(1/N)` into the
+# `reduce_mean` they match (StableHLO has no mean instruction). That is still
+# before `add_fp16_cast`, so the graph is fp32 there as well.
+LATE_FUSION_PASSES: list[str] = [
+    "common::fuse_rmsnorm",
+    _DCE,
+]
+
 # The pass the CLEANUP group is inserted before (fallback: the front of the pipeline).
 _CLEANUP_ANCHOR = "common::const_elimination"
 # The pass the FUSION group is inserted before (fallback: the end of the pipeline).
 _FUSION_ANCHOR = "common::fuse_matmul_weight_bias"
+# The pass the LATE_FUSION group is inserted after (fallback: the end of the pipeline).
+_LATE_FUSION_ANCHOR = "common::fuse_reduce_mean"
 
 
-def _insert_passes(pipeline: ct.PassPipeline, pass_names: list[str], anchor: str, fallback_index: int | None) -> None:
-    """Insert ``pass_names`` (in order) immediately before the first ``anchor`` pass.
+def _insert_passes(
+    pipeline: ct.PassPipeline,
+    pass_names: list[str],
+    anchor: str,
+    fallback_index: int | None,
+    after: bool = False,
+) -> None:
+    """Insert ``pass_names`` (in order) at the first ``anchor`` pass.
 
-    Our own passes are only inserted when they are not in the pipeline yet, so
-    re-inserting into a pipeline that already has them is a no-op. The
-    ``dead_code_elimination`` entries are always inserted along with them:
-    coremltools' default pipeline runs those elsewhere too, but we need them
-    right between our own passes. If ``anchor`` is not part of the pipeline,
-    ``fallback_index`` is used instead (``None`` meaning "append at the end").
+    The group goes immediately before ``anchor``, or immediately after it when
+    ``after`` is set. Our own passes are only inserted when they are not in the
+    pipeline yet, so re-inserting into a pipeline that already has them is a
+    no-op. The ``dead_code_elimination`` entries are always inserted along with
+    them: coremltools' default pipeline runs those elsewhere too, but we need
+    them right between our own passes. If ``anchor`` is not part of the
+    pipeline, ``fallback_index`` is used instead (``None`` meaning "append at
+    the end").
     """
     to_insert = [name for name in pass_names if name == _DCE or name not in pipeline.passes]
     if all(name == _DCE for name in to_insert):
         return
 
     if anchor in pipeline.passes:
-        index = pipeline.passes.index(anchor)
+        index = pipeline.passes.index(anchor) + (1 if after else 0)
     elif fallback_index is None:
         index = len(pipeline.passes)
     else:
@@ -97,6 +117,7 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
 
     _insert_passes(pipeline, CLEANUP_PASSES, _CLEANUP_ANCHOR, fallback_index=0)
     _insert_passes(pipeline, FUSION_PASSES, _FUSION_ANCHOR, fallback_index=None)
+    _insert_passes(pipeline, LATE_FUSION_PASSES, _LATE_FUSION_ANCHOR, fallback_index=None, after=True)
 
     return pipeline
 
