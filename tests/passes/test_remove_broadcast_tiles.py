@@ -2,6 +2,7 @@ import coremltools as ct
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.testing_utils import (
@@ -132,6 +133,23 @@ class TestRemoveBroadcastTiles:
         _apply(prog)
         assert get_op_types_in_program(prog) == ["add"]
         assert prog.functions["main"].outputs[0].shape == (4, 8)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="`matmul` broadcasts its batch dimensions natively (verified against the "
+               "runtime), but it is not in `_BROADCAST_OPS`: unlike the elementwise ops, "
+               "only its leading axes broadcast while the trailing two are contracted, so "
+               "it needs its own axis rule. `jnp.broadcast_to(x, (B, ...)) @ y` therefore "
+               "still materialises the full batch.",
+    )
+    def test_batch_broadcast_ahead_of_matmul_is_removed(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 4, 8)), mb.TensorSpec(shape=(2, 8, 4))])
+        def prog(x, y):
+            tiled = mb.tile(x=x, reps=[2, 1, 1])
+            return mb.matmul(x=tiled, y=y)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["matmul"]
 
     def test_not_removed_when_symbolic_dim_is_tiled(self):
         """A symbolic dim cannot be proven to be 1, so tiling it is not a broadcast."""
