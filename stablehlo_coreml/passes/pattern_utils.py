@@ -14,19 +14,28 @@ proven (typically because a dimension is symbolic) the helpers report the
 """
 
 import numpy as np
+from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 __all__ = [
     "broadcast_shapes",
     "const_int_list",
+    "const_scaled_operand",
     "dims_equal",
+    "dtype_epsilon",
     "is_broadcast_tile",
     "normalize_axis",
+    "peel_to_scaled_input",
     "shapes_equal",
     "sole_consumer",
     "uniform_const_operand",
     "uniform_scalar_value",
 ]
+
+# Upper bound on the number of scaling/negation ops `peel_to_scaled_input` walks
+# back over. The converter emits at most two or three; the bound just keeps the
+# search finite for hand-written graphs.
+MAX_PEEL_DEPTH = 8
 
 
 def uniform_scalar_value(var) -> float | None:
@@ -208,3 +217,75 @@ def is_broadcast_tile(op) -> bool:
         return False
     # `dim` may be symbolic; only a literal 1 is safe to broadcast.
     return all(rep == 1 or dims_equal(dim, 1) for dim, rep in zip(x_shape, reps))
+
+
+def const_scaled_operand(op):
+    """Split a ``mul``/``real_div``/``sub`` op into ``(input_var, factor)``.
+
+    Recognises the ops that scale or negate a value by a compile-time constant:
+    ``mul(v, c)``/``mul(c, v)`` -> ``(v, c)``, ``real_div(v, c)`` -> ``(v, 1/c)``
+    and the negation ``sub(0, v)`` -> ``(v, -1)``. Returns ``None`` otherwise.
+    """
+    if op.op_type == "mul":
+        scaled = uniform_const_operand(op)
+        if scaled is None:
+            return None
+        factor, operand = scaled
+        return operand, factor
+
+    if op.op_type == "real_div":
+        divisor = uniform_scalar_value(op.y)
+        if divisor is not None and divisor != 0.0:
+            return op.x, 1.0 / divisor
+        return None
+
+    if op.op_type == "sub":
+        lhs = uniform_scalar_value(op.x)
+        if lhs is not None and abs(lhs) < 1e-12:
+            return op.y, -1.0
+        return None
+
+    return None
+
+
+def peel_to_scaled_input(var, block):
+    """Walk back over constant scalings/negations, returning ``[(var, factor), ...]``.
+
+    The first entry is ``(var, 1.0)`` itself, then every prefix of the chain with
+    the accumulated factor: ``var == entry_var * factor``.
+
+    Peeling stops at a value that has more than one consumer: rewriting past it
+    would leave the op in the graph anyway, and must not change what the other
+    consumer sees.
+    """
+    chain = [(var, 1.0)]
+    factor = 1.0
+    current = var
+    for _ in range(MAX_PEEL_DEPTH):
+        op = current.op
+        if op is None or op.enclosing_block is not block:
+            break
+        if sole_consumer(current) is None:
+            break
+        split = const_scaled_operand(op)
+        if split is None:
+            break
+        current, step = split
+        factor *= step
+        chain.append((current, factor))
+    return chain
+
+
+def dtype_epsilon(var) -> float:
+    """Machine epsilon of ``var``'s element type (``0.0`` if it is not a float).
+
+    Pattern constants reach MIL already rounded to the operand type, so a
+    matcher comparing them against exact mathematical values has to allow at
+    least this much slack.
+    """
+    if var is None:
+        return 0.0
+    dtype = getattr(var, "dtype", None)
+    if dtype is None or not types.is_float(dtype):
+        return 0.0
+    return float(np.finfo(types.nptype_from_builtin(dtype)).eps)

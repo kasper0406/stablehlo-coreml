@@ -1,11 +1,13 @@
 import numpy as np
 import pytest
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import get_new_symbol
+from coremltools.converters.mil.mil import get_new_symbol, types
 
 from stablehlo_coreml.passes.pattern_utils import (
     broadcast_shapes,
     dims_equal,
+    dtype_epsilon,
+    peel_to_scaled_input,
     shapes_equal,
     sole_consumer,
     uniform_scalar_value,
@@ -148,3 +150,82 @@ class TestSoleConsumer:
 
     def test_none(self):
         assert sole_consumer(None) is None
+
+
+class TestPeelToScaledInput:
+
+    def test_peels_a_chain_of_constant_scalings(self):
+        def build(x, captured):
+            scaled = mb.mul(x=x, y=np.float32(3.0))
+            negated = mb.sub(x=np.float32(0.0), y=scaled)
+            captured["out"] = mb.real_div(x=negated, y=np.float32(2.0))
+            # `sole_consumer` refuses a block output, so keep `out` internal.
+            return mb.identity(x=captured["out"])
+
+        prog, captured = _build(build)
+        block = prog.functions["main"]
+        chain = peel_to_scaled_input(captured["out"], block)
+
+        assert [var for var, _ in chain][-1] is captured["x"]
+        assert [factor for _, factor in chain] == pytest.approx([1.0, 0.5, -0.5, -1.5])
+
+    def test_stops_at_a_value_with_two_consumers(self):
+        def build(x, captured):
+            scaled = mb.mul(x=x, y=np.float32(3.0))
+            captured["out"] = mb.mul(x=scaled, y=np.float32(2.0))
+            return mb.add(x=captured["out"], y=scaled)
+
+        prog, captured = _build(build)
+        chain = peel_to_scaled_input(captured["out"], prog.functions["main"])
+
+        # `scaled` escapes to the `add`, so peeling past it is not allowed.
+        assert len(chain) == 2
+        assert chain[-1][0] is not captured["x"]
+
+    def test_stops_at_a_non_scaling_op(self):
+        def build(x, captured):
+            captured["out"] = mb.mul(x=mb.tanh(x=x), y=np.float32(3.0))
+            return mb.identity(x=captured["out"])
+
+        prog, captured = _build(build)
+        chain = peel_to_scaled_input(captured["out"], prog.functions["main"])
+        assert len(chain) == 2
+        assert chain[-1][0].op.op_type == "tanh"
+
+    def test_a_non_constant_multiplication_is_not_a_scaling(self):
+        def build(x, captured):
+            captured["out"] = mb.mul(x=x, y=x)
+            return mb.identity(x=captured["out"])
+
+        prog, captured = _build(build)
+        assert peel_to_scaled_input(captured["out"], prog.functions["main"]) == [
+            (captured["out"], 1.0)
+        ]
+
+
+class TestDtypeEpsilon:
+
+    def test_matches_numpy(self):
+        _, captured = _build(lambda x, c: c.setdefault("v", mb.tanh(x=x)))
+        assert dtype_epsilon(captured["v"]) == pytest.approx(np.finfo(np.float32).eps)
+
+    def test_fp16(self):
+        captured = {}
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4,), dtype=types.fp16)])
+        def prog(x):
+            captured["v"] = mb.tanh(x=x)
+            return captured["v"]
+
+        assert dtype_epsilon(captured["v"]) == pytest.approx(np.finfo(np.float16).eps)
+
+    def test_non_float_and_none(self):
+        captured = {}
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4,), dtype=types.int32)])
+        def prog(x):
+            captured["v"] = mb.add(x=x, y=np.int32(1))
+            return captured["v"]
+
+        assert dtype_epsilon(captured["v"]) == 0.0
+        assert dtype_epsilon(None) == 0.0
