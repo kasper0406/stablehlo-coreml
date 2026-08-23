@@ -2,6 +2,7 @@ import coremltools as ct
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.testing_utils import (
@@ -74,6 +75,49 @@ class TestFuseLogitSoftcap:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["scaled_tanh"]
+
+    @pytest.mark.parametrize("cap", [30.0, 50.0])
+    def test_fp16_reciprocal_rounding_is_still_fused(self, cap):
+        """``1 / cap`` is rounded to fp16 long before MIL sees it.
+
+        ``fp16(1/30) * 30 == 0.99976``, which is 2.4e-4 away from unity -- more
+        than the fp32 tolerance allows, but well inside one fp16 ulp.
+        """
+        beta = np.float16(1.0) / np.float16(cap)
+        assert abs(float(beta) * cap - 1.0) > 1e-4
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8), dtype=types.fp16)])
+        def prog(x):
+            scaled = mb.mul(x=x, y=beta)
+            return mb.mul(x=mb.tanh(x=scaled), y=np.float16(cap))
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["scaled_tanh"]
+
+        fused = _scaled_tanh_ops(prog)[0]
+        assert fused.alpha.val.dtype == np.float16
+        assert np.isclose(fused.alpha.val, cap)
+        assert fused.beta.val == beta
+
+    def test_fp32_keeps_the_tight_tolerance(self):
+        """The widened tolerance is fp16-only; fp32 constants stay tightly checked."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
+        def prog(x):
+            scaled = mb.mul(x=x, y=np.float32(1.0 / 30.0))
+            # 5e-4 off unity: representable in fp32, so not a rounding artifact.
+            return mb.mul(x=mb.tanh(x=scaled), y=np.float32(30.0 * 1.0005))
+
+        _apply(prog)
+        assert "scaled_tanh" not in get_op_types_in_program(prog)
+
+    def test_not_fused_in_fp16_when_the_product_is_far_from_one(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8), dtype=types.fp16)])
+        def prog(x):
+            scaled = mb.mul(x=x, y=np.float16(1.0 / 30.0))
+            return mb.mul(x=mb.tanh(x=scaled), y=np.float16(20.0))
+
+        _apply(prog)
+        assert "scaled_tanh" not in get_op_types_in_program(prog)
 
     def test_not_fused_when_product_is_not_one(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
@@ -181,3 +225,53 @@ class TestFuseLogitSoftcapEndToEnd:
         ops = get_model_instruction_types(cml_model)
         assert "scaled_tanh" not in ops
         assert ops.count("tanh") == 1
+
+    @pytest.mark.parametrize("cap", [30.0, 50.0])
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            pytest.param(lambda x, cap: cap * jnp.tanh(x / cap), id="cap_times_tanh_of_div"),
+            pytest.param(lambda x, cap: jnp.tanh(x / cap) * cap, id="tanh_of_div_times_cap"),
+            pytest.param(lambda x, cap: cap * jnp.tanh(x * (1.0 / cap)), id="cap_times_tanh_of_mul"),
+            pytest.param(
+                lambda x, cap: jnp.asarray(cap, x.dtype) * jnp.tanh(x / jnp.asarray(cap, x.dtype)),
+                id="cap_as_traced_array",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+    def test_gemma_style_softcap_spellings(self, spelling, cap, dtype):
+        """Every way Gemma-2 writes ``cap * tanh(logits / cap)`` must fuse.
+
+        The fp16 cases matter: JAX folds ``1 / cap`` in the operand dtype, so
+        ``alpha * beta`` only reaches unity to within an fp16 ulp.
+        """
+        precision_loss = jnp.finfo(dtype).eps / jnp.finfo(jnp.float32).eps
+        cml_model = run_and_compare(
+            lambda x: spelling(x, cap),
+            [jax.ShapeDtypeStruct((4, 16), dtype)],
+            atol=1e-04 * precision_loss,
+            rtol=1e-05 * precision_loss,
+        )
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("scaled_tanh") == 1
+        assert "tanh" not in ops
+
+    def test_attention_logit_softcap(self):
+        """Gemma-2 softcaps the attention logits, right before the softmax."""
+        def f(query, key):
+            logits = jnp.einsum("qd,kd->qk", query, key)
+            logits = 50.0 * jnp.tanh(logits / 50.0)
+            return jax.nn.softmax(logits, axis=-1)
+
+        cml_model = run_and_compare(
+            f,
+            [
+                jax.ShapeDtypeStruct((6, 4), jnp.float32),
+                jax.ShapeDtypeStruct((6, 4), jnp.float32),
+            ],
+        )
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("scaled_tanh") == 1
+        assert ops.count("softmax") == 1
+        assert "tanh" not in ops
