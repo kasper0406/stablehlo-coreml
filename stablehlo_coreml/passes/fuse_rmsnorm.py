@@ -13,7 +13,29 @@ the converter (helped by ``fuse_reduce_keep_dims`` and coremltools'
     %s    = mul(x=%n, y=const scale)          # absent for a norm without scale
     %out  = cast(x=%s, dtype=fp16)
 
-Six of those eight ops compute ``x / sqrt(mean(x^2) + eps)``, which is
+That is only one of the spellings the libraries emit. Everything up to and
+including the ``rsqrt`` is common to all of them; the tail is reassociated
+differently, so the pass walks forward from the ``rsqrt`` and tolerates, in any
+order, at most one broadcast ``reshape`` and at most one multiply by a constant
+scale before the ``mul`` that normalizes ``x``. The three shapes that occur in
+practice are:
+
+* hand-written (the chain above): ``mul(x32, rsqrt)`` and then, optionally,
+  ``mul(., scale)``;
+* ``flax.nnx.RMSNorm``, whose ``_normalize`` computes ``mul = rsqrt(var + eps)``,
+  then ``mul *= scale``, then ``y = x * mul`` -- the scale lands on the *rsqrt*
+  result, before the normalize ``mul``;
+* ``equinox.nn.RMSNorm``, whose ``jnp.mean(x**2)`` has no axis argument, so it
+  reduces to a scalar and JAX broadcasts *after* the ``rsqrt``: a ``reshape``
+  sits between the ``rsqrt`` and the normalize ``mul``, and the trailing weight
+  multiply has the constant on the left.
+
+A scale on either side of the normalize ``mul`` (or on both) folds into the same
+single constant. The reduction itself may keep its dimensions or not: what the
+pass validates is the shape the statistic actually has where it broadcasts
+against ``x`` (see ``_is_broadcast_partner``), which covers both.
+
+Six of the eight ops above compute ``x / sqrt(mean(x^2) + eps)``, which is
 ``l2_norm`` up to a constant:
 
 .. math::
@@ -82,14 +104,87 @@ def _matches_scale_shape(val, x_shape) -> bool:
     return all(dim == 1 for dim in val.shape[:-1])
 
 
+def _is_broadcast_partner(stat_shape, x_shape) -> bool:
+    """True if a statistic of ``stat_shape`` normalizes ``x_shape`` row-wise.
+
+    NumPy broadcasting right-aligns the operands, so ``stat_shape`` is padded
+    with leading 1s to ``x``'s rank. The padded shape must then agree with ``x``
+    on every axis but the last (otherwise the elementwise ``mul`` would either
+    fail or replicate ``x`` along a batch axis instead of scaling it), and its
+    last entry must be 1 or the full normalized size -- i.e. one statistic per
+    row, or the reduced axis already broadcast back to full width.
+
+    This is what makes ``keep_dims=False`` acceptable: a squeezed ``(1, 1)``
+    statistic of a ``(1, 1, d)`` input pads to ``(1, 1, 1)``, which is exactly
+    the keep-dims shape. A reshape that permutes non-unit axes always changes
+    the shape tuple in a way this rejects, so the walk below never has to reason
+    about reshape orderings.
+    """
+    if stat_shape is None or any_symbolic(stat_shape):
+        return False
+    if len(stat_shape) > len(x_shape):
+        return False
+    padded = (1,) * (len(x_shape) - len(stat_shape)) + tuple(stat_shape)
+    if [int(dim) for dim in padded[:-1]] != [int(dim) for dim in x_shape[:-1]]:
+        return False
+    return int(padded[-1]) in (1, int(x_shape[-1]))
+
+
+def _walk_to_normalize_mul(rsqrt_op, x32, block):
+    """Walk from the ``rsqrt`` result to the ``mul`` that normalizes ``x32``.
+
+    Different RMSNorm implementations reassociate the tail of the chain: flax
+    folds the learnable scale onto the ``rsqrt`` result *before* multiplying by
+    ``x``, and equinox reduces to a scalar and broadcasts the statistic back with
+    a ``reshape`` after the ``rsqrt``. The walk therefore tolerates, in any
+    order, at most one ``reshape`` and at most one multiply by a constant scale
+    on the way to the normalize ``mul``.
+
+    Returns ``(norm_mul, pre_scale, walked)`` -- the normalize ``mul``, the
+    constant the walk absorbed (or ``None``), and the ops it consumed in walk
+    order -- or ``None`` when the chain is anything else.
+    """
+    stat = rsqrt_op.outputs[0]
+    pre_scale = None
+    reshaped = False
+    walked = []
+
+    while True:
+        consumer = sole_consumer(stat)
+        if consumer is None or consumer.enclosing_block is not block:
+            return None
+
+        if consumer.op_type == "mul" and {id(consumer.x), id(consumer.y)} == {id(x32), id(stat)}:
+            if not _is_broadcast_partner(stat.shape, x32.shape):
+                return None
+            return consumer, pre_scale, walked
+
+        if consumer.op_type == "reshape":
+            if reshaped or not _is_broadcast_partner(consumer.outputs[0].shape, x32.shape):
+                return None
+            reshaped = True
+        elif consumer.op_type == "mul":
+            other = consumer.y if consumer.x is stat else consumer.x
+            if pre_scale is not None or other is stat or other.val is None:
+                return None
+            val = np.asarray(other.val)
+            if not _matches_scale_shape(val, x32.shape):
+                return None
+            pre_scale = val
+        else:
+            return None
+
+        walked.append(consumer)
+        stat = consumer.outputs[0]
+
+
 def _match(rsqrt_op, block):
     """Match the RMSNorm chain ending at ``rsqrt_op``.
 
     Returns ``(x32, eps, tail_op, scale, dead)``: the normalized input, the
-    total epsilon, the last op of the chain (the scale ``mul``, or the
-    normalize ``mul`` when the norm has no learnable scale), that scale's
-    constant value or ``None``, and the ops the rewrite replaces, in removal
-    order.
+    total epsilon, the last op of the chain (the trailing scale ``mul``, or the
+    normalize ``mul`` when there is none), the single constant factor to fold in
+    (or ``None``), and the ops the rewrite replaces, in removal order.
     """
     # rsqrt(x) is 1/sqrt(x + epsilon); fold that epsilon in with the add's.
     eps = uniform_scalar_value(rsqrt_op.inputs.get("epsilon")) or 0.0
@@ -110,7 +205,10 @@ def _match(rsqrt_op, block):
         return None
     if sole_consumer(var_var) is not add_op:
         return None
-    if mean_op.keep_dims is None or mean_op.keep_dims.val is not True:
+    # `keep_dims` may be either way -- what matters is the shape the statistic
+    # has when it reaches the normalize `mul`, which `_is_broadcast_partner`
+    # checks there. Its value does have to be known at compile time.
+    if mean_op.keep_dims is None or mean_op.keep_dims.val is None:
         return None
     if mean_op.axes is None or mean_op.axes.val is None:
         return None
@@ -137,29 +235,35 @@ def _match(rsqrt_op, block):
     if x32.shape[-2] != 1 or x32.shape[-3] != 1:
         return None
 
-    # The rsqrt result must feed exactly one mul, against x32 itself.
-    norm_mul = sole_consumer(rsqrt_op.outputs[0])
-    if norm_mul is None or norm_mul.op_type != "mul" or norm_mul.enclosing_block is not block:
+    # The rsqrt result must reach a single mul against x32 itself, possibly via
+    # a broadcast reshape and/or a scale that was reassociated onto it.
+    walk = _walk_to_normalize_mul(rsqrt_op, x32, block)
+    if walk is None:
         return None
-    if {id(norm_mul.x), id(norm_mul.y)} != {id(x32), id(rsqrt_op.outputs[0])}:
-        return None
+    norm_mul, scale, walked = walk
 
-    # x32 is read by the square (twice) and by the normalize mul, nothing else.
-    if {id(op) for op in x32.child_ops} != {id(square_op), id(norm_mul)}:
-        return None
+    # Note there is deliberately no check that x32 is read *only* by the chain.
+    # The rewrite never removes the op producing it, and none of the ops in
+    # `dead` other than the square and the normalize mul read it, so any other
+    # reader keeps working against an unchanged value. Requiring exclusivity
+    # would decline every RMSNorm on a residual path (`x + attn(rmsnorm(x))`) in
+    # an fp32 graph, where no cast insulates the input from the residual add.
 
-    # Optionally absorb a following multiply by a constant scale.
-    tail_op, scale = norm_mul, None
+    # Optionally absorb a following multiply by a constant scale. Both scales
+    # fold into the same factor when the chain has one on either side.
+    tail_op = norm_mul
     scale_mul = sole_consumer(norm_mul.outputs[0])
     if scale_mul is not None and scale_mul.op_type == "mul" and scale_mul.enclosing_block is block:
         other = scale_mul.y if scale_mul.x is norm_mul.outputs[0] else scale_mul.x
         if other is not norm_mul.outputs[0] and other.val is not None:
             val = np.asarray(other.val)
             if _matches_scale_shape(val, x32.shape):
-                tail_op, scale = scale_mul, val
+                tail_op = scale_mul
+                scale = val if scale is None else scale.astype(np.float64) * val
 
     # Reverse topological order, so `remove_ops` never sees a live consumer.
-    dead = [norm_mul, rsqrt_op, add_op, mean_op, square_op]
+    # The walked ops sit between the rsqrt and the normalize mul.
+    dead = [norm_mul, *reversed(walked), rsqrt_op, add_op, mean_op, square_op]
     if tail_op is not norm_mul:
         dead.insert(0, tail_op)
 
@@ -207,7 +311,7 @@ def _fuse_rmsnorm(block) -> int:
 @register_pass(namespace="common")
 class fuse_rmsnorm(AbstractGraphPass):
     """
-    Fuse the eight-op RMSNorm chain into ``l2_norm`` + a constant ``mul``.
+    Fuse the RMSNorm elementwise chain into ``l2_norm`` + a constant ``mul``.
 
     ``x / sqrt(mean(x^2) + eps)`` equals ``sqrt(d) * l2_norm(x, d * eps)``,
     where ``d`` is the size of the normalized (last) axis, so the reduction and
@@ -216,16 +320,22 @@ class fuse_rmsnorm(AbstractGraphPass):
 
     The rewrite applies when
 
-    1. the reduction is a ``reduce_mean`` with ``keep_dims=True`` over the last
-       axis of a ``mul(x, x)`` square,
-    2. every intermediate value of the chain has exactly one consumer, and
-    3. the input has a static shape with ``rank >= 3`` and
+    1. the reduction is a ``reduce_mean`` over the last axis of a ``mul(x, x)``
+       square (``keep_dims`` either way, as long as it is known at compile time),
+    2. the ``rsqrt`` result reaches the ``mul`` that normalizes ``x`` through at
+       most one ``reshape`` and at most one multiply by a constant scale, and
+       the statistic broadcasts against ``x`` as one value per row,
+    3. every intermediate value of the chain has exactly one consumer -- the
+       normalized input itself is exempt, so a residual path reading ``x``
+       alongside the norm does not block the rewrite, and
+    4. the input has a static shape with ``rank >= 3`` and
        ``shape[-2] == shape[-3] == 1`` -- the shapes for which ``l2_norm``'s
        last-three-dimensions reduction is the last dimension alone. Other
        shapes would need a reshape around the op, which costs more than the
        ops it saves.
 
-    Given:
+    Given (hand-written spelling; flax puts the scale on ``%4`` instead, and
+    equinox reshapes ``%4`` before ``%5``):
         %1 = mul(x=%0, y=%0)
         %2 = reduce_mean(x=%1, axes=[-1], keep_dims=True)
         %3 = add(x=%2, y=1e-6)

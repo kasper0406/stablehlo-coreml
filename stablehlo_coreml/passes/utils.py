@@ -59,7 +59,17 @@ FUSION_PASSES: list[str] = [
 # that is the pass that turns the converter's `reduce_sum -> mul(1/N)` into the
 # `reduce_mean` they match (StableHLO has no mean instruction). That is still
 # before `add_fp16_cast`, so the graph is fp32 there as well.
+#
+# `fuse_reduce_keep_dims` runs a *second* time here (it is also in
+# `CLEANUP_PASSES`). A `jnp.mean(x, axis, keepdims=True)` lowers to
+# `reduce_sum -> mul(1/N) -> reshape`, so in the cleanup slot the reduction is not
+# yet adjacent to its keep-dims reshape and the pass cannot see the pair. Only
+# after `common::fuse_reduce_mean` has folded `reduce_sum -> mul(1/N)` into a
+# single `reduce_mean` does the reshape sit directly on the reduction -- which is
+# exactly the position this group runs in.
 LATE_FUSION_PASSES: list[str] = [
+    "common::fuse_reduce_keep_dims",
+    _DCE,
     "common::fuse_rmsnorm",
     _DCE,
 ]
@@ -82,16 +92,17 @@ def _insert_passes(
     """Insert ``pass_names`` (in order) at the first ``anchor`` pass.
 
     The group goes immediately before ``anchor``, or immediately after it when
-    ``after`` is set. Our own passes are only inserted when they are not in the
-    pipeline yet, so re-inserting into a pipeline that already has them is a
-    no-op. The ``dead_code_elimination`` entries are always inserted along with
-    them: coremltools' default pipeline runs those elsewhere too, but we need
-    them right between our own passes. If ``anchor`` is not part of the
-    pipeline, ``fallback_index`` is used instead (``None`` meaning "append at
-    the end").
+    ``after`` is set. The group is inserted as a whole, ``dead_code_elimination``
+    entries included: coremltools' default pipeline runs those elsewhere too, but
+    we need them right between our own passes. A pass may legitimately appear in
+    more than one group (``fuse_reduce_keep_dims`` runs both in ``CLEANUP_PASSES``
+    and in ``LATE_FUSION_PASSES``), so "already inserted" is decided per group --
+    the group is skipped only when it already occupies the slot next to its
+    anchor, which is what makes re-inserting into a pipeline that already has the
+    groups a no-op. If ``anchor`` is not part of the pipeline, ``fallback_index``
+    is used instead (``None`` meaning "append at the end").
     """
-    to_insert = [name for name in pass_names if name == _DCE or name not in pipeline.passes]
-    if all(name == _DCE for name in to_insert):
+    if len(pass_names) == 0:
         return
 
     if anchor in pipeline.passes:
@@ -101,7 +112,14 @@ def _insert_passes(
     else:
         index = fallback_index
 
-    for offset, pass_name in enumerate(to_insert):
+    if after:
+        occupied = pipeline.passes[index:index + len(pass_names)]
+    else:
+        occupied = pipeline.passes[max(index - len(pass_names), 0):index]
+    if occupied == pass_names:
+        return
+
+    for offset, pass_name in enumerate(pass_names):
         pipeline.insert_pass(index=index + offset, pass_name=pass_name)
 
 
