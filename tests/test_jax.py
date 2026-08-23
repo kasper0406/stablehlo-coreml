@@ -1298,6 +1298,17 @@ def test_dynamic_update_slice_oob():
     run_and_compare_specific_input(dynamic_update_slice, (operand, update, jnp.array([10, 10], dtype=jnp.int32)))
 
 
+def test_dynamic_update_slice_full_tensor():
+    # An update covering the whole operand is a plain copy, which
+    # `remove_noop_slice_update` rewrites away. Returning it directly makes the
+    # rewritten var a function output while the update is a function input.
+    def dynamic_update_slice(operand, update):
+        return jax.lax.dynamic_update_slice(operand, update, (0, 0))
+
+    model = run_and_compare(dynamic_update_slice, (jnp.zeros((4, 8)), jnp.zeros((4, 8))))
+    assert "slice_update" not in get_model_instruction_types(model)
+
+
 def test_transposed_conv_large_padding():
     input_shape = (1, 1, 4, 4)
     kernel_shape = (1, 1, 3, 3)
