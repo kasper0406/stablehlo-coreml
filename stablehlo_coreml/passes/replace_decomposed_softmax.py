@@ -23,6 +23,12 @@ constant along ``axis`` and is not a statically known non-finite value --
 softmax is invariant under such a shift, so the whole ``reduce_max``/
 ``maximum``/``reshape`` chain becomes dead. That covers the ``maximum(-inf,
 .)`` clamps and the permuted layouts for free.
+
+``jax.nn.softmax(x, where=mask)`` additionally wraps the summand in
+``select(mask, ., 0)`` and the quotient in ``select(mask, ., 0)``, having
+first replaced the masked lanes of ``x`` with ``-inf``. Those masked lanes
+exponentiate to exactly 0, so the ``select`` inside the sum is redundant and
+the whole thing is ``select(mask, softmax(select(mask, x, -inf)), 0)``.
 """
 
 import logging
@@ -40,6 +46,7 @@ from .pattern_utils import (
     normalize_axis,
     shapes_equal,
     sole_consumer,
+    uniform_scalar_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,19 +105,33 @@ def _match(real_div_op):
     if axis is None:
         return None
 
-    # `reduce_sum` must consume the exp output, possibly through an fp32 cast.
+    # `reduce_sum` must consume the exp output, possibly through an fp32 cast
+    # and/or the `select(mask, ., 0)` that `jax.nn.softmax(where=...)` puts
+    # inside the sum.
     sum_input = reduce_sum_op.inputs["x"]
     matched += chain
     matched.append(reduce_sum_op)
-    if sum_input is not numerator:
-        cast_op = getattr(sum_input, "op", None)
-        if cast_op is None or cast_op.op_type != "cast":
+    consumer = reduce_sum_op
+    mask = None
+    seen_cast = False
+    while sum_input is not numerator:
+        op = getattr(sum_input, "op", None)
+        if op is None or sole_consumer(sum_input) is not consumer:
             return None
-        if cast_op.inputs["x"] is not numerator:
+        if op.op_type == "cast" and not seen_cast:
+            seen_cast = True
+            next_input = op.inputs["x"]
+        elif op.op_type == "select" and mask is None:
+            zero = uniform_scalar_value(op.inputs["b"])
+            if zero is None or zero != 0.0:
+                return None
+            mask = _mask_source(op.inputs["cond"])
+            next_input = op.inputs["a"]
+        else:
             return None
-        if sole_consumer(sum_input) is not reduce_sum_op:
-            return None
-        matched.append(cast_op)
+        matched.append(op)
+        consumer = op
+        sum_input = next_input
 
     # The intermediate values must be a plain "broadcast the sum back" chain.
     keep_dims_shape = full_shape[:axis] + (1,) + full_shape[axis + 1:]
@@ -143,7 +164,68 @@ def _match(real_div_op):
     ):
         softmax_input = sub_op.inputs["x"]
 
+    if mask is not None and not _is_masked_softmax(real_div_op, softmax_input, mask):
+        return None
+
     return softmax_input, axis
+
+
+def _mask_source(var):
+    """Peel broadcasting ``tile``s off a mask so that equal masks compare equal.
+
+    JAX materialises the same ``where=`` mask once per use, and the converter
+    tiles each of those up to the operand shape separately, so the three masks
+    of a masked softmax are distinct ``Var``s over one common source.
+    """
+    while True:
+        op = getattr(var, "op", None)
+        if op is None or not is_broadcast_tile(op):
+            return var
+        var = op.inputs["x"]
+
+
+def _select_over(var, mask):
+    """Return the ``select`` op if ``var`` is ``select(mask, ., .)``, else ``None``."""
+    op = getattr(var, "op", None)
+    if op is None or op.op_type != "select":
+        return None
+    if _mask_source(op.inputs["cond"]) is not mask:
+        return None
+    return op
+
+
+def _is_masked_softmax(real_div_op, softmax_input, mask) -> bool:
+    """True if dropping the ``select`` inside the sum leaves the result unchanged.
+
+    ``jax.nn.softmax(x, where=mask)`` is::
+
+        x_safe = select(mask, x, -inf)
+        result = select(mask, exp(x_safe - m) / sum(select(mask, exp(...), 0)), 0)
+
+    Summing ``exp`` directly instead of the masked copy is exact as long as the
+    masked lanes of ``x_safe`` are ``-inf``: ``exp(-inf - m) == 0`` for any finite
+    ``m``, so those terms contribute nothing either way. When a whole row is
+    masked ``m`` is ``-inf`` too and both spellings produce NaN, but the outer
+    ``select`` then replaces the entire row with zeros -- which is why that
+    ``select`` has to be present for the rewrite to be sound.
+    """
+    fill_select = _select_over(softmax_input, mask)
+    if fill_select is None:
+        return False
+    fill = uniform_scalar_value(fill_select.inputs["b"])
+    if fill is None or not (np.isinf(fill) and fill < 0):
+        return False
+
+    result = real_div_op.outputs[0]
+    out_select = sole_consumer(result)
+    if out_select is None or out_select.op_type != "select":
+        return False
+    if _mask_source(out_select.inputs["cond"]) is not mask:
+        return False
+    if out_select.inputs["a"] is not result:
+        return False
+    zero = uniform_scalar_value(out_select.inputs["b"])
+    return zero is not None and zero == 0.0
 
 
 def _is_constant_along(var, axis: int, rank: int) -> bool:
@@ -228,7 +310,23 @@ class replace_decomposed_softmax(AbstractGraphPass):
 
     ``tile`` ops broadcasting the sum back to the input shape and the ``cast``
     pair that JAX adds around ``reduce_sum`` for fp16 inputs are matched as
-    well. The subtraction is only peeled off when the subtrahend is constant
+    well, as is the masked form ``jax.nn.softmax(x, where=mask)``:
+
+        %safe = select(cond=%mask, a=%x, b=-inf)
+        ...
+        %exp = exp(x=sub(%safe, %kd))
+        %masked = select(cond=%mask, a=%exp, b=0.0)
+        %sum = reduce_sum(x=%masked, axes=[a], keep_dims=True)
+        %div = real_div(x=%exp, y=%sum)
+        %out = select(cond=%mask, a=%div, b=0.0)     # required
+
+    becomes ``%out = select(cond=%mask, a=softmax(x=%safe, axis=a), b=0.0)``.
+    All three masks must come from one source (broadcasting ``tile``s aside),
+    the fill of ``%safe`` must be ``-inf`` so that the masked lanes of ``%exp``
+    are exactly zero, and the outer ``select`` must be there -- it is what
+    makes an entirely masked row come out as zeros rather than NaN.
+
+    The subtraction is only peeled off when the subtrahend is constant
     along the softmax axis (which is what makes softmax invariant under it)
     and is not statically known to contain NaN or infinity; otherwise the
     ``sub`` output becomes the softmax input.
