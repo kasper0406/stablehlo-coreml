@@ -4,6 +4,7 @@ import coremltools as ct
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.testing_utils import (
@@ -178,11 +179,20 @@ class TestFuseGeluErfc:
 class TestFuseGeluErfcEndToEnd:
     """End-to-end tests going through the real converter + pipeline."""
 
-    def test_exact_gelu_via_jit_lowering(self):
-        """The `jax.jit(...).lower()` path keeps `chlo.erfc`, which becomes `1 - erf`."""
-        inputs = (jax.random.normal(jax.random.PRNGKey(0), (4, 16), dtype=jnp.float32),)
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+    def test_exact_gelu_via_jit_lowering(self, dtype):
+        """The `jax.jit(...).lower()` path keeps `chlo.erfc`, which becomes `1 - erf`.
+
+        The fp16 case additionally covers the composite handler emitting its `1`
+        in the operand dtype; with an fp32 literal the model does not convert.
+        """
+        inputs = (jax.random.normal(jax.random.PRNGKey(0), (4, 16), dtype=dtype),)
+        precision_loss = jnp.finfo(dtype).eps / jnp.finfo(jnp.float32).eps
         cml_model = run_and_compare_jit_lowering(
-            lambda x: jax.nn.gelu(x, approximate=False), inputs
+            lambda x: jax.nn.gelu(x, approximate=False),
+            inputs,
+            atol=1e-04 * precision_loss,
+            rtol=1e-05 * precision_loss,
         )
         ops = get_model_instruction_types(cml_model)
         assert ops.count("gelu") == 1

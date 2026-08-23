@@ -500,19 +500,30 @@ def test_erf():
         assert len([op for op in ops if op != "const"]) == 1
 
 
-def test_erfc():
-    """`chlo.erfc` maps to `1 - erf(x)` when it survives as a composite."""
-    inputs = (jnp.linspace(-3, 3, 30, dtype=jnp.float32).reshape(5, 6),)
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+def test_erfc(dtype):
+    """`chlo.erfc` maps to `1 - erf(x)` when it survives as a composite.
 
-    cml_model = run_and_compare_jit_lowering(jax.lax.erfc, inputs)
+    The `1` has to be emitted in the operand dtype: MIL's `sub` requires both
+    of its inputs to have the same dtype, so an fp32 literal rejects an fp16 x.
+    """
+    inputs = (jnp.linspace(-3, 3, 30, dtype=dtype).reshape(5, 6),)
+    # fp16 carries ~3 decimal digits; scale the tolerances by the ratio of the
+    # machine epsilons, the way `test_trigonometry` does for the atan2 case.
+    precision_loss = jnp.finfo(dtype).eps / jnp.finfo(jnp.float32).eps
+    tolerances = {"atol": 1e-04 * precision_loss, "rtol": 1e-05 * precision_loss}
+
+    cml_model = run_and_compare_jit_lowering(jax.lax.erfc, inputs, **tolerances)
     ops = get_model_instruction_types(cml_model)
     assert ops.count("erf") == 1
     assert ops.count("sub") == 1
+    # The subtraction happens in the operand dtype, without an fp32 detour.
+    assert "cast" not in ops
 
     # `jax.export` expands `chlo.erfc` before we get to see the module (unlike
     # `chlo.erf`, it has no composite representation there), so that path keeps
     # the polynomial. Only the numerics are checked.
-    run_and_compare_specific_input(jax.lax.erfc, inputs)
+    run_and_compare_specific_input(jax.lax.erfc, inputs, **tolerances)
 
 
 def test_composite_ops_via_jit_lowering():

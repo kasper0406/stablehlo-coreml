@@ -321,7 +321,10 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         x = context[op.inputs[0].get_name()]
         # erfc(x) = 1 - erf(x). Keeping the `1 - erf(...)` shape also lets the
         # `fuse_gelu_erfc` MIL pass recognise an exact GELU.
-        context.add_result(op.results[0], mb.sub(x=1.0, y=mb.erf(x=x)))
+        # The literal has to carry the operand dtype: MIL's `sub` requires both
+        # inputs to have the same dtype, so a bare `1.0` (fp32) rejects an fp16 x.
+        one = get_numpy_type(x)(1.0)
+        context.add_result(op.results[0], mb.sub(x=one, y=mb.erf(x=x)))
 
     @register_composite_op("chlo.asin")
     def _op_composite_chlo_asin(self, context: TranslationContext, op: CompositeOp):
