@@ -79,6 +79,60 @@ class TestRemoveBroadcastTiles:
         _apply(prog)
         assert get_op_types_in_program(prog) == ["add"]
 
+    def test_removed_when_the_operands_carry_different_symbols(self):
+        """MIL mints a fresh symbol per op, so one runtime dimension gets several names.
+
+        `is5` and `dim_0` below are the same dimension at runtime, but no
+        compile-time comparison can say so. Only the axis the tile actually
+        replicated matters, and that one is a literal.
+        """
+        batch = get_new_symbol()
+        renamed_batch = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, 8)), mb.TensorSpec(shape=(renamed_batch, 1))])
+        def prog(x, y):
+            tiled = mb.tile(x=y, reps=[1, 8])
+            return mb.mul(x=x, y=tiled)
+
+        assert get_op_types_in_program(prog) == ["tile", "mul"]
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["mul"]
+
+    def test_not_removed_when_the_other_operand_lacks_the_replicated_size(self):
+        """Both operands are size 1 on the replicated axis, so the output would shrink."""
+        batch = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, 1)), mb.TensorSpec(shape=(batch, 1))])
+        def prog(x, y):
+            tiled = mb.tile(x=y, reps=[1, 8])
+            return mb.add(x=x, y=tiled)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["tile", "add"]
+        assert prog.functions["main"].outputs[0].shape == (batch, 8)
+
+    def test_not_removed_when_the_tile_is_both_operands(self):
+        """Bypassing the tile on both sides takes the output back down to (4, 1)."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 1))])
+        def prog(x):
+            tiled = mb.tile(x=x, reps=[1, 8])
+            return mb.mul(x=tiled, y=tiled)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["tile", "mul"]
+        assert prog.functions["main"].outputs[0].shape == (4, 8)
+
+    def test_removed_when_the_other_operand_has_a_lower_rank(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(8,)), mb.TensorSpec(shape=(4, 1))])
+        def prog(x, y):
+            tiled = mb.tile(x=y, reps=[1, 8])
+            return mb.add(x=tiled, y=x)
+
+        assert get_op_types_in_program(prog) == ["tile", "add"]
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["add"]
+        assert prog.functions["main"].outputs[0].shape == (4, 8)
+
     def test_not_removed_when_symbolic_dim_is_tiled(self):
         """A symbolic dim cannot be proven to be 1, so tiling it is not a broadcast."""
         batch = get_new_symbol()
@@ -225,6 +279,25 @@ class TestRemoveBroadcastTilesEndToEnd:
         cml_model = run_and_compare(
             f,
             [jax.ShapeDtypeStruct((2, 16, 64), jnp.float32), jax.ShapeDtypeStruct((1, 1, 64), jnp.float32)],
+        )
+        assert "tile" not in get_model_instruction_types(cml_model)
+
+    def test_symbolic_broadcast_leaves_no_tile(self):
+        """Dynamic shapes: the two `mul` operands reach MIL with different symbols."""
+        symbolic_shape = jax.export.symbolic_shape("(b, 8)")
+
+        def f(x):
+            return jnp.mean(x, axis=-1, keepdims=True) * x
+
+        from tests.utils import run_and_compare_symbolic  # noqa: PLC0415
+
+        cml_model = run_and_compare_symbolic(
+            f,
+            [jax.ShapeDtypeStruct(symbolic_shape, jnp.float32)],
+            [
+                (np.random.randn(3, 8).astype(np.float32),),
+                (np.random.randn(5, 8).astype(np.float32),),
+            ],
         )
         assert "tile" not in get_model_instruction_types(cml_model)
 

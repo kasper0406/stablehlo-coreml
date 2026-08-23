@@ -15,7 +15,7 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import broadcast_shapes, is_broadcast_tile, shapes_equal
+from .pattern_utils import const_int_list, dims_equal, is_broadcast_tile
 
 logger = logging.getLogger(__name__)
 
@@ -39,22 +39,69 @@ _BROADCAST_OPS = frozenset({
 _BINARY_OPERANDS = ("x", "y")
 
 
-def _consumer_output_is_unchanged(consumer, tile_out, tile_in) -> bool:
-    """True if replacing ``tile_out`` by ``tile_in`` keeps ``consumer``'s output shape."""
-    operand_shapes = []
+def _aligned_dim(operand, out_axis: int, out_rank: int):
+    """``operand``'s dimension at output axis ``out_axis``, NumPy-aligned to the right.
+
+    Axes that broadcasting prepends to a lower-rank operand read as 1.
+    ``None`` when the operand's shape is unknown.
+    """
+    shape = operand.shape
+    if shape is None:
+        return None
+    axis = out_axis - (out_rank - len(shape))
+    if axis < 0:
+        return 1
+    return shape[axis]
+
+
+def _consumer_output_is_unchanged(consumer, tile_op, tile_out) -> bool:
+    """True if bypassing ``tile_op`` keeps ``consumer``'s output shape.
+
+    The question is decided per axis rather than by re-broadcasting the whole
+    operand shapes. Re-broadcasting cannot answer it under dynamic shapes: MIL
+    mints a *fresh* symbol for a dynamic dimension at nearly every op, so the
+    two operands of an elementwise op routinely carry different symbols
+    (``is4`` vs ``dim_0``) for one and the same runtime value, and a symbolic
+    dimension is only ever provably equal to the identical symbol.
+
+    Per axis the reasoning needs no such comparison:
+
+    * ``reps[axis] == 1`` leaves the axis alone -- the tile's output dimension
+      *is* its input's, whatever either is called, so the consumer cannot tell
+      the two apart.
+    * ``reps[axis] > 1`` means the tile replicated a size-1 axis, and bypassing
+      it takes the operand back down to 1 there. The consumer's output only
+      stays the same if the other operand already carries the full size on that
+      axis. A replicated dimension is always ``1 * reps[axis]``, i.e. a literal
+      int, so this comparison never involves a symbol on the tile's side.
+    """
+    reps = const_int_list(tile_op.inputs.get("reps"))
+    if reps is None or tile_out.shape is None:
+        return False
+
+    out_shape = consumer.outputs[0].shape
+    if out_shape is None or len(out_shape) < len(reps):
+        return False
+
+    others = []
     for name in _BINARY_OPERANDS:
         operand = consumer.inputs.get(name)
         if operand is None:
             return False
-        shape = tile_in.shape if operand is tile_out else operand.shape
-        if shape is None:
-            return False
-        operand_shapes.append(tuple(shape))
+        # An operand that is the tile itself is bypassed too, so it cannot be
+        # the one supplying a replicated dimension.
+        if operand is not tile_out:
+            others.append(operand)
 
-    broadcast = broadcast_shapes(*operand_shapes)
-    if broadcast is None:
-        return False
-    return shapes_equal(broadcast, consumer.outputs[0].shape)
+    offset = len(out_shape) - len(reps)
+    for axis, rep in enumerate(reps):
+        if rep == 1:
+            continue
+        replicated = tile_out.shape[axis]
+        dims = [_aligned_dim(other, offset + axis, len(out_shape)) for other in others]
+        if not any(dim is not None and dims_equal(dim, replicated) for dim in dims):
+            return False
+    return True
 
 
 def _can_remove(op, block) -> bool:
@@ -76,7 +123,7 @@ def _can_remove(op, block) -> bool:
         # cond body) is not safe to rewrite from here.
         if consumer.enclosing_block is not block:
             return False
-        if not _consumer_output_is_unchanged(consumer, tile_out, op.x):
+        if not _consumer_output_is_unchanged(consumer, op, tile_out):
             return False
     return True
 
@@ -124,7 +171,10 @@ class remove_broadcast_tiles(AbstractGraphPass):
     2. Every consumer is an elementwise op with implicit broadcasting support
        (``select`` is excluded on purpose, see the module docstring), and lives
        in the same block as the tile.
-    3. No consumer changes its output shape when the tile is bypassed.
+    3. No consumer changes its output shape when the tile is bypassed: on every
+       axis the tile actually replicated (``reps[i] > 1``), the consumer's other
+       operand already carries the replicated size. Axes with ``reps[i] == 1``
+       need no check -- the tile passes them through unchanged.
 
     Given:
         %2 = tile(x=%1, reps=[1, 8])   # %1: (4, 1)
