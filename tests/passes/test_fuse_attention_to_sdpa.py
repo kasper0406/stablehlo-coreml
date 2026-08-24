@@ -1057,6 +1057,28 @@ class TestFuseAttentionToSdpaEndToEnd:
         ops = self._assert_fused(cml_model)
         assert ops == ["scaled_dot_product_attention"]
 
+    def test_attention_written_as_transposed_value_times_transposed_weights(self):
+        """``(Vᵀ Wᵀ)``: the weights are the *right* operand and contract on axis -2.
+
+        Both of the second matmul's spellings are reachable, because
+        ``dot_general`` gives each operand whichever of the two layouts
+        ``matmul`` accepts it is already in. Here that puts the weights on the
+        right with no ``transpose_y``, so the pass has to work out the key axis
+        from the operand side and the flag rather than assuming it is the last
+        one.
+        """
+        def attention(q, k, v):
+            scores = jnp.einsum("bhld,bhsd->bhls", q, k) / jnp.sqrt(4.0)
+            weights = jnp.swapaxes(jax.nn.softmax(scores, axis=-1), -2, -1)
+            return jnp.swapaxes(jnp.einsum("bhds,bhsl->bhdl", v, weights), -2, -1)
+
+        cml_model = run_and_compare(attention, [
+            jax.ShapeDtypeStruct((2, 3, 5, 4), jnp.float32),
+            jax.ShapeDtypeStruct((2, 3, 7, 4), jnp.float32),
+            jax.ShapeDtypeStruct((2, 3, 4, 7), jnp.float32),
+        ])
+        self._assert_fused(cml_model)
+
     def test_attention_with_additive_bias(self):
         def attention(q, k, v, bias):
             scores = jnp.einsum("bhld,bhsd->bhls", q, k) / jnp.sqrt(4.0) + bias

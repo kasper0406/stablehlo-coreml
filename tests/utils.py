@@ -1,5 +1,6 @@
 import copy
 from collections.abc import Mapping
+from typing import NamedTuple
 
 import coremltools as ct
 import jax
@@ -378,7 +379,14 @@ def run_and_compare_jit_lowering(
     )
 
 
-def get_model_instruction_types(cml_model) -> list[str]:
+def _mil_program_of(model_or_program) -> Program:
+    """Accept either a converted Core ML model or a bare MIL program."""
+    if isinstance(model_or_program, Program):
+        return model_or_program
+    return model_or_program._mil_program
+
+
+def get_model_instruction_types(model_or_program) -> list[str]:
     def collect_ops(ops: list) -> list[str]:
         collected_ops = []
         for op in ops:
@@ -388,11 +396,44 @@ def get_model_instruction_types(cml_model) -> list[str]:
 
         return collected_ops
 
-    mil_program = cml_model._mil_program
     all_ops = []
-    for func in mil_program.functions.values():
+    for func in _mil_program_of(model_or_program).functions.values():
         all_ops += collect_ops(func.operations)
     return all_ops
+
+
+class MatmulSpec(NamedTuple):
+    """How one ``matmul`` in a program is spelled."""
+
+    transpose_x: bool
+    transpose_y: bool
+    x_shape: tuple
+    y_shape: tuple
+
+
+def get_matmul_specs(model_or_program) -> list[MatmulSpec]:
+    """Describe every ``matmul`` in a converted model or a MIL program."""
+    def flag(value):
+        return False if value is None else bool(value.val)
+
+    def collect(ops):
+        specs = []
+        for op in ops:
+            if op.op_type == "matmul":
+                specs.append(MatmulSpec(
+                    flag(op.transpose_x),
+                    flag(op.transpose_y),
+                    tuple(op.inputs["x"].shape),
+                    tuple(op.inputs["y"].shape),
+                ))
+            for block in op.blocks:
+                specs += collect(block.operations)
+        return specs
+
+    all_specs = []
+    for func in _mil_program_of(model_or_program).functions.values():
+        all_specs += collect(func.operations)
+    return all_specs
 
 
 def export_hlo_module(jax_func, inputs):
@@ -401,6 +442,11 @@ def export_hlo_module(jax_func, inputs):
     exported = jax_export(jax_func, inputs)
     context = jax_mlir.make_ir_context()
     return ir.Module.parse(exported.mlir_module(), context=context)
+
+
+def converted_mil_program(jax_func, inputs) -> Program:
+    """The MIL program the converter emits for ``jax_func``, before any pass runs."""
+    return convert(export_hlo_module(jax_func, inputs), minimum_deployment_target=ct.target.iOS18)
 
 
 def run_and_compare_stateful(

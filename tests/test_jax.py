@@ -9,6 +9,8 @@ from jax._src.lib.mlir import ir
 from jax.lax import GatherDimensionNumbers, ScatterDimensionNumbers
 
 from tests.utils import (
+    converted_mil_program,
+    get_matmul_specs,
     get_model_instruction_types,
     run_and_compare,
     run_and_compare_hlo_module,
@@ -112,6 +114,72 @@ def test_tensor_multiplication():
     run_and_compare(full_tensor_product_3_2, (jnp.zeros((2, 2, 3)), jnp.zeros((2, 3))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros((15, 20, 5, 3)), jnp.zeros((10,))))
     run_and_compare(full_tensor_product_4_1, (jnp.zeros((2, 2, 2, 3)), jnp.zeros((2,))))
+
+
+@pytest.mark.parametrize(
+    "einsum, lhs_shape, rhs_shape, transpose_x, transpose_y",
+    [
+        # `A @ B`, the shape of every dense layer: the rhs already contracts on
+        # its first axis, which is what a plain matmul wants.
+        ("mk,kn->mn", (3, 4), (4, 5), False, False),
+        # The rhs contracts on its last axis instead; `transpose_y` says so.
+        ("mk,nk->mn", (3, 4), (5, 4), False, True),
+        # The same on the lhs, expressed with `transpose_x`.
+        ("km,kn->mn", (4, 3), (4, 5), True, False),
+        ("km,nk->mn", (4, 3), (5, 4), True, True),
+        # Batched, and with more than one batch dimension.
+        ("bmk,bkn->bmn", (2, 3, 4), (2, 4, 5), False, False),
+        ("abcd,abde->abce", (2, 3, 4, 5), (2, 3, 5, 6), False, False),
+        # A QKV-style projection: the rhs has two result dims, so it is reshaped
+        # — but not transposed, which is the case the pass pipeline could not
+        # clean up for us.
+        ("bsd,dhk->bshk", (1, 7, 6), (6, 2, 3), False, False),
+        # The two attention matmuls.
+        ("bhsd,bhtd->bhst", (1, 2, 5, 4), (1, 2, 7, 4), False, True),
+        ("bhst,bhtd->bhsd", (1, 2, 5, 7), (1, 2, 7, 4), False, False),
+    ],
+)
+def test_dot_general_uses_the_operand_orientation_that_needs_no_transpose(
+    einsum, lhs_shape, rhs_shape, transpose_x, transpose_y
+):
+    """``dot_general`` picks, per operand, the layout the operand is already in.
+
+    ``matmul`` accepts each operand in two layouts and its ``transpose_x`` /
+    ``transpose_y`` flags express the difference between them for free, so an
+    ``mb.transpose`` is only ever needed when *neither* layout is reachable
+    without one. Every shape here reaches one of them, so the converter emits no
+    ``transpose`` at all.
+    """
+    def jax_func(a, b):
+        return jnp.einsum(einsum, a, b)
+
+    inputs = (jnp.zeros(lhs_shape), jnp.zeros(rhs_shape))
+    mil_program = converted_mil_program(jax_func, inputs)
+    assert "transpose" not in get_model_instruction_types(mil_program)
+    specs = get_matmul_specs(mil_program)
+    assert len(specs) == 1, f"expected one matmul, got {specs}"
+    assert (specs[0].transpose_x, specs[0].transpose_y) == (transpose_x, transpose_y)
+
+    run_and_compare(jax_func, inputs)
+
+
+def test_dot_general_transposes_when_neither_orientation_is_free():
+    """Several contracting dims can force a real transpose, and that still works.
+
+    ``ackd`` has to become ``a(kc)d`` — its result dim sits between the two
+    contracting ones — which no ``transpose`` flag can express, so the converter
+    falls back to emitting one.
+    """
+    def jax_func(a, b):
+        return jnp.einsum("abcd,ackd->abk", a, b)
+
+    inputs = (jnp.zeros((2, 3, 4, 5)), jnp.zeros((2, 4, 6, 5)))
+    mil_program = converted_mil_program(jax_func, inputs)
+    assert get_model_instruction_types(mil_program).count("transpose") == 1
+    specs = get_matmul_specs(mil_program)
+    assert len(specs) == 1 and specs[0].transpose_y and not specs[0].transpose_x
+
+    run_and_compare(jax_func, inputs)
 
 
 def test_simple_reductions():

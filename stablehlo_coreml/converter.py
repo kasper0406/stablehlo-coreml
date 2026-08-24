@@ -596,9 +596,40 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs_result_dim = [d for d in range(lhs_rank) if d not in lhs_batching_dim + lhs_contracting_dim]
         rhs_result_dim = [d for d in range(rhs_rank) if d not in rhs_batching_dim + rhs_contracting_dim]
 
-        # Transpose to [batch…, result…, contract…]
-        lhs_perm = lhs_batching_dim + lhs_result_dim + lhs_contracting_dim
-        rhs_perm = rhs_batching_dim + rhs_result_dim + rhs_contracting_dim
+        # Each operand has two layouts `matmul` accepts, and its transpose flag
+        # expresses the difference between them for free:
+        #
+        #   lhs: [batch…, result…, contract…] plain, or
+        #        [batch…, contract…, result…] with `transpose_x`
+        #   rhs: [batch…, contract…, result…] plain, or
+        #        [batch…, result…, contract…] with `transpose_y`
+        #
+        # So pick, per operand, the one it is already in — no `mb.transpose` at
+        # all, and the flag carries the difference. Only when neither layout is
+        # reachable for free is a real transpose emitted, and then it goes to
+        # [batch…, result…, contract…], which is what this lowering has always
+        # produced.
+        def _orient(rank, batching, contracting, result, flag_is_result_first):
+            """Return ``(perm, transpose_flag)`` for one matmul operand."""
+            result_first = batching + result + contracting
+            contract_first = batching + contracting + result
+            if flag_is_result_first:
+                plain, flagged = contract_first, result_first
+            else:
+                plain, flagged = result_first, contract_first
+            identity = list(range(rank))
+            if plain == identity:
+                return plain, False
+            if flagged == identity:
+                return flagged, True
+            return result_first, flag_is_result_first
+
+        lhs_perm, transpose_x = _orient(
+            lhs_rank, lhs_batching_dim, lhs_contracting_dim, lhs_result_dim, False
+        )
+        rhs_perm, transpose_y = _orient(
+            rhs_rank, rhs_batching_dim, rhs_contracting_dim, rhs_result_dim, True
+        )
         t_lhs = lhs if lhs_perm == list(range(lhs_rank)) else mb.transpose(x=lhs, perm=lhs_perm)
         t_rhs = rhs if rhs_perm == list(range(rhs_rank)) else mb.transpose(x=rhs, perm=rhs_perm)
 
@@ -619,28 +650,31 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         lhs_result_count = _safe_product(lhs_result_shapes) if lhs_result_shapes else 1
         rhs_result_count = _safe_product(rhs_result_shapes) if rhs_result_shapes else 1
 
-        # Reshape each operand to (batch…, M, K) / (batch…, N, K).
+        # Reshape each operand to the 3D layout `_orient` picked for it, which
+        # is (batch…, M, K) / (batch…, K, N) for a plain operand and
+        # (batch…, K, M) / (batch…, N, K) for a flagged one. `contracting_first`
+        # is which of the two it is.
         # When len(result_dims)==1 and len(contract_dims)==1 the tensor is
         # already in the right layout and we can skip the reshape entirely,
         # which avoids the two-unknown-dims problem when both are symbolic.
-        def _reshape_to_3d(tensor, result_count, result_dims, side_name):
+        def _reshape_to_3d(tensor, result_count, result_dims, contracting_first, side_name):
             if len(result_dims) == 1 and len(lhs_contracting_dim) == 1:
                 return tensor
-            rc = result_count if result_count != -1 else -1
-            cc = contracted_count if contracted_count != -1 else -1
+            rc = result_count
+            cc = contracted_count
             if rc == -1 and cc == -1:
                 raise ValueError(
                     f"dot_general: cannot reshape {side_name} — "
                     f"both result-dim product and contracting-dim product are symbolic."
                 )
-            target = list(batch_shape) + [rc if rc != -1 else -1, cc if cc != -1 else -1]
-            return mb.reshape(x=tensor, shape=target)
+            trailing = [cc, rc] if contracting_first else [rc, cc]
+            return mb.reshape(x=tensor, shape=list(batch_shape) + trailing)
 
-        c_lhs = _reshape_to_3d(t_lhs, lhs_result_count, lhs_result_dim, "lhs")
-        c_rhs = _reshape_to_3d(t_rhs, rhs_result_count, rhs_result_dim, "rhs")
+        c_lhs = _reshape_to_3d(t_lhs, lhs_result_count, lhs_result_dim, transpose_x, "lhs")
+        c_rhs = _reshape_to_3d(t_rhs, rhs_result_count, rhs_result_dim, not transpose_y, "rhs")
 
-        # (batch…, M, K) × (batch…, N, K)^T → (batch…, M, N)
-        result = mb.matmul(x=c_lhs, y=c_rhs, transpose_y=True)
+        # → (batch…, M, N)
+        result = mb.matmul(x=c_lhs, y=c_rhs, transpose_x=transpose_x, transpose_y=transpose_y)
 
         # Squeeze fake dims when a side has no result dims
         if len(lhs_result_dim) == 0 and len(rhs_result_dim) == 0:

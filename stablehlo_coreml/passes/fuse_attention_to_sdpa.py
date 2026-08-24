@@ -1,15 +1,19 @@
 """MIL pass: fuse a decomposed attention block into ``scaled_dot_product_attention``.
 
 Attention arrives from StableHLO as two ``dot_general``\\ s with a softmax in
-between. ``dot_general`` lowers to ``[transpose] -> [reshape] -> matmul(...,
-transpose_y=True) -> [reshape] -> [transpose]``, so an attention block looks
-like::
+between. ``dot_general`` lowers to ``[transpose] -> [reshape] -> matmul ->
+[reshape] -> [transpose]``, so an attention block looks like::
 
-    matmul_0(Q, K, transpose_y=True) -> [reshape/transpose]* -> [scale] ->
+    matmul_0(Q, K_t) -> [reshape/transpose]* -> [scale] ->
       [mask] -> [cast] -> softmax(axis=-1) -> [reshape/transpose]* ->
-      matmul_1(W, V, transpose_y=True)
+      matmul_1(W, V)
 
 The pass matches that and emits a single ``scaled_dot_product_attention``.
+
+Neither matmul is assumed to be in any particular orientation: each operand may
+arrive already transposed (with the matmul's ``transpose_y`` flag set) or laid
+out for a plain matmul, and the softmax weights may enter ``matmul_1`` on either
+side, contracting over either of their two trailing axes.
 
 Everything happens in "matmul space": the SDPA operands are exactly the matmul
 operands, so nothing is assumed about how the model laid out heads, groups or
@@ -629,6 +633,20 @@ def _softmax_axis_atom(dim, m_atom: _Atom, n_atom: _Atom) -> _Atom | None:
     return whole[0] if len(whole) == 1 else None
 
 
+def _weights_key_axis(pattern) -> int:
+    """Which axis of ``weights_var`` ``matmul_1`` contracts over: ``-1`` or ``-2``.
+
+    The softmax weights are ``[..., L', S]`` when the contraction runs over their
+    last axis and ``[..., S, L']`` when it runs over the one before it. Which one
+    it is follows from the side ``weights_var`` enters ``matmul_1`` on and that
+    side's transpose flag.
+    """
+    matmul_1 = pattern.matmul_1
+    if matmul_1.inputs["x"] is pattern.weights_var:
+        return -2 if bool(matmul_1.transpose_x.val) else -1
+    return -1 if bool(matmul_1.transpose_y.val) else -2
+
+
 def _analyse_space(pattern) -> _Space | None:
     """Work out the S/L roles and the row permutation between the two matmuls."""
     scores_shape = tuple(pattern.matmul_0.outputs[0].shape)
@@ -636,8 +654,13 @@ def _analyse_space(pattern) -> _Space | None:
     if n_batch < 1:
         return None
 
+    key_axis = _weights_key_axis(pattern)
+
     if not pattern.back_layout_ops and not pattern.fwd_layout_ops:
-        # Softmax runs directly on the matmul result, so S is its last axis.
+        # Softmax runs directly on the matmul result, so S is its last axis, and
+        # `matmul_1` has to contract over that one.
+        if key_axis != -1:
+            return None
         return _Space(n_batch, scores_shape[:n_batch])
 
     if any(is_symbolic(dim) for dim in scores_shape):
@@ -665,7 +688,7 @@ def _analyse_space(pattern) -> _Space | None:
     if s_atom.children is not None:
         # The key axis itself was split; it is no longer a single SDPA axis.
         return None
-    if not _same_ordering(_expand(weights_layout[-1]), [s_atom]):
+    if not _same_ordering(_expand(weights_layout[key_axis]), [s_atom]):
         return None
     for atom, dim in zip(batch_atoms, weights_layout):
         # The batch layout of both matmuls has to agree: SDPA keeps it as is.
@@ -673,7 +696,8 @@ def _analyse_space(pattern) -> _Space | None:
             return None
 
     l_leaves = _ordering(l_atom.leaves())
-    l_prime = _ordering(_expand(weights_layout[n_batch]))
+    # The query rows sit on whichever of the two trailing axes is not the key one.
+    l_prime = _ordering(_expand(weights_layout[-1 if key_axis == -2 else -2]))
     if len(l_prime) != len(l_leaves) or {id(a) for a in l_prime} != {id(a) for a in l_leaves}:
         return None
 
@@ -925,9 +949,11 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
         value_t = bool(matmul_1.transpose_y.val)
         output_transposed = False
     elif matmul_1.inputs["y"] is pattern.weights_var:
-        if not bool(matmul_1.transpose_y.val):
-            # The contracting axis would not be the last one of the weights.
-            return False
+        # The weights are the right-hand operand, so the value is the left one
+        # and carries its embedding axis first: `[batch…, E, S] × [batch…, S, L']`
+        # (or the `transpose_y=True` spelling of it, which `_analyse_space` has
+        # already accounted for). Both need the value transposed, and both
+        # produce `[batch…, E, L']` instead of SDPA's `[batch…, L, E]`.
         value_src = matmul_1.inputs["x"]
         value_t = True
         output_transposed = True
