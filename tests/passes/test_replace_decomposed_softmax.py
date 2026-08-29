@@ -363,6 +363,46 @@ class TestReplaceDecomposedSoftmax:
         _apply(prog)
         assert "softmax" not in get_op_types_in_program(prog)
 
+    def test_not_replaced_for_a_squeezed_sum_on_a_middle_axis(self):
+        """A `keep_dims=False` sum right-aligns onto the wrong axes.
+
+        The denominator has shape (4, 4), which `real_div` broadcasts over axes
+        1 and 2 of the (4, 4, 4) numerator -- not over axis 1 alone, so this is
+        not `softmax(x, axis=1)`.
+        """
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4, 4))])
+        def prog(x):
+            exponentiated = mb.exp(x=x)
+            total = mb.reduce_sum(x=exponentiated, axes=[1], keep_dims=False)
+            return mb.real_div(x=exponentiated, y=total)
+
+        _apply(prog)
+        assert "softmax" not in get_op_types_in_program(prog)
+
+    def test_not_replaced_when_the_sum_is_squeezed_on_a_middle_axis(self):
+        """Same as above, with the dimension dropped by an explicit `squeeze`."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4, 4))])
+        def prog(x):
+            exponentiated = mb.exp(x=x)
+            total = mb.reduce_sum(x=exponentiated, axes=[1], keep_dims=True)
+            squeezed = mb.squeeze(x=total, axes=[1])
+            return mb.real_div(x=exponentiated, y=squeezed)
+
+        _apply(prog)
+        assert "softmax" not in get_op_types_in_program(prog)
+
+    def test_replaces_a_squeezed_sum_on_the_leading_axis(self):
+        """Dropping the leading dimension *is* the broadcast that softmax needs."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 4, 4))])
+        def prog(x):
+            exponentiated = mb.exp(x=x)
+            total = mb.reduce_sum(x=exponentiated, axes=[0], keep_dims=False)
+            return mb.real_div(x=exponentiated, y=total)
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["softmax"]
+        assert prog.functions["main"].operations[-1].axis.val == 0
+
     def test_not_replaced_when_denominator_is_not_a_sum(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 4))])
         def prog(x):

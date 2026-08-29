@@ -141,6 +141,13 @@ def _match(real_div_op):
         if not any(shapes_equal(op.outputs[0].shape, shape) for shape in allowed):
             return None
 
+    # ... and the denominator itself has to broadcast back along `axis`. A
+    # `reduced_shape` denominator only does so when `axis` is the leading one:
+    # NumPy aligns shapes to the right, so a rank-1 gap anywhere else lines the
+    # sum up against the wrong axes and the quotient is not a softmax.
+    if not _is_constant_along(denominator, axis, rank):
+        return None
+
     # The exp output must not be observed anywhere else.
     block = real_div_op.enclosing_block
     matched_set = set(matched)
