@@ -1,6 +1,7 @@
 import coremltools as ct
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
+from coremltools.converters.mil.mil import get_new_symbol
 from coremltools.converters.mil.testing_utils import (
     apply_pass_and_basic_check,
     assert_model_is_valid,
@@ -111,13 +112,60 @@ class TestRemoveNoopSliceUpdate:
             return x
         self.__test_program(prog, should_remove=False)
 
-    def test_not_removed_if_end_mask(self):
+    def test_removed_if_end_mask(self):
+        """`end_mask[i]` means "to the end of axis i", so the axis is covered."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(10, 20))])
         def prog(x):
             buffer = np.zeros((10, 20))
-            x = mb.slice_update(x=buffer, update=x, begin=[0, 0], end=buffer.shape, end_mask=[True, False])
+            # `end[0]` is neglected because of the mask
+            x = mb.slice_update(x=buffer, update=x, begin=[0, 0], end=[0, 20], end_mask=[True, False], name="x")
             return x
-        self.__test_program(prog, should_remove=False)
+        self.__test_program(prog, should_remove=True)
+
+    def test_not_removed_if_squeeze_mask(self):
+        """A squeezed axis is a pure index, not a write of the whole axis."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(20,))])
+        def prog(x):
+            buffer = np.zeros((10, 20))
+            updated = mb.slice_update(
+                x=buffer, update=x, begin=[0, 0], end=[10, 20], squeeze_mask=[True, False]
+            )
+            return mb.mul(x=updated, y=np.float32(2.0))
+
+        assert get_op_types_in_program(prog) == ["slice_update", "mul"]
+        apply_pass_and_basic_check(prog, "common::remove_noop_slice_update")
+        apply_pass_and_basic_check(prog, "common::dead_code_elimination")
+        assert get_op_types_in_program(prog) == ["slice_update", "mul"]
+
+    def test_removed_for_symbolic_shape_covered_by_end_mask(self):
+        """A symbolic dimension can only be covered by `end_mask`."""
+        batch = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, 20)), mb.TensorSpec(shape=(batch, 20))])
+        def prog(buffer, update):
+            updated = mb.slice_update(
+                x=buffer, update=update, begin=[0, 0], end=[0, 20], end_mask=[True, False]
+            )
+            return mb.mul(x=updated, y=np.float32(2.0))
+
+        assert get_op_types_in_program(prog) == ["slice_update", "mul"]
+        apply_pass_and_basic_check(prog, "common::remove_noop_slice_update")
+        apply_pass_and_basic_check(prog, "common::dead_code_elimination")
+        assert get_op_types_in_program(prog) == ["mul"]
+
+    def test_not_removed_for_symbolic_shape_with_constant_end(self):
+        """`end` is a constant, so it can never provably cover a symbolic axis."""
+        batch = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, 20)), mb.TensorSpec(shape=(batch, 20))])
+        def prog(buffer, update):
+            updated = mb.slice_update(x=buffer, update=update, begin=[0, 0], end=[10, 20])
+            return mb.mul(x=updated, y=np.float32(2.0))
+
+        assert get_op_types_in_program(prog) == ["slice_update", "mul"]
+        apply_pass_and_basic_check(prog, "common::remove_noop_slice_update")
+        apply_pass_and_basic_check(prog, "common::dead_code_elimination")
+        assert get_op_types_in_program(prog) == ["slice_update", "mul"]
 
     def __test_program(self, prog, should_remove: bool):
         assert get_op_types_in_program(prog) == ["slice_update"]
