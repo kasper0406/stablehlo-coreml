@@ -51,6 +51,7 @@ as well, but only when the matched mask proves that no row can be entirely
 -inf; otherwise the wrapper is not an identity and the block is left alone.
 """
 
+import dataclasses
 import logging
 import math
 
@@ -832,6 +833,24 @@ def _mask_to_sdpa_space(mask_var, space, softmax_shape, seq_len, before_op, name
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _Options:
+    """The pass options, see :class:`fuse_attention_to_sdpa`."""
+
+    finite_fill_mask: str = "additive"
+    max_head_dim: int | None = None
+    max_key_len: int | None = None
+
+
+def _within_bound(dim, bound: int | None) -> bool:
+    """True when ``dim`` is known not to exceed ``bound`` (a symbolic ``dim`` is not)."""
+    if bound is None:
+        return True
+    if is_symbolic(dim):
+        return False
+    return int(dim) <= bound
+
+
 def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
     """Build SDPA's ``attn_mask`` from the matched additive / ``select`` masks.
 
@@ -941,7 +960,7 @@ def _validate_operands(query, key, value, n_batch: int) -> bool:
     return dims_equal(key.shape[-2], value.shape[-2])
 
 
-def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
+def _try_fuse(softmax_op, block, options: _Options) -> bool:
     out_rank = len(softmax_op.outputs[0].shape)
     if normalize_axis(softmax_op.axis.val, out_rank) != out_rank - 1:
         return False
@@ -1006,9 +1025,12 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
     embedding = int(embedding)
     seq_len = key.shape[-2]
 
+    if not _within_bound(embedding, options.max_head_dim) or not _within_bound(seq_len, options.max_key_len):
+        return False
+
     attn_mask = None
     if pattern.has_mask:
-        attn_mask = _build_mask(pattern, space, matmul_1, seq_len, query, finite_fill_mask)
+        attn_mask = _build_mask(pattern, space, matmul_1, seq_len, query, options.finite_fill_mask)
         if attn_mask is None:
             return False
 
@@ -1072,14 +1094,14 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
 
 
 @block_context_manager
-def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
+def _fuse_attention_to_sdpa(block, options: _Options) -> int:
     fused = 0
     for op in list(block.operations):
         if op.enclosing_block is None:
             continue
 
         for nested_block in op.blocks:
-            fused += _fuse_attention_to_sdpa(nested_block, finite_fill_mask)
+            fused += _fuse_attention_to_sdpa(nested_block, options)
         if len(op.blocks) > 0:
             continue
 
@@ -1087,7 +1109,7 @@ def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
             continue
         # `_try_fuse` may build some replacement ops before a late check makes it
         # give up; those are left dead in the block for `dead_code_elimination`.
-        if _try_fuse(op, block, finite_fill_mask):
+        if _try_fuse(op, block, options):
             fused += 1
 
     return fused
@@ -1107,6 +1129,21 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
       stays finite, exactly like the original graph; ``"bool"`` emits the
       boolean condition instead, which is cheaper but turns such rows into NaN.
       Only a fill of exactly ``-inf`` maps to a boolean mask unconditionally.
+    - ``max_head_dim`` / ``max_key_len``: leave an attention block unfused when
+      its head dimension ``E``, respectively its key length ``S``, is larger
+      than the bound (or symbolic, i.e. unknown). ``None`` (the default) fuses
+      everything. On macOS 26.x / coremltools 9.0 a fused SDPA with a large
+      head dimension and a long key length has been reported to break the ANE
+      partitioner (``ANECCompile`` fails, the model silently runs on CPU) and to
+      crash the BNNS fp16 kernel for query lengths >= 2; the decomposed form is
+      fine on every backend and costs nothing measurable on the GPU. Consumers
+      targeting the ANE or the CPU can keep the small, sliding-window sites
+      fused and opt the global ones out with these bounds.
+
+    Options are set on the pipeline::
+
+        pipeline = build_pass_pipeline()
+        pipeline.set_options("common::fuse_attention_to_sdpa", {"max_key_len": 4096})
 
     Given:
         %scores = matmul(x=%q, y=%k, transpose_y=True)
@@ -1120,6 +1157,8 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
     """
 
     _finite_fill_mask = "additive"
+    _max_head_dim = None
+    _max_key_len = None
 
     @property
     def finite_fill_mask(self) -> str:
@@ -1131,8 +1170,39 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
             raise ValueError(f"finite_fill_mask must be 'additive' or 'bool', got `{mode}`")
         self._finite_fill_mask = mode
 
+    @staticmethod
+    def _parse_bound(name: str, value) -> int | None:
+        # `PassPipeline.set_options` is documented to take strings.
+        if value is None or (isinstance(value, str) and value.strip().lower() in ("", "none")):
+            return None
+        try:
+            bound = int(value)
+            integral = bound == value if not isinstance(value, str) else True
+        except (TypeError, ValueError):
+            integral = False
+        if not integral or bound < 1:
+            raise ValueError(f"{name} must be a positive integer or None, got `{value}`")
+        return bound
+
+    @property
+    def max_head_dim(self) -> int | None:
+        return self._max_head_dim
+
+    @max_head_dim.setter
+    def max_head_dim(self, value):
+        self._max_head_dim = self._parse_bound("max_head_dim", value)
+
+    @property
+    def max_key_len(self) -> int | None:
+        return self._max_key_len
+
+    @max_key_len.setter
+    def max_key_len(self, value):
+        self._max_key_len = self._parse_bound("max_key_len", value)
+
     def apply(self, prog):
+        options = _Options(self._finite_fill_mask, self._max_head_dim, self._max_key_len)
         for f in prog.functions.values():
-            fused = _fuse_attention_to_sdpa(f, self._finite_fill_mask)
+            fused = _fuse_attention_to_sdpa(f, options)
             if fused:
                 logger.debug("fuse_attention_to_sdpa: fused %d attention block(s)", fused)

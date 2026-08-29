@@ -774,6 +774,77 @@ class TestAdditiveBiasAndSelectMask:
         assert _sdpa_ops(prog) == 0
 
 
+class TestShapeBounds:
+    """``max_head_dim`` / ``max_key_len`` opt a block out of the fusion by size.
+
+    A fused SDPA over global attention (large ``E``, long ``S``) is known to
+    break the ANE partitioner and the BNNS fp16 kernel; consumers targeting
+    those backends leave such sites decomposed.
+    """
+
+    @staticmethod
+    def _prog(key_len=S):
+        @mb.program(opset_version=ct.target.iOS18, input_specs=[
+            mb.TensorSpec(shape=(B, H, L, E)),
+            mb.TensorSpec(shape=(B, H, key_len, E)),
+            mb.TensorSpec(shape=(B, H, key_len, E)),
+        ])
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            weights = mb.softmax(x=scores, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        return prog
+
+    @pytest.mark.parametrize("option, fused_at, unfused_at", [
+        ("max_head_dim", E, E - 1),
+        ("max_key_len", S, S - 1),
+    ])
+    def test_bound_is_inclusive(self, option, fused_at, unfused_at):
+        prog = self._prog()
+        _apply(prog, **{option: fused_at})
+        assert _sdpa_ops(prog) == 1
+
+        prog = self._prog()
+        _apply(prog, **{option: unfused_at})
+        assert _sdpa_ops(prog) == 0
+        assert "softmax" in get_op_types_in_program(prog)
+
+    def test_bounds_accept_the_string_form_set_options_documents(self):
+        prog = self._prog()
+        _apply(prog, max_head_dim=str(E - 1))
+        assert _sdpa_ops(prog) == 0
+
+        prog = self._prog()
+        _apply(prog, max_head_dim="none", max_key_len="")
+        assert _sdpa_ops(prog) == 1
+
+    def test_symbolic_key_length_counts_as_too_long(self):
+        prog = self._prog(key_len=get_new_symbol())
+        _apply(prog, max_key_len=4096)
+        assert _sdpa_ops(prog) == 0
+
+        # ...but only when a bound is set; unbounded fuses as before.
+        prog = self._prog(key_len=get_new_symbol())
+        _apply(prog)
+        assert _sdpa_ops(prog) == 1
+
+    @pytest.mark.parametrize("value", [0, -1, "abc", 1.5])
+    def test_invalid_bound_is_rejected(self, value):
+        with pytest.raises(ValueError, match="max_key_len"):
+            _apply(self._prog(), max_key_len=value)
+
+    def test_options_do_not_leak_between_runs(self):
+        """The pass instance is a registry singleton; a bound set once must not stick."""
+        prog = self._prog()
+        _apply(prog, max_key_len=S - 1)
+        assert _sdpa_ops(prog) == 0
+
+        prog = self._prog()
+        _apply(prog)
+        assert _sdpa_ops(prog) == 1
+
+
 class TestUnitQueryLength:
     """The autoregressive decode step: a single query row.
 
