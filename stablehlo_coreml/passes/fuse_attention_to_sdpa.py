@@ -52,18 +52,16 @@ as well, but only when the matched mask proves that no row can be entirely
 """
 
 import dataclasses
-import logging
 import math
 
 import numpy as np
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 from .pattern_utils import (
+    RewritePass,
     broadcast_shapes,
     const_int_list,
     dims_equal,
@@ -74,8 +72,6 @@ from .pattern_utils import (
     uniform_const_operand,
     uniform_scalar_value,
 )
-
-logger = logging.getLogger(__name__)
 
 # Ops that only re-group axes; they never reorder elements within an axis.
 _LAYOUT_OPS = frozenset({"reshape", "expand_dims", "squeeze", "transpose"})
@@ -1103,30 +1099,8 @@ def _try_fuse(softmax_op, block, options: _Options) -> bool:
     return True
 
 
-@block_context_manager
-def _fuse_attention_to_sdpa(block, options: _Options) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_attention_to_sdpa(nested_block, options)
-        if len(op.blocks) > 0:
-            continue
-
-        if op.op_type != "softmax":
-            continue
-        # `_try_fuse` may build some replacement ops before a late check makes it
-        # give up; those are left dead in the block for `dead_code_elimination`.
-        if _try_fuse(op, block, options):
-            fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_attention_to_sdpa(AbstractGraphPass):
+class fuse_attention_to_sdpa(RewritePass):
     """
     Fuse ``matmul -> [scale] -> [bias] -> [mask] -> softmax -> matmul`` into
     ``scaled_dot_product_attention``.
@@ -1173,6 +1147,8 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
         %out = scaled_dot_product_attention(query=%q, key=%k, value=%v, attn_mask=...)
     """
 
+    _REWRITES = "attention block(s)"
+
     _finite_fill_mask = "additive"
     _max_head_dim = None
     _max_key_len = None
@@ -1217,9 +1193,10 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
     def max_key_len(self, value):
         self._max_key_len = self._parse_bound("max_key_len", value)
 
-    def apply(self, prog):
+    def visit(self, op, block) -> bool:
+        if op.op_type != "softmax":
+            return False
         options = _Options(self._finite_fill_mask, self._max_head_dim, self._max_key_len)
-        for f in prog.functions.values():
-            fused = _fuse_attention_to_sdpa(f, options)
-            if fused:
-                logger.debug("fuse_attention_to_sdpa: fused %d attention block(s)", fused)
+        # `_try_fuse` may build some replacement ops before a late check makes it
+        # give up; those are left dead in the block for `dead_code_elimination`.
+        return _try_fuse(op, block, options)

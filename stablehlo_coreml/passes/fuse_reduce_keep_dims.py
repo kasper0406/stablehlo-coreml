@@ -26,17 +26,12 @@ would need the runtime shape as an operand)::
 so both spellings are matched.
 """
 
-import logging
 
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import shapes_equal
-
-logger = logging.getLogger(__name__)
+from .pattern_utils import RewritePass, shapes_equal
 
 # The MIL reduction ops whose builder takes an `axes` + `keep_dims` pair.
 # The arg-reductions (`reduce_argmax`/`reduce_argmin`) take a single `axis` and
@@ -123,47 +118,8 @@ def _match(reshape_op, block):
     return reduce_op, axes
 
 
-@block_context_manager
-def _fuse_reduce_keep_dims(block) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_reduce_keep_dims(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        match = _match(op, block)
-        if match is None:
-            continue
-        reduce_op, axes = match
-
-        # A fresh reduction with `keep_dims=True` replaces the reshape. The
-        # original reduction is left in place; if the reshape was its sole
-        # consumer it becomes dead and `dead_code_elimination` picks it up
-        # (otherwise the other consumers, which expect the squeezed shape, keep
-        # using it).
-        keep_dims_var = getattr(mb, reduce_op.op_type)(
-            x=reduce_op.x,
-            axes=axes,
-            keep_dims=True,
-            before_op=op,
-            name=op.outputs[0].name,
-        )
-        block.replace_uses_of_var_after_op(
-            anchor_op=op,
-            old_var=op.outputs[0],
-            new_var=keep_dims_var,
-        )
-        fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_reduce_keep_dims(AbstractGraphPass):
+class fuse_reduce_keep_dims(RewritePass):
     """
     Fuse ``reduce_*(keep_dims=False) -> reshape/expand_dims(<keep-dims shape>)``
     into a single ``reduce_*(keep_dims=True)``.
@@ -199,8 +155,29 @@ class fuse_reduce_keep_dims(AbstractGraphPass):
         %2 = reduce_sum(x=%0, axes=[1], keep_dims=True)
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            fused = _fuse_reduce_keep_dims(f)
-            if fused:
-                logger.debug("fuse_reduce_keep_dims: fused %d reduce/reshape pair(s)", fused)
+    _REWRITES = "reduce/reshape pair(s)"
+
+    def visit(self, op, block) -> bool:
+        match = _match(op, block)
+        if match is None:
+            return False
+        reduce_op, axes = match
+
+        # A fresh reduction with `keep_dims=True` replaces the reshape. The
+        # original reduction is left in place; if the reshape was its sole
+        # consumer it becomes dead and `dead_code_elimination` picks it up
+        # (otherwise the other consumers, which expect the squeezed shape, keep
+        # using it).
+        keep_dims_var = getattr(mb, reduce_op.op_type)(
+            x=reduce_op.x,
+            axes=axes,
+            keep_dims=True,
+            before_op=op,
+            name=op.outputs[0].name,
+        )
+        block.replace_uses_of_var_after_op(
+            anchor_op=op,
+            old_var=op.outputs[0],
+            new_var=keep_dims_var,
+        )
+        return True

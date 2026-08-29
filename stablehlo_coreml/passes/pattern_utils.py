@@ -2,6 +2,8 @@
 
 The passes in this package all have to deal with the same handful of problems:
 
+* walking every op of a program, nested blocks included, and rewriting the ones
+  that match (:class:`RewritePass` and :func:`rewrite_leaf_ops`),
 * recognising constants that hold a single repeated value (either a ``const``
   or a ``fill`` op),
 * comparing shapes that may contain symbolic (sympy) dimensions,
@@ -13,8 +15,12 @@ proven (typically because a dimension is symbolic) the helpers report the
 "unknown" answer (``None``/``False``) so that callers skip the optimization.
 """
 
+import logging
+
 import numpy as np
 from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
+from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 # Upper bound on the number of scaling/negation ops `peel_to_scaled_input` walks
@@ -289,3 +295,63 @@ def dtype_epsilon(var) -> float:
     if dtype is None or not types.is_float(dtype):
         return 0.0
     return float(np.finfo(types.nptype_from_builtin(dtype)).eps)
+
+
+@block_context_manager
+def rewrite_leaf_ops(block, visit) -> int:
+    """Run ``visit(op, block)`` over every leaf operation of ``block``, and return
+    the number of rewrites.
+
+    A *leaf* op is one that does not itself contain blocks. Ops that do
+    (``cond``, ``while_loop``, ...) are descended into instead, so ``visit``
+    only ever sees ops it can rewrite in place, together with the block that
+    holds them.
+
+    ``visit`` returns a truthy value when it rewrote the op it was given; those
+    are what is counted. It may remove other ops as well: the walk iterates over
+    a snapshot of the block and skips ops that a previous rewrite has already
+    taken out of it.
+
+    The whole walk runs inside ``with block`` (:func:`block_context_manager`),
+    which is what lets ``visit`` build replacement ops -- and keeps coremltools
+    from re-running its expensive block bookkeeping once per rewrite.
+    """
+    rewrites = 0
+    for op in list(block.operations):
+        if op.enclosing_block is None:
+            continue
+
+        for nested_block in op.blocks:
+            rewrites += rewrite_leaf_ops(nested_block, visit)
+        if len(op.blocks) > 0:
+            continue
+
+        if visit(op, block):
+            rewrites += 1
+
+    return rewrites
+
+
+class RewritePass(AbstractGraphPass):
+    """Base class for a pass that rewrites one matched op at a time.
+
+    Subclasses implement :meth:`visit`, which :func:`rewrite_leaf_ops` calls for
+    every leaf op of every function of the program, and set ``_REWRITES`` to a
+    plural noun naming what they rewrite (it only appears in the debug log).
+    """
+
+    # What one truthy `visit` amounts to, for the debug log.
+    _REWRITES = "op(s)"
+
+    def visit(self, op, block) -> bool:
+        """Rewrite ``op`` if it matches the pass' pattern; return whether it did."""
+        raise NotImplementedError
+
+    def apply(self, prog):
+        for f in prog.functions.values():
+            rewrites = rewrite_leaf_ops(f, self.visit)
+            if rewrites:
+                # Log under the subclass' own module, as a hand-written pass would.
+                logging.getLogger(type(self).__module__).debug(
+                    "%s: rewrote %d %s", type(self).__name__, rewrites, self._REWRITES
+                )

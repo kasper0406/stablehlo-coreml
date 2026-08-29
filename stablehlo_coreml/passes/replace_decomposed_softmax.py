@@ -31,15 +31,13 @@ exponentiate to exactly 0, so the ``select`` inside the sum is redundant and
 the whole thing is ``select(mask, softmax(select(mask, x, -inf)), 0)``.
 """
 
-import logging
 
 import numpy as np
 from coremltools.converters.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 from .pattern_utils import (
+    RewritePass,
     const_int_list,
     dims_equal,
     is_broadcast_tile,
@@ -48,8 +46,6 @@ from .pattern_utils import (
     sole_consumer,
     uniform_scalar_value,
 )
-
-logger = logging.getLogger(__name__)
 
 # Shape/dtype-only ops that broadcast the reduction result back over the input.
 _BROADCAST_BACK_OPS = frozenset({"reshape", "expand_dims", "squeeze", "tile", "cast", "identity"})
@@ -269,36 +265,8 @@ def _is_statically_nonfinite(var) -> bool:
     return np.issubdtype(arr.dtype, np.floating) and not bool(np.all(np.isfinite(arr)))
 
 
-@block_context_manager
-def _replace_decomposed_softmax(block) -> int:
-    replaced = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            replaced += _replace_decomposed_softmax(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        match = _match(op)
-        if match is None:
-            continue
-        softmax_input, axis = match
-
-        softmax_var = mb.softmax(x=softmax_input, axis=axis, before_op=op, name=op.name + "_softmax")
-        block.replace_uses_of_var_after_op(
-            anchor_op=op,
-            old_var=op.outputs[0],
-            new_var=softmax_var,
-        )
-        replaced += 1
-
-    return replaced
-
-
 @register_pass(namespace="common")
-class replace_decomposed_softmax(AbstractGraphPass):
+class replace_decomposed_softmax(RewritePass):
     """
     Replace the decomposed softmax that JAX emits with MIL's ``softmax`` op.
 
@@ -339,8 +307,18 @@ class replace_decomposed_softmax(AbstractGraphPass):
     ``sub`` output becomes the softmax input.
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            replaced = _replace_decomposed_softmax(f)
-            if replaced:
-                logger.debug("replace_decomposed_softmax: replaced %d softmax chain(s)", replaced)
+    _REWRITES = "softmax chain(s)"
+
+    def visit(self, op, block) -> bool:
+        match = _match(op)
+        if match is None:
+            return False
+        softmax_input, axis = match
+
+        softmax_var = mb.softmax(x=softmax_input, axis=axis, before_op=op, name=op.name + "_softmax")
+        block.replace_uses_of_var_after_op(
+            anchor_op=op,
+            old_var=op.outputs[0],
+            new_var=softmax_var,
+        )
+        return True

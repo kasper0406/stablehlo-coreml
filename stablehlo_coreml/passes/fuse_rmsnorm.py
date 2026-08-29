@@ -75,20 +75,15 @@ percent of the estimated cost, against ~21% for the ``matmul``s. Op-count work
 of this kind should be judged on graph size, not on latency.
 """
 
-import logging
 import math
 
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from coremltools.converters.mil.mil.types.symbolic import any_symbolic
 
-from .pattern_utils import sole_consumer, uniform_const_operand, uniform_scalar_value
-
-logger = logging.getLogger(__name__)
+from .pattern_utils import RewritePass, sole_consumer, uniform_const_operand, uniform_scalar_value
 
 
 def _matches_scale_shape(val, x_shape) -> bool:
@@ -270,46 +265,8 @@ def _match(rsqrt_op, block):
     return x32, eps, tail_op, scale, dead
 
 
-@block_context_manager
-def _fuse_rmsnorm(block) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_rmsnorm(nested_block)
-        if len(op.blocks) > 0 or op.op_type != "rsqrt":
-            continue
-
-        match = _match(op, block)
-        if match is None:
-            continue
-        x32, eps, tail_op, scale, dead = match
-
-        d = int(x32.shape[-1])
-        np_dtype = types.nptype_from_builtin(x32.dtype)
-
-        normalized = mb.l2_norm(
-            x=x32, epsilon=np_dtype(d * eps), before_op=tail_op, name=tail_op.name + "_l2"
-        )
-        # The `sqrt(d)` the identity above pulls out, folded into the scale.
-        factor = math.sqrt(d) if scale is None else np.sqrt(d) * scale.astype(np.float64)
-        rescaled = mb.mul(x=normalized, y=np_dtype(factor), before_op=tail_op, name=tail_op.name)
-
-        block.replace_uses_of_var_after_op(
-            anchor_op=tail_op,
-            old_var=tail_op.outputs[0],
-            new_var=rescaled,
-        )
-        block.remove_ops(dead)
-        fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_rmsnorm(AbstractGraphPass):
+class fuse_rmsnorm(RewritePass):
     """
     Fuse the RMSNorm elementwise chain into ``l2_norm`` + a constant ``mul``.
 
@@ -348,8 +305,31 @@ class fuse_rmsnorm(AbstractGraphPass):
         %6 = mul(x=%5, y=<const sqrt(d) * scale>)
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            fused = _fuse_rmsnorm(f)
-            if fused:
-                logger.debug("fuse_rmsnorm: fused %d RMSNorm chain(s)", fused)
+    _REWRITES = "RMSNorm chain(s)"
+
+    def visit(self, op, block) -> bool:
+        if op.op_type != "rsqrt":
+            return False
+
+        match = _match(op, block)
+        if match is None:
+            return False
+        x32, eps, tail_op, scale, dead = match
+
+        d = int(x32.shape[-1])
+        np_dtype = types.nptype_from_builtin(x32.dtype)
+
+        normalized = mb.l2_norm(
+            x=x32, epsilon=np_dtype(d * eps), before_op=tail_op, name=tail_op.name + "_l2"
+        )
+        # The `sqrt(d)` the identity above pulls out, folded into the scale.
+        factor = math.sqrt(d) if scale is None else np.sqrt(d) * scale.astype(np.float64)
+        rescaled = mb.mul(x=normalized, y=np_dtype(factor), before_op=tail_op, name=tail_op.name)
+
+        block.replace_uses_of_var_after_op(
+            anchor_op=tail_op,
+            old_var=tail_op.outputs[0],
+            new_var=rescaled,
+        )
+        block.remove_ops(dead)
+        return True

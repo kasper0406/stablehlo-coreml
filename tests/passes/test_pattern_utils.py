@@ -8,6 +8,7 @@ from stablehlo_coreml.passes.pattern_utils import (
     dims_equal,
     dtype_epsilon,
     peel_to_scaled_input,
+    rewrite_leaf_ops,
     shapes_equal,
     sole_consumer,
     uniform_scalar_value,
@@ -229,3 +230,67 @@ class TestDtypeEpsilon:
 
         assert dtype_epsilon(captured["v"]) == 0.0
         assert dtype_epsilon(None) == 0.0
+
+
+class TestRewriteLeafOps:
+
+    @staticmethod
+    def _cond_prog():
+        """A program whose only ``cond`` holds an ``add`` and a ``mul``."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1,))])
+        def prog(x):
+            pred = mb.squeeze(x=mb.less(x=x, y=1.0))
+            return mb.cond(
+                pred=pred,
+                _true_fn=lambda: mb.add(x=x, y=1.0),
+                _false_fn=lambda: mb.mul(x=x, y=2.0),
+            )
+
+        return prog
+
+    def test_descends_into_nested_blocks_instead_of_visiting_their_parent(self):
+        main = self._cond_prog().functions["main"]
+        seen = []
+
+        def visit(op, block):
+            seen.append((op.op_type, block is main))
+
+        assert rewrite_leaf_ops(main, visit) == 0
+        assert ("cond", True) not in seen
+        assert ("less", True) in seen
+        # The ops of the two branches are visited with their own block.
+        assert ("add", False) in seen
+        assert ("mul", False) in seen
+
+    def test_counts_the_truthy_visits_of_every_block(self):
+        main = self._cond_prog().functions["main"]
+        assert rewrite_leaf_ops(main, lambda op, block: op.op_type in ("add", "mul")) == 2
+
+    def test_skips_ops_a_previous_visit_removed(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4,))])
+        def prog(x):
+            a = mb.identity(x=x, name="a")
+            b = mb.identity(x=a, name="b")
+            return mb.identity(x=b, name="c")
+
+        seen = []
+
+        def visit(op, block):
+            """Fuse ``a -> b`` into a single op, the way a real pass would."""
+            seen.append(op.name)
+            if op.name != "a":
+                return False
+            consumer = op.outputs[0].child_ops[0]
+            fused = mb.identity(x=op.x, before_op=op, name="fused")
+            block.replace_uses_of_var_after_op(
+                anchor_op=consumer, old_var=consumer.outputs[0], new_var=fused
+            )
+            block.remove_ops([consumer, op])
+            return True
+
+        main = prog.functions["main"]
+        assert rewrite_leaf_ops(main, visit) == 1
+        # `b` is gone by the time the walk reaches it, and the replacement op is
+        # not visited either -- the walk iterates over a snapshot of the block.
+        assert seen == ["a", "c"]
+        assert [op.name for op in main.operations] == ["fused", "c"]

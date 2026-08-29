@@ -15,18 +15,13 @@ is fused; the softcap shape (``alpha * beta == 1``, where the composition is the
 identity for small ``x``) is just the common case, not a requirement.
 """
 
-import logging
 
 import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import sole_consumer, uniform_const_operand
-
-logger = logging.getLogger(__name__)
+from .pattern_utils import RewritePass, sole_consumer, uniform_const_operand
 
 
 def _scalar_operand(op):
@@ -103,40 +98,8 @@ def _match(mul_op, block):
     return None
 
 
-@block_context_manager
-def _fuse_logit_softcap(block) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_logit_softcap(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        match = _match(op, block)
-        if match is None:
-            continue
-        x, alpha, beta = match
-
-        # `alpha`/`beta` are `const T`, with T the element type of `x`.
-        dtype = types.nptype_from_builtin(x.dtype)
-        capped = mb.scaled_tanh(
-            x=x,
-            alpha=dtype(alpha),
-            beta=dtype(beta),
-            before_op=op,
-            name=op.outputs[0].name,
-        )
-        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=capped)
-        fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_logit_softcap(AbstractGraphPass):
+class fuse_logit_softcap(RewritePass):
     """
     Fuse ``alpha * tanh(beta * x)`` into ``scaled_tanh(x, alpha, beta)``.
 
@@ -159,8 +122,22 @@ class fuse_logit_softcap(AbstractGraphPass):
         %3 = scaled_tanh(x=%0, alpha=30.0, beta=0.0333)
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            fused = _fuse_logit_softcap(f)
-            if fused:
-                logger.debug("fuse_logit_softcap: fused %d scaled tanh(s)", fused)
+    _REWRITES = "scaled tanh(s)"
+
+    def visit(self, op, block) -> bool:
+        match = _match(op, block)
+        if match is None:
+            return False
+        x, alpha, beta = match
+
+        # `alpha`/`beta` are `const T`, with T the element type of `x`.
+        dtype = types.nptype_from_builtin(x.dtype)
+        capped = mb.scaled_tanh(
+            x=x,
+            alpha=dtype(alpha),
+            beta=dtype(beta),
+            before_op=op,
+            name=op.outputs[0].name,
+        )
+        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=capped)
+        return True

@@ -17,23 +17,19 @@ only recognises the algebraically equivalent but structurally different
 than duplicating it.
 """
 
-import logging
 import math
 
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 from .pattern_utils import (
+    RewritePass,
     peel_to_scaled_input,
     shapes_equal,
     sole_consumer,
     uniform_const_operand,
     uniform_scalar_value,
 )
-
-logger = logging.getLogger(__name__)
 
 # Absolute tolerances on the constants of the pattern.
 _HALF_TOLERANCE = 1e-4
@@ -111,31 +107,8 @@ def _match(mul_op, block):
     return None
 
 
-@block_context_manager
-def _fuse_gelu_erfc(block) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_gelu_erfc(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        x = _match(op, block)
-        if x is None:
-            continue
-
-        gelu = mb.gelu(x=x, mode="EXACT", before_op=op, name=op.outputs[0].name)
-        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=gelu)
-        fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_gelu_erfc(AbstractGraphPass):
+class fuse_gelu_erfc(RewritePass):
     """
     Fuse ``0.5 * x * (1 - erf(k * x))`` with ``k == -1/sqrt(2)`` into
     ``gelu(x, mode="EXACT")``.
@@ -157,8 +130,13 @@ class fuse_gelu_erfc(AbstractGraphPass):
         %6 = gelu(x=%0, mode="EXACT")
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            fused = _fuse_gelu_erfc(f)
-            if fused:
-                logger.debug("fuse_gelu_erfc: fused %d exact GELU(s)", fused)
+    _REWRITES = "exact GELU(s)"
+
+    def visit(self, op, block) -> bool:
+        x = _match(op, block)
+        if x is None:
+            return False
+
+        gelu = mb.gelu(x=x, mode="EXACT", before_op=op, name=op.outputs[0].name)
+        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=gelu)
+        return True

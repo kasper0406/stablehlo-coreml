@@ -9,15 +9,10 @@ constant weights). The pass therefore runs before the first
 ``const_elimination`` in the pipeline.
 """
 
-import logging
 
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import aligned_dim, const_int_list, dims_equal, is_broadcast_tile
-
-logger = logging.getLogger(__name__)
+from .pattern_utils import RewritePass, aligned_dim, const_int_list, dims_equal, is_broadcast_tile
 
 # Ops that support implicit NumPy-style broadcasting of their operands.
 #
@@ -115,38 +110,8 @@ def _can_remove(op, block) -> bool:
     return True
 
 
-@block_context_manager
-def _remove_broadcast_tiles(block) -> int:
-    removed = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            removed += _remove_broadcast_tiles(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        if not _can_remove(op, block):
-            continue
-
-        # The replacement changes the shape of the operand, so type inference on
-        # the consumers must be skipped (`no_check_var_types`). That is safe: we
-        # verified above that every consumer keeps its current output shape.
-        block.replace_uses_of_var_after_op(
-            anchor_op=op,
-            old_var=op.outputs[0],
-            new_var=op.x,
-            no_check_var_types=True,
-        )
-        op.remove_from_block()
-        removed += 1
-
-    return removed
-
-
 @register_pass(namespace="common")
-class remove_broadcast_tiles(AbstractGraphPass):
+class remove_broadcast_tiles(RewritePass):
     """
     Remove ``tile`` ops that only implement NumPy broadcasting for consumers
     that broadcast natively.
@@ -171,8 +136,20 @@ class remove_broadcast_tiles(AbstractGraphPass):
         %3 = add(x=%0, y=%1)
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            removed = _remove_broadcast_tiles(f)
-            if removed:
-                logger.debug("remove_broadcast_tiles: removed %d tile op(s)", removed)
+    _REWRITES = "tile op(s)"
+
+    def visit(self, op, block) -> bool:
+        if not _can_remove(op, block):
+            return False
+
+        # The replacement changes the shape of the operand, so type inference on
+        # the consumers must be skipped (`no_check_var_types`). That is safe: we
+        # verified above that every consumer keeps its current output shape.
+        block.replace_uses_of_var_after_op(
+            anchor_op=op,
+            old_var=op.outputs[0],
+            new_var=op.x,
+            no_check_var_types=True,
+        )
+        op.remove_from_block()
+        return True
