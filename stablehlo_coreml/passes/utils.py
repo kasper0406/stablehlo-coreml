@@ -91,6 +91,11 @@ _FUSION_ANCHOR = "common::fuse_matmul_weight_bias"
 _LATE_FUSION_ANCHOR = "common::fuse_reduce_mean"
 
 
+def _contains_group(passes: list[str], group: list[str]) -> bool:
+    """Whether ``group`` appears as a contiguous run anywhere in ``passes``."""
+    return any(passes[i:i + len(group)] == group for i in range(len(passes) - len(group) + 1))
+
+
 def _insert_passes(
     pipeline: ct.PassPipeline,
     pass_names: list[str],
@@ -106,12 +111,14 @@ def _insert_passes(
     we need them right between our own passes. A pass may legitimately appear in
     more than one group (``fuse_reduce_keep_dims`` runs both in ``CLEANUP_PASSES``
     and in ``LATE_FUSION_PASSES``), so "already inserted" is decided per group --
-    the group is skipped only when it already occupies the slot next to its
-    anchor, which is what makes re-inserting into a pipeline that already has the
-    groups a no-op. If ``anchor`` is not part of the pipeline, ``fallback_index``
-    is used instead (``None`` meaning "append at the end").
+    the group is skipped when its whole sequence already runs somewhere in the
+    pipeline, wherever that is. Looking for the group itself rather than at the
+    slot next to the anchor is what keeps re-inserting a no-op even for a base
+    that has no anchors at all (where every group lands on a fallback index). If
+    ``anchor`` is not part of the pipeline, ``fallback_index`` is used instead
+    (``None`` meaning "append at the end").
     """
-    if len(pass_names) == 0:
+    if _contains_group(pipeline.passes, pass_names):
         return
 
     if anchor in pipeline.passes:
@@ -120,13 +127,6 @@ def _insert_passes(
         index = len(pipeline.passes)
     else:
         index = fallback_index
-
-    if after:
-        occupied = pipeline.passes[index:index + len(pass_names)]
-    else:
-        occupied = pipeline.passes[max(index - len(pass_names), 0):index]
-    if occupied == pass_names:
-        return
 
     for offset, pass_name in enumerate(pass_names):
         pipeline.insert_pass(index=index + offset, pass_name=pass_name)

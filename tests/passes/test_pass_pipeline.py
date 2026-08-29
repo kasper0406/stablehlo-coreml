@@ -90,6 +90,17 @@ def test_build_pass_pipeline_is_idempotent():
     assert twice.passes == once.passes
 
 
+def test_build_pass_pipeline_is_idempotent_without_the_anchors():
+    """Without the anchors every group lands on a fallback index, which is no
+    slot the second call could look at -- it has to find the groups themselves."""
+    base = ct.PassPipeline.EMPTY
+    base.passes = ["common::noop_elimination"]
+
+    once = build_pass_pipeline(base)
+    twice = build_pass_pipeline(once)
+    assert twice.passes == once.passes
+
+
 def test_build_pass_pipeline_with_base_missing_the_anchors():
     """Without the anchors, cleanup passes go first and fusion passes last."""
     base = ct.PassPipeline.EMPTY
@@ -116,11 +127,11 @@ def test_group_is_inserted_even_when_the_base_already_has_one_of_its_passes():
     """Insertion is decided per group, not per pass.
 
     A pass may belong to two groups (`fuse_reduce_keep_dims`), so "already in the
-    pipeline" cannot mean "skip it". The group is skipped only when it already
-    occupies the slot next to its anchor -- which is what keeps
-    `build_pass_pipeline` idempotent. A stray copy elsewhere in the base is
-    therefore left where it is and the group is inserted anyway; our passes are
-    idempotent, so the duplicate is harmless.
+    pipeline" cannot mean "skip it". The group is skipped only when its whole
+    sequence already runs somewhere in the pipeline -- which is what keeps
+    `build_pass_pipeline` idempotent. A stray copy of a single pass is therefore
+    left where it is and the group is inserted anyway; our passes are idempotent,
+    so the duplicate is harmless.
     """
     base = ct.PassPipeline.EMPTY
     base.passes = ["common::fuse_reduce_keep_dims", "common::const_elimination"]
