@@ -1,15 +1,28 @@
+from collections import Counter
+
 import coremltools as ct
 import pytest
 
 from stablehlo_coreml import build_pass_pipeline
-from stablehlo_coreml.passes.utils import CLEANUP_PASSES, DEFAULT_HLO_PIPELINE, FUSION_PASSES
+from stablehlo_coreml.passes.utils import (
+    CLEANUP_PASSES,
+    DEFAULT_HLO_PIPELINE,
+    FUSION_PASSES,
+    LATE_FUSION_PASSES,
+)
 
 DCE_PASS_NAME = "common::dead_code_elimination"
 # The groups interleave coremltools' DCE with our own passes, so the same name
 # appears several times; only our own passes are expected in the pipeline exactly
 # once.
-ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES))
+ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES))
 OUR_PASSES = [name for name in ALL_PASSES if name != DCE_PASS_NAME]
+# Most of our passes run once, but a pass may belong to more than one group:
+# `fuse_reduce_keep_dims` runs in the cleanup slot and again in the late-fusion
+# slot, where `fuse_reduce_mean` has just made new reduce/reshape pairs visible.
+EXPECTED_PASS_COUNTS = Counter(
+    name for name in CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES if name != DCE_PASS_NAME
+)
 
 
 @pytest.mark.parametrize("pass_name", ALL_PASSES)
@@ -19,8 +32,18 @@ def test_pass_is_registered(pass_name):
 
 
 @pytest.mark.parametrize("pass_name", OUR_PASSES)
-def test_default_pipeline_contains_each_pass_exactly_once(pass_name):
-    assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == 1
+def test_default_pipeline_contains_each_pass_once_per_group(pass_name):
+    assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == EXPECTED_PASS_COUNTS[pass_name]
+
+
+def test_fuse_reduce_keep_dims_runs_again_in_the_late_fusion_group():
+    """The keep-dims reshape only becomes adjacent to its reduction once
+    `fuse_reduce_mean` has folded `reduce_sum -> mul(1/N)` into one op."""
+    passes = build_pass_pipeline().passes
+    occurrences = [i for i, name in enumerate(passes) if name == "common::fuse_reduce_keep_dims"]
+    assert len(occurrences) == 2
+    assert occurrences[0] < passes.index("common::fuse_reduce_mean") < occurrences[1]
+    assert occurrences[1] < passes.index("common::fuse_rmsnorm")
 
 
 def test_cleanup_passes_run_before_first_const_elimination():
@@ -33,6 +56,13 @@ def test_fusion_passes_run_before_fuse_matmul_weight_bias():
     passes = build_pass_pipeline().passes
     anchor = passes.index("common::fuse_matmul_weight_bias")
     assert passes[anchor - len(FUSION_PASSES):anchor] == FUSION_PASSES
+
+
+def test_late_fusion_passes_run_after_fuse_reduce_mean():
+    """`fuse_rmsnorm` needs the `reduce_mean` that coremltools' pass creates."""
+    passes = build_pass_pipeline().passes
+    anchor = passes.index("common::fuse_reduce_mean") + 1
+    assert passes[anchor:anchor + len(LATE_FUSION_PASSES)] == LATE_FUSION_PASSES
 
 
 def test_build_pass_pipeline_returns_distinct_objects():
@@ -67,7 +97,10 @@ def test_build_pass_pipeline_with_base_missing_the_anchors():
 
     pipeline = build_pass_pipeline(base)
     assert pipeline.passes == (
-        CLEANUP_PASSES + ["common::noop_elimination", DCE_PASS_NAME] + FUSION_PASSES
+        CLEANUP_PASSES
+        + ["common::noop_elimination", DCE_PASS_NAME]
+        + FUSION_PASSES
+        + LATE_FUSION_PASSES
     )
 
 
@@ -77,3 +110,21 @@ def test_build_pass_pipeline_preserves_pass_options():
 
     pipeline = build_pass_pipeline(base)
     assert "common::const_elimination" in pipeline._pass_options
+
+
+def test_group_is_inserted_even_when_the_base_already_has_one_of_its_passes():
+    """Insertion is decided per group, not per pass.
+
+    A pass may belong to two groups (`fuse_reduce_keep_dims`), so "already in the
+    pipeline" cannot mean "skip it". The group is skipped only when it already
+    occupies the slot next to its anchor -- which is what keeps
+    `build_pass_pipeline` idempotent. A stray copy elsewhere in the base is
+    therefore left where it is and the group is inserted anyway; our passes are
+    idempotent, so the duplicate is harmless.
+    """
+    base = ct.PassPipeline.EMPTY
+    base.passes = ["common::fuse_reduce_keep_dims", "common::const_elimination"]
+
+    passes = build_pass_pipeline(base).passes
+    assert passes[: len(CLEANUP_PASSES) + 1] == ["common::fuse_reduce_keep_dims"] + CLEANUP_PASSES
+    assert passes.count("common::fuse_reduce_keep_dims") == 3
