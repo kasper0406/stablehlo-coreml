@@ -14,28 +14,69 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
+from .pattern_utils import const_int_list, dims_equal, shapes_equal
+
+
+def _mask_values(var, rank) -> list[bool] | None:
+    """A ``slice_update`` boolean mask as a list of ``rank`` values.
+
+    An absent mask reads as all-``False``, which is what the op defaults to.
+    ``None`` when the mask is present but not a compile-time constant of the
+    expected length, so that callers give up on the match.
+    """
+    if var is None:
+        return [False] * rank
+    val = getattr(var, "val", None)
+    if val is None:
+        return None
+    values = [bool(v) for v in np.asarray(val).reshape(-1)]
+    return values if len(values) == rank else None
+
 
 def _match_pattern(op):
-    if op.op_type == "slice_update":
-        if op.x.shape is None or op.update.shape is None:
-            return False
+    if op.op_type != "slice_update":
+        return False
 
-        x_rank = len(op.x.shape)
+    if op.x.shape is None:
+        return False
 
-        x_and_update_shape_matches = op.x.shape == op.update.shape
+    x_shape = tuple(op.x.shape)
+    x_rank = len(x_shape)
 
-        all_zeros_start_indices_array = np.array([0] * x_rank, dtype=np.int32)
-        start_values_all_zero = np.array_equal(op.begin.val, all_zeros_start_indices_array)
+    # `begin_mask[i]` neglects `begin[i]`, and `squeeze_mask[i]` turns the axis
+    # into a pure index that drops out of the result. Neither is the plain
+    # full-tensor write this pass rewrites. A squeeze also lowers the update's
+    # rank, so the shape check below rejects it anyway -- the explicit guard
+    # keeps that from being an accident.
+    begin_mask = _mask_values(op.begin_mask, x_rank)
+    squeeze_mask = _mask_values(op.squeeze_mask, x_rank)
+    if begin_mask is None or squeeze_mask is None or any(begin_mask) or any(squeeze_mask):
+        return False
 
-        end_values_matches_x_shape = np.array_equal(op.end.val, op.x.shape)
+    # Symbolic dimensions compare structurally: the update has to be shaped by
+    # the very same symbols as the buffer it overwrites.
+    if not shapes_equal(x_shape, op.update.shape):
+        return False
 
-        all_one_strides_array = np.array([1] * x_rank, dtype=np.int32)
-        strides_all_one = not op.stride or np.array_equal(op.stride.val, all_one_strides_array)
-        no_extra_options = strides_all_one and not op.begin_mask and not op.end_mask
+    if const_int_list(op.begin) != [0] * x_rank:
+        return False
 
-        return x_and_update_shape_matches and start_values_all_zero and end_values_matches_x_shape and no_extra_options
+    if op.stride is not None and const_int_list(op.stride) != [1] * x_rank:
+        return False
 
-    return False
+    end_mask = _mask_values(op.end_mask, x_rank)
+    end = const_int_list(op.end)
+    if end_mask is None or end is None or len(end) != x_rank:
+        return False
+
+    # `end_mask[i] == True` *means* "up to the end of axis i", so it covers the
+    # axis whatever its size. Without it the axis has to be concrete for
+    # `end[i]` to provably cover it: `end` holds constant ints, and a symbolic
+    # dimension is never provably equal to one.
+    return all(
+        covers_axis or dims_equal(dim, stop)
+        for covers_axis, dim, stop in zip(end_mask, x_shape, end)
+    )
 
 
 def _renames_function_input(slice_update_op, new_var) -> bool:
@@ -89,9 +130,7 @@ def _remove_noop_slice_update(block):
             continue
 
         for b in op.blocks:
-            block_changed = True
-            while block_changed:
-                block_changed = _remove_noop_slice_update(b)
+            did_optimize |= _remove_noop_slice_update(b)
         if len(op.blocks) > 0:
             continue
 
@@ -120,6 +159,9 @@ class remove_noop_slice_update(AbstractGraphPass):
         %1 = <tensor of shape S>
         %3 = some_op(%1)
         ...
+
+    A symbolic dimension of S is only ever covered through `end_mask`, since a
+    constant `end` is never provably equal to a symbol.
     """
     def apply(self, prog):
         for f in prog.functions.values():
