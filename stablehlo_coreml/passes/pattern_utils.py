@@ -18,6 +18,7 @@ from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 __all__ = [
+    "aligned_dim",
     "broadcast_shapes",
     "const_int_list",
     "const_scaled_operand",
@@ -106,6 +107,21 @@ def shapes_equal(a, b) -> bool:
     if len(a) != len(b):
         return False
     return all(dims_equal(x, y) for x, y in zip(a, b))
+
+
+def aligned_dim(operand, out_axis: int, out_rank: int):
+    """``operand``'s dimension at output axis ``out_axis``, NumPy-aligned to the right.
+
+    Axes that broadcasting prepends to a lower-rank operand read as 1.
+    ``None`` when the operand's shape is unknown.
+    """
+    shape = operand.shape
+    if shape is None:
+        return None
+    axis = out_axis - (out_rank - len(shape))
+    if axis < 0:
+        return 1
+    return shape[axis]
 
 
 def _broadcast_dims(a, b):
