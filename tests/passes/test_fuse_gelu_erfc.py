@@ -92,6 +92,30 @@ class TestFuseGeluErfc:
         _apply(prog)
         assert get_op_types_in_program(prog) == ["gelu"]
 
+    def test_not_fused_when_a_uniform_constant_broadcasts_x(self):
+        """A uniform constant is matched whatever its shape -- including a wider one.
+
+        `0.5 * x` is then `(4, 8)` while `gelu(x)` would be `(4, 1)`, so fusing
+        would silently drop the broadcast.
+        """
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 1))])
+        def prog(x):
+            return _erfc_gelu(x, half=np.full((4, 8), 0.5, dtype=np.float32))
+
+        _apply(prog)
+        assert "gelu" not in get_op_types_in_program(prog)
+        assert prog.functions["main"].outputs[0].shape == (4, 8)
+
+    def test_not_fused_when_a_fill_broadcasts_x(self):
+        """Same, for the `fill` spelling of a uniform constant."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 1))])
+        def prog(x):
+            return _erfc_gelu(x, half=mb.fill(shape=(4, 8), value=0.5))
+
+        _apply(prog)
+        assert "gelu" not in get_op_types_in_program(prog)
+        assert prog.functions["main"].outputs[0].shape == (4, 8)
+
     def test_not_fused_for_the_wrong_factor(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(4, 8))])
         def prog(x):

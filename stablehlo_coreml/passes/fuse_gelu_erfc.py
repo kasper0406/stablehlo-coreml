@@ -27,6 +27,7 @@ from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 from .pattern_utils import (
     peel_to_scaled_input,
+    shapes_equal,
     sole_consumer,
     uniform_const_operand,
     uniform_scalar_value,
@@ -99,6 +100,11 @@ def _match(mul_op, block):
             if abs(factor - _FACTOR) > _FACTOR_TOLERANCE:
                 continue
             if not _match_half_x(half_var, candidate, block):
+                continue
+            # A uniform constant of the pattern is accepted whatever its shape, so
+            # it may broadcast `x`; `gelu(x)` has `x`'s shape and cannot replace a
+            # wider result.
+            if not shapes_equal(mul_op.outputs[0].shape, candidate.shape):
                 continue
             return candidate
 
