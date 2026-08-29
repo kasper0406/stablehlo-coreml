@@ -928,8 +928,12 @@ def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
         return mask
 
     # A finite fill (-1e9, torch's `finfo(dtype).min`, ...) keeps a fully masked
-    # row finite -- softmax turns it into a uniform row -- while a boolean mask
-    # would turn it into NaN. Reproduce it as an additive mask.
+    # row finite, where a boolean mask would turn it into NaN. An additive mask
+    # preserves that -- and only that. `select` *replaces* the row with `fill`,
+    # so softmax makes it uniform; adding `fill` shifts the scores instead, and
+    # softmax is shift invariant, so the row comes out as softmax(scores). The
+    # two agree once |fill| is large enough that `score + fill` rounds back to
+    # `fill` in the operand dtype, which is the regime the usual fills live in.
     float_mask = mb.cast(
         x=mask,
         dtype=types.builtin_to_string(query.dtype),
@@ -1131,10 +1135,17 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
 
     - ``finite_fill_mask``: how to translate a ``select`` whose fill value is a
       large but finite negative number (``-1e9``, ``torch.finfo(dtype).min``).
-      ``"additive"`` (the default) emits a float mask so that a fully masked row
-      stays finite, exactly like the original graph; ``"bool"`` emits the
-      boolean condition instead, which is cheaper but turns such rows into NaN.
-      Only a fill of exactly ``-inf`` maps to a boolean mask unconditionally.
+      ``"additive"`` (the default) emits a float mask, which keeps a fully
+      masked row finite and NaN-free as the original graph did; ``"bool"``
+      emits the boolean condition instead, which is cheaper but turns such rows
+      into NaN. What ``"additive"`` does *not* reproduce is the value of a
+      fully masked row: ``select`` replaces the scores with ``fill`` and
+      softmax makes the row uniform, whereas adding ``fill`` leaves
+      softmax(scores) untouched. The two only coincide once ``|fill|`` is large
+      enough for ``score + fill`` to round back to ``fill`` in the operand
+      dtype -- which is what the fills in use do, but a fill sitting just at
+      the threshold does not. Only a fill of exactly ``-inf`` maps to a boolean
+      mask unconditionally.
     - ``max_head_dim`` / ``max_key_len``: leave an attention block unfused when
       its head dimension ``E``, respectively its key length ``S``, is larger
       than the bound (or symbolic, i.e. unknown). ``None`` (the default) fuses

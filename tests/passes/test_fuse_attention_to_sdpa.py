@@ -1394,7 +1394,15 @@ class TestFuseAttentionToSdpaEndToEnd:
         self._assert_fused(cml_model, expected=2)
 
     def test_fully_masked_row_stays_finite(self):
-        """The additive mask keeps a fully masked row finite, as -1e9 did."""
+        """The additive mask keeps a fully masked row finite, as -1e9 did.
+
+        The *values* of that row only match because -1e9 swamps the scores: in
+        fp32 an ulp at 1e9 is 64, so `score + (-1e9) == -1e9` for the O(1)
+        scores below and softmax sees the uniform row the `select` produced. A
+        fill close to `_MASK_FILL_THRESHOLD` (-1e4) would not round the scores
+        away and the fused row would differ; see `finite_fill_mask` in the pass
+        docstring.
+        """
         from tests.utils import run_and_compare_specific_input  # noqa: PLC0415
 
         def attention(q, k, v, mask):
