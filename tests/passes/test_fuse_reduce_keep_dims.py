@@ -92,6 +92,79 @@ class TestFuseReduceKeepDims:
         assert get_op_types_in_program(prog) == ["reduce_sum"]
         assert prog.functions["main"].outputs[0].shape == (batch, 8, 1)
 
+    @pytest.mark.parametrize("reduce_op", sorted(_REDUCE_OPS))
+    def test_expand_dims_is_fused(self, reduce_op):
+        """`op_dynamic_broadcast_in_dim` spells the keep-dims axis as `expand_dims`."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
+        def prog(x):
+            reduced = getattr(mb, reduce_op)(x=x, axes=[2], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[2])
+
+        assert get_op_types_in_program(prog) == [reduce_op, "expand_dims"]
+        _apply(prog)
+        assert get_op_types_in_program(prog) == [reduce_op]
+
+        fused = _ops_of_type(prog, reduce_op)
+        assert len(fused) == 1
+        assert fused[0].keep_dims.val
+        assert prog.functions["main"].outputs[0].shape == (2, 8, 1)
+        assert_model_is_valid(
+            prog, {"x": (2, 8, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
+        )
+
+    def test_expand_dims_with_negative_axes_is_fused(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
+        def prog(x):
+            reduced = mb.reduce_sum(x=x, axes=[-1], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[-1])
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["reduce_sum"]
+        assert prog.functions["main"].outputs[0].shape == (2, 8, 1)
+
+    def test_expand_dims_over_multiple_axes_is_fused(self):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
+        def prog(x):
+            reduced = mb.reduce_sum(x=x, axes=[0, 2], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[0, 2])
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["reduce_sum"]
+        assert prog.functions["main"].outputs[0].shape == (1, 8, 1)
+
+    def test_expand_dims_with_symbolic_dims_is_fused(self):
+        """The shape the dynamic lowering actually produces: a symbolic leading dim."""
+        batch = get_new_symbol()
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(batch, 8))])
+        def prog(x):
+            reduced = mb.reduce_sum(x=x, axes=[1], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[1])
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["reduce_sum"]
+        assert prog.functions["main"].outputs[0].shape == (batch, 1)
+
+    def test_expand_dims_in_the_wrong_place_is_untouched(self):
+        """`(2, 8, 16) -> reduce axis 1 -> (2, 16)` expanded at axis 2, not axis 1."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
+        def prog(x):
+            reduced = mb.reduce_sum(x=x, axes=[1], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[2])
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["reduce_sum", "expand_dims"]
+
+    def test_expand_dims_adding_an_extra_axis_is_untouched(self):
+        """Two inserted axes for a single reduced one is not the keep-dims shape."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
+        def prog(x):
+            reduced = mb.reduce_sum(x=x, axes=[2], keep_dims=False)
+            return mb.expand_dims(x=reduced, axes=[0, 3])
+
+        _apply(prog)
+        assert get_op_types_in_program(prog) == ["reduce_sum", "expand_dims"]
+
     def test_keep_dims_already_true_is_untouched(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8, 16))])
         def prog(x):
@@ -237,3 +310,24 @@ class TestFuseReduceKeepDimsEndToEnd:
         ops = get_model_instruction_types(cml_model)
         assert ops.count("reduce_sum") == 1
         assert "reshape" not in ops
+        # Under symbolic shapes the keep-dims axis arrives as an `expand_dims`,
+        # not a `reshape`.
+        assert "expand_dims" not in ops
+
+    def test_symbolic_batch_dim_with_downstream_consumer(self):
+        """The `expand_dims` sits between the reduce and the op consuming it."""
+        symbolic_shape = jax.export.symbolic_shape("(b, 8)")
+
+        def f(x):
+            return x - jnp.max(x, axis=-1, keepdims=True)
+
+        from tests.utils import run_and_compare_symbolic  # noqa: PLC0415
+
+        cml_model = run_and_compare_symbolic(
+            f,
+            [jax.ShapeDtypeStruct(symbolic_shape, jnp.float32)],
+            [(np.zeros((3, 8), dtype=np.float32),), (np.ones((5, 8), dtype=np.float32),)],
+        )
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("reduce_max") == 1
+        assert "expand_dims" not in ops

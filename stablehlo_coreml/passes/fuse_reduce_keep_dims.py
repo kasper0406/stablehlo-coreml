@@ -1,4 +1,4 @@
-"""MIL pass: fold a keep-dims ``reshape`` back into the reduction that feeds it.
+"""MIL pass: fold a keep-dims ``reshape``/``expand_dims`` back into its reduction.
 
 StableHLO's ``reduce`` always drops the reduced dimensions, so JAX's
 ``jnp.sum(x, axis, keepdims=True)`` lowers to a ``reduce`` followed by a
@@ -14,6 +14,16 @@ into that single op is not just cosmetic: several of coremltools' own fusions
 to be directly followed by the arithmetic that consumes it, and the intervening
 ``reshape`` blocks them. With this pass in place an RMSNorm
 (``x * rsqrt(mean(x**2, -1, keepdims=True) + eps)``) becomes a ``reduce_mean``.
+
+Under symbolic (dynamic) shapes the very same JAX source lowers to
+``stablehlo.dynamic_broadcast_in_dim`` instead, and ``op_dynamic_broadcast_in_dim``
+re-inserts the axes with ``expand_dims`` rather than ``reshape`` (a ``reshape``
+would need the runtime shape as an operand)::
+
+    %r = reduce_sum(x=%x, axes=[1], keep_dims=False)   # %x: (dim_0, 8) -> (dim_0,)
+    %o = expand_dims(x=%r, axes=[1])                   # (dim_0, 1)
+
+so both spellings are matched.
 """
 
 import logging
@@ -73,9 +83,17 @@ def _keep_dims_shape(x_shape, axes: list[int]) -> tuple:
     return tuple(shape)
 
 
+# The ops that can spell out "re-insert the axes the reduction dropped": a
+# `reshape` to the keep-dims shape (static shapes) or an `expand_dims` on the
+# reduced axes (dynamic shapes, from `op_dynamic_broadcast_in_dim`). Both are
+# order-preserving, so matching the output shape is enough to prove either is
+# the keep-dims shape -- see `_match`.
+_RESTORE_OPS = frozenset({"reshape", "expand_dims"})
+
+
 def _match(reshape_op, block):
     """Return ``(reduce_op, axes)`` if ``reshape_op`` only re-inserts the reduced axes."""
-    if reshape_op.op_type != "reshape":
+    if reshape_op.op_type not in _RESTORE_OPS:
         return None
 
     reduce_op = reshape_op.x.op
@@ -147,17 +165,21 @@ def _fuse_reduce_keep_dims(block) -> int:
 @register_pass(namespace="common")
 class fuse_reduce_keep_dims(AbstractGraphPass):
     """
-    Fuse ``reduce_*(keep_dims=False) -> reshape(<keep-dims shape>)`` into a
-    single ``reduce_*(keep_dims=True)``.
+    Fuse ``reduce_*(keep_dims=False) -> reshape/expand_dims(<keep-dims shape>)``
+    into a single ``reduce_*(keep_dims=True)``.
 
     The rewrite applies when
 
     1. the reduce is one of the ops whose builder takes ``axes`` + ``keep_dims``
        (the arg-reductions are excluded),
     2. ``axes`` is known at compile time, and
-    3. the reshape output shape is exactly the reduce input shape with the
-       reduced axes set to 1 (compared symbolically, so dynamic dimensions are
-       preserved).
+    3. the ``reshape``/``expand_dims`` output shape is exactly the reduce input
+       shape with the reduced axes set to 1 (compared symbolically, so dynamic
+       dimensions are preserved).
+
+    Neither ``reshape`` nor ``expand_dims`` reorders elements, so an output
+    shape equal to the keep-dims shape is enough to prove the op is the identity
+    on the reduction's result.
 
     When the reduce has consumers besides the reshape it is kept for them and
     only the reshape is replaced.
@@ -168,6 +190,13 @@ class fuse_reduce_keep_dims(AbstractGraphPass):
 
     Result:
         %2 = reduce_sum(x=%0, axes=[2], keep_dims=True)
+
+    Given:
+        %1 = reduce_sum(x=%0, axes=[1], keep_dims=False)   # %0: (dim_0, 8)
+        %2 = expand_dims(x=%1, axes=[1])
+
+    Result:
+        %2 = reduce_sum(x=%0, axes=[1], keep_dims=True)
     """
 
     def apply(self, prog):
