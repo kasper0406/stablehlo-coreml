@@ -6,7 +6,6 @@ import pytest
 from stablehlo_coreml import build_pass_pipeline
 from stablehlo_coreml.passes.utils import (
     CLEANUP_PASSES,
-    DEFAULT_HLO_PIPELINE,
     FUSION_PASSES,
     LATE_FUSION_PASSES,
 )
@@ -33,7 +32,7 @@ def test_pass_is_registered(pass_name):
 
 @pytest.mark.parametrize("pass_name", OUR_PASSES)
 def test_default_pipeline_contains_each_pass_once_per_group(pass_name):
-    assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == EXPECTED_PASS_COUNTS[pass_name]
+    assert build_pass_pipeline().passes.count(pass_name) == EXPECTED_PASS_COUNTS[pass_name]
 
 
 def test_fuse_reduce_keep_dims_runs_again_in_the_late_fusion_group():
@@ -74,7 +73,7 @@ def test_build_pass_pipeline_returns_distinct_objects():
 
     first.append_pass(DCE_PASS_NAME)
     assert first.passes != second.passes
-    assert DEFAULT_HLO_PIPELINE.passes == second.passes
+    assert build_pass_pipeline().passes == second.passes
 
 
 def test_build_pass_pipeline_does_not_mutate_the_base():
@@ -86,6 +85,17 @@ def test_build_pass_pipeline_does_not_mutate_the_base():
 
 def test_build_pass_pipeline_is_idempotent():
     once = build_pass_pipeline()
+    twice = build_pass_pipeline(once)
+    assert twice.passes == once.passes
+
+
+def test_build_pass_pipeline_is_idempotent_without_the_anchors():
+    """Without the anchors every group lands on a fallback index, which is no
+    slot the second call could look at -- it has to find the groups themselves."""
+    base = ct.PassPipeline.EMPTY
+    base.passes = ["common::noop_elimination"]
+
+    once = build_pass_pipeline(base)
     twice = build_pass_pipeline(once)
     assert twice.passes == once.passes
 
@@ -116,11 +126,11 @@ def test_group_is_inserted_even_when_the_base_already_has_one_of_its_passes():
     """Insertion is decided per group, not per pass.
 
     A pass may belong to two groups (`fuse_reduce_keep_dims`), so "already in the
-    pipeline" cannot mean "skip it". The group is skipped only when it already
-    occupies the slot next to its anchor -- which is what keeps
-    `build_pass_pipeline` idempotent. A stray copy elsewhere in the base is
-    therefore left where it is and the group is inserted anyway; our passes are
-    idempotent, so the duplicate is harmless.
+    pipeline" cannot mean "skip it". The group is skipped only when its whole
+    sequence already runs somewhere in the pipeline -- which is what keeps
+    `build_pass_pipeline` idempotent. A stray copy of a single pass is therefore
+    left where it is and the group is inserted anyway; our passes are idempotent,
+    so the duplicate is harmless.
     """
     base = ct.PassPipeline.EMPTY
     base.passes = ["common::fuse_reduce_keep_dims", "common::const_elimination"]
