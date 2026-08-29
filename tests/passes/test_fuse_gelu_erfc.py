@@ -138,6 +138,18 @@ class TestFuseGeluErfc:
         _apply(prog)
         assert "gelu" not in get_op_types_in_program(prog)
 
+    def test_not_fused_for_the_tanh_approximation(self):
+        """This pass covers the `erfc` form only; `fuse_gelu_tanh` covers the other."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(4, 8))])
+        def prog(x):
+            cubed = mb.mul(x=mb.mul(x=x, y=x), y=x)
+            inner = mb.add(x=x, y=mb.mul(x=0.044715, y=cubed))
+            cdf = mb.add(x=1.0, y=mb.tanh(x=mb.mul(x=math.sqrt(2.0 / math.pi), y=inner)))
+            return mb.mul(x=x, y=mb.mul(x=0.5, y=cdf))
+
+        _apply(prog)
+        assert "gelu" not in get_op_types_in_program(prog)
+
     def test_not_fused_when_erf_is_shared(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(4, 8))])
         def prog(x):
@@ -210,16 +222,22 @@ class TestFuseGeluErfcEndToEnd:
         )
         assert "gelu" not in get_model_instruction_types(cml_model)
 
-    def test_tanh_approximated_gelu_still_converts(self):
-        """The tanh approximation converts correctly, but is not fused.
+    def test_tanh_approximated_gelu_is_fused_by_its_own_pass(self):
+        """`jax.nn.gelu(approximate=True)` is a different formula entirely.
 
-        coremltools' `fuse_gelu_tanh_approximation` insists on a literal
-        `pow(x, 3)`, while JAX emits `x * x * x`. This pass deliberately only
-        covers the `erfc` form, so the approximation stays decomposed.
+        It is matched by `fuse_gelu_tanh` (see its test module), not by this
+        pass -- what is checked here is only that the two do not disagree about
+        which `gelu` mode the result is.
         """
         cml_model = run_and_compare(
             lambda x: jax.nn.gelu(x, approximate=True),
             [jax.ShapeDtypeStruct((4, 16), jnp.float32)],
         )
-        ops = get_model_instruction_types(cml_model)
-        assert ops.count("tanh") == 1
+        gelu_ops = [
+            op
+            for func in cml_model._mil_program.functions.values()
+            for op in func.operations
+            if op.op_type == "gelu"
+        ]
+        assert len(gelu_ops) == 1
+        assert gelu_ops[0].mode.val == "TANH_APPROXIMATION"

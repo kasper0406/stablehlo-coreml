@@ -13,6 +13,7 @@ import coremltools as ct
 # Importing the pass modules registers them in coremltools' PASS_REGISTRY.
 from . import fuse_attention_to_sdpa as _fuse_attention_to_sdpa  # noqa: F401
 from . import fuse_gelu_erfc as _fuse_gelu_erfc  # noqa: F401
+from . import fuse_gelu_tanh as _fuse_gelu_tanh  # noqa: F401
 from . import fuse_logit_softcap as _fuse_logit_softcap  # noqa: F401
 from . import fuse_reduce_keep_dims as _fuse_reduce_keep_dims  # noqa: F401
 from . import fuse_rmsnorm as _fuse_rmsnorm  # noqa: F401
@@ -52,6 +53,8 @@ FUSION_PASSES: list[str] = [
     "common::fuse_logit_softcap",
     _DCE,
     "common::fuse_gelu_erfc",
+    _DCE,
+    "common::fuse_gelu_tanh",
     _DCE,
 ]
 
