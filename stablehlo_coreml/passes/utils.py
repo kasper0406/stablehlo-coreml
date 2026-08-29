@@ -11,6 +11,7 @@ import copy
 import coremltools as ct
 
 # Importing the pass modules registers them in coremltools' PASS_REGISTRY.
+from . import broadcast_select_operands as _broadcast_select_operands  # noqa: F401
 from . import fuse_attention_to_sdpa as _fuse_attention_to_sdpa  # noqa: F401
 from . import fuse_gelu_erfc as _fuse_gelu_erfc  # noqa: F401
 from . import fuse_logit_softcap as _fuse_logit_softcap  # noqa: F401
@@ -29,6 +30,11 @@ _DCE = "common::dead_code_elimination"
 # scalar constant is materialised at full size).
 CLEANUP_PASSES: list[str] = [
     "common::remove_broadcast_tiles",
+    # `remove_broadcast_tiles` keeps the tiles feeding a `select`; this one adds
+    # the ones JAX never emitted, so that no `select` operand broadcasts from 1
+    # into a symbolic dimension. It replaces the `select` in place and leaves no
+    # dead ops behind, so it needs no `_DCE` entry of its own.
+    "common::broadcast_select_operands",
     "common::fuse_reduce_keep_dims",
     # `fuse_reduce_keep_dims` leaves the old reduction behind when the reshape
     # was its sole consumer.

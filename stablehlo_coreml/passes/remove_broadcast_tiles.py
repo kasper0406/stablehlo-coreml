@@ -15,7 +15,7 @@ from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import const_int_list, dims_equal, is_broadcast_tile
+from .pattern_utils import aligned_dim, const_int_list, dims_equal, is_broadcast_tile
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 # is loaded as a multifunction .mlpackage. It fails with
 #   "Failed to PropagateInputTensorShapes: Validation error during type
 #    inference for select: Incompatible Dimension"
-# so tiles feeding a `select` must be preserved.
+# so tiles feeding a `select` must be preserved. Preserving them only covers the
+# tiles that exist, though -- `broadcast_select_operands` runs right after this
+# pass and adds the ones JAX never emitted (`jnp.where` broadcasts implicitly).
 _BROADCAST_OPS = frozenset({
     "add", "sub", "mul", "real_div",
     "maximum", "minimum",
@@ -37,21 +39,6 @@ _BROADCAST_OPS = frozenset({
 
 # The operand names of the (binary) ops above.
 _BINARY_OPERANDS = ("x", "y")
-
-
-def _aligned_dim(operand, out_axis: int, out_rank: int):
-    """``operand``'s dimension at output axis ``out_axis``, NumPy-aligned to the right.
-
-    Axes that broadcasting prepends to a lower-rank operand read as 1.
-    ``None`` when the operand's shape is unknown.
-    """
-    shape = operand.shape
-    if shape is None:
-        return None
-    axis = out_axis - (out_rank - len(shape))
-    if axis < 0:
-        return 1
-    return shape[axis]
 
 
 def _consumer_output_is_unchanged(consumer, tile_op, tile_out) -> bool:
@@ -98,7 +85,7 @@ def _consumer_output_is_unchanged(consumer, tile_op, tile_out) -> bool:
         if rep == 1:
             continue
         replicated = tile_out.shape[axis]
-        dims = [_aligned_dim(other, offset + axis, len(out_shape)) for other in others]
+        dims = [aligned_dim(other, offset + axis, len(out_shape)) for other in others]
         if not any(dim is not None and dims_equal(dim, replicated) for dim in dims):
             return False
     return True
