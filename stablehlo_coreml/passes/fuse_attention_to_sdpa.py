@@ -869,6 +869,19 @@ def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
             _peel_broadcast_tile(var), space, softmax_op.x.shape, seq_len, before_op, name
         )
 
+    def to_query_dtype(var, name):
+        # SDPA wants `attn_mask` in the operand dtype. The backward walk tolerates
+        # casts around the scores, so a mask picked up on the far side of one can
+        # be wider (or narrower) than the operands.
+        if var.dtype == query.dtype:
+            return var
+        return mb.cast(
+            x=var,
+            dtype=types.builtin_to_string(query.dtype),
+            before_op=before_op,
+            name=name,
+        )
+
     bias = None
     if pattern.add_var is not None:
         bias = to_sdpa_space(pattern.add_var, softmax_op.name + "_bias")
@@ -883,7 +896,7 @@ def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
             )
 
     if pattern.select_cond is None:
-        return bias
+        return to_query_dtype(bias, softmax_op.name + "_bias_cast")
 
     mask = to_sdpa_space(pattern.select_cond, softmax_op.name + "_mask")
     if mask is None:
@@ -908,14 +921,7 @@ def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
             before_op=before_op,
             name=softmax_op.name + "_mask_bias",
         )
-        if combined.dtype != query.dtype:
-            combined = mb.cast(
-                x=combined,
-                dtype=types.builtin_to_string(query.dtype),
-                before_op=before_op,
-                name=softmax_op.name + "_mask_bias_cast",
-            )
-        return combined
+        return to_query_dtype(combined, softmax_op.name + "_mask_bias_cast")
 
     if math.isinf(fill) or finite_fill_mask == "bool":
         # A -inf fill and SDPA's boolean mask have identical semantics.
