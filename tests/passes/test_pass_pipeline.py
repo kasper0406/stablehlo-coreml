@@ -6,7 +6,6 @@ import pytest
 from stablehlo_coreml import build_pass_pipeline
 from stablehlo_coreml.passes.utils import (
     CLEANUP_PASSES,
-    DEFAULT_HLO_PIPELINE,
     FUSION_PASSES,
     LATE_FUSION_PASSES,
 )
@@ -33,7 +32,7 @@ def test_pass_is_registered(pass_name):
 
 @pytest.mark.parametrize("pass_name", OUR_PASSES)
 def test_default_pipeline_contains_each_pass_once_per_group(pass_name):
-    assert DEFAULT_HLO_PIPELINE.passes.count(pass_name) == EXPECTED_PASS_COUNTS[pass_name]
+    assert build_pass_pipeline().passes.count(pass_name) == EXPECTED_PASS_COUNTS[pass_name]
 
 
 def test_fuse_reduce_keep_dims_runs_again_in_the_late_fusion_group():
@@ -74,7 +73,7 @@ def test_build_pass_pipeline_returns_distinct_objects():
 
     first.append_pass(DCE_PASS_NAME)
     assert first.passes != second.passes
-    assert DEFAULT_HLO_PIPELINE.passes == second.passes
+    assert build_pass_pipeline().passes == second.passes
 
 
 def test_build_pass_pipeline_does_not_mutate_the_base():

@@ -1,4 +1,3 @@
-import copy
 from collections.abc import Mapping
 
 import coremltools as ct
@@ -11,7 +10,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax._src.lib.mlir import ir
 from jax.export import export as _jax_export
 
-from stablehlo_coreml import DEFAULT_HLO_PIPELINE
+from stablehlo_coreml import build_pass_pipeline
 from stablehlo_coreml.converter import convert
 from stablehlo_coreml.function_interface import sanitize_name
 from stablehlo_coreml.state import preferred_argument_name, resolve_state_map
@@ -120,7 +119,7 @@ def _convert_mil_to_coreml(
             f"max allowed complexity is {max_complexity}"
         )
 
-    pipeline = copy.deepcopy(DEFAULT_HLO_PIPELINE)
+    pipeline = build_pass_pipeline()
     pipeline.remove_passes(['common::add_fp16_cast'])
 
     convert_kwargs = dict(

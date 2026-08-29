@@ -2,8 +2,7 @@
 
 Importing this module registers every pass in ``stablehlo_coreml.passes`` with
 coremltools' ``PASS_REGISTRY``. Use :func:`build_pass_pipeline` to obtain a
-pipeline with the passes inserted at the right places, or the pre-built
-:data:`DEFAULT_HLO_PIPELINE` convenience object.
+pipeline with the passes inserted at the right places.
 """
 
 import copy
@@ -147,6 +146,3 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
     _insert_passes(pipeline, LATE_FUSION_PASSES, _LATE_FUSION_ANCHOR, fallback_index=None, after=True)
 
     return pipeline
-
-
-DEFAULT_HLO_PIPELINE: ct.PassPipeline = build_pass_pipeline()
