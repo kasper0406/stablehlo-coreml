@@ -26,15 +26,13 @@ associativity does not matter: ``x * (0.5 * (1 + tanh(t)))`` and
 written in distributed form (``k*x + k*a*x**3``) rather than factored.
 """
 
-import logging
 import math
 
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
 from .pattern_utils import (
+    RewritePass,
     dtype_epsilon,
     peel_to_scaled_input,
     shapes_equal,
@@ -42,8 +40,6 @@ from .pattern_utils import (
     uniform_const_operand,
     uniform_scalar_value,
 )
-
-logger = logging.getLogger(__name__)
 
 # The coefficients of the tanh approximation, as the paper writes them.
 _SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
@@ -177,31 +173,8 @@ def _match(mul_op, block):
     return None
 
 
-@block_context_manager
-def _fuse_gelu_tanh(block) -> int:
-    fused = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            fused += _fuse_gelu_tanh(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        x = _match(op, block)
-        if x is None:
-            continue
-
-        gelu = mb.gelu(x=x, mode="TANH_APPROXIMATION", before_op=op, name=op.outputs[0].name)
-        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=gelu)
-        fused += 1
-
-    return fused
-
-
 @register_pass(namespace="common")
-class fuse_gelu_tanh(AbstractGraphPass):
+class fuse_gelu_tanh(RewritePass):
     """
     Fuse ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))`` into
     ``gelu(x, mode="TANH_APPROXIMATION")``.
@@ -234,8 +207,13 @@ class fuse_gelu_tanh(AbstractGraphPass):
     ``x`` itself, which the pattern reads three times.
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            fused = _fuse_gelu_tanh(f)
-            if fused:
-                logger.debug("fuse_gelu_tanh: fused %d approximated GELU(s)", fused)
+    _REWRITES = "approximated GELU(s)"
+
+    def visit(self, op, block) -> bool:
+        x = _match(op, block)
+        if x is None:
+            return False
+
+        gelu = mb.gelu(x=x, mode="TANH_APPROXIMATION", before_op=op, name=op.outputs[0].name)
+        block.replace_uses_of_var_after_op(anchor_op=op, old_var=op.outputs[0], new_var=gelu)
+        return True

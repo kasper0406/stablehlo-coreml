@@ -232,7 +232,7 @@ class TestFuseAttentionToSdpa:
         expected = _reference_attention(
             q.astype(np.float32) / math.sqrt(E), k.astype(np.float32), v.astype(np.float32), bias=bias
         )
-        np.testing.assert_allclose(_predict(prog, q=q, k=k, v=v), expected, atol=2e-2, rtol=2e-2)
+        np.testing.assert_allclose(predict(prog, q=q, k=k, v=v), expected, atol=2e-2, rtol=2e-2)
 
     def test_scale_applied_after_the_mask_scales_the_fill(self):
         @mb.program(

@@ -32,12 +32,10 @@ import logging
 
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
-from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
-from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
-from .pattern_utils import aligned_dim, dims_equal
+from .pattern_utils import RewritePass, aligned_dim, dims_equal
 
 logger = logging.getLogger(__name__)
 
@@ -132,61 +130,8 @@ def _widen(operand, reference, op, name: str):
     return combine(x=operand, y=zeros, before_op=op, name=f"{op.name}_{name}_broadcast")
 
 
-@block_context_manager
-def _broadcast_select_operands(block) -> int:
-    widened = 0
-    for op in list(block.operations):
-        if op.enclosing_block is None:
-            continue
-
-        for nested_block in op.blocks:
-            widened += _broadcast_select_operands(nested_block)
-        if len(op.blocks) > 0:
-            continue
-
-        if op.op_type != "select":
-            continue
-
-        out_shape = op.outputs[0].shape
-        if out_shape is None or not any(is_symbolic(dim) for dim in out_shape):
-            continue
-
-        under_shaped = [name for name in _OPERANDS if _needs_widening(op.inputs.get(name), out_shape)]
-        if not under_shaped:
-            continue
-
-        reference = _fill_reference(op, out_shape)
-        if reference is None:
-            logger.debug(
-                "broadcast_select_operands: no operand of '%s' carries the full output shape %s",
-                op.name,
-                out_shape,
-            )
-            continue
-
-        operands = {name: op.inputs[name] for name in _OPERANDS}
-        for name in under_shaped:
-            operands[name] = _widen(operands[name], reference, op, name)
-
-        # The operands changed shape, so type inference on the new `select` must
-        # not be re-run against the old output type (`no_check_var_types`). The
-        # output itself is unaffected: widening only replaces implicit
-        # broadcasting with explicit, so the broadcast result is the same shape.
-        widened_select = mb.select(**operands, before_op=op, name=op.outputs[0].name)
-        block.replace_uses_of_var_after_op(
-            anchor_op=op,
-            old_var=op.outputs[0],
-            new_var=widened_select,
-            no_check_var_types=True,
-        )
-        block.remove_ops([op])
-        widened += 1
-
-    return widened
-
-
 @register_pass(namespace="common")
-class broadcast_select_operands(AbstractGraphPass):
+class broadcast_select_operands(RewritePass):
     """
     Widen the operands of a ``select`` that broadcast into a symbolic dimension.
 
@@ -207,8 +152,43 @@ class broadcast_select_operands(AbstractGraphPass):
         %3 = select(cond=%c, a=%2, b=%cache)
     """
 
-    def apply(self, prog):
-        for f in prog.functions.values():
-            widened = _broadcast_select_operands(f)
-            if widened:
-                logger.debug("broadcast_select_operands: widened %d select op(s)", widened)
+    _REWRITES = "select op(s)"
+
+    def visit(self, op, block) -> bool:
+        if op.op_type != "select":
+            return False
+
+        out_shape = op.outputs[0].shape
+        if out_shape is None or not any(is_symbolic(dim) for dim in out_shape):
+            return False
+
+        under_shaped = [name for name in _OPERANDS if _needs_widening(op.inputs.get(name), out_shape)]
+        if not under_shaped:
+            return False
+
+        reference = _fill_reference(op, out_shape)
+        if reference is None:
+            logger.debug(
+                "broadcast_select_operands: no operand of '%s' carries the full output shape %s",
+                op.name,
+                out_shape,
+            )
+            return False
+
+        operands = {name: op.inputs[name] for name in _OPERANDS}
+        for name in under_shaped:
+            operands[name] = _widen(operands[name], reference, op, name)
+
+        # The operands changed shape, so type inference on the new `select` must
+        # not be re-run against the old output type (`no_check_var_types`). The
+        # output itself is unaffected: widening only replaces implicit
+        # broadcasting with explicit, so the broadcast result is the same shape.
+        widened_select = mb.select(**operands, before_op=op, name=op.outputs[0].name)
+        block.replace_uses_of_var_after_op(
+            anchor_op=op,
+            old_var=op.outputs[0],
+            new_var=widened_select,
+            no_check_var_types=True,
+        )
+        block.remove_ops([op])
+        return True
