@@ -5,12 +5,10 @@ import numpy as np
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
-from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
-    get_op_types_in_program,
-)
+from coremltools.converters.mil.testing_utils import get_op_types_in_program
 
 from stablehlo_coreml.passes.pattern_utils import dims_equal, shapes_equal
+from tests.passes.helpers import apply_pass, ops_of_type, predict
 from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_symbolic
 
 PASS_NAME = "common::broadcast_select_operands"
@@ -20,26 +18,11 @@ _OPERANDS = ("cond", "a", "b")
 
 def _apply(prog):
     """Apply the pass, returning a deep copy of the program as it was before."""
-    prev_prog, _, _ = apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
-    return prev_prog
-
-
-def _selects(prog, recurse: bool = True):
-    def collect(block):
-        found = []
-        for op in block.operations:
-            if recurse:
-                for nested in op.blocks:
-                    found += collect(nested)
-            if op.op_type == "select":
-                found.append(op)
-        return found
-
-    return [op for func in prog.functions.values() for op in collect(func)]
+    return apply_pass(prog, PASS_NAME, dce=False, skip_output_shape_check=True)
 
 
 def _sole_select(prog):
-    selects = _selects(prog)
+    selects = ops_of_type(prog, "select", recurse=True)
     assert len(selects) == 1, f"expected exactly one select, got {len(selects)}"
     return selects[0]
 
@@ -65,20 +48,7 @@ def _ct_inputs(prog, symbolic_dim: int, range_max: int = 64):
 
 def _predict(prog, values, symbolic_dim: int):
     """Convert ``prog`` and run it on ``values``, with ``symbolic_dim`` for the symbolic axes."""
-    model = ct.convert(
-        prog,
-        source="milinternal",
-        minimum_deployment_target=ct.target.iOS18,
-        compute_units=ct.ComputeUnit.CPU_ONLY,
-        # Keep fp32 throughout, so the comparison is not limited by fp16 accuracy.
-        compute_precision=ct.precision.FLOAT32,
-        # coremltools' stock pipeline: the pass under test is applied by hand here.
-        pass_pipeline=ct.PassPipeline.DEFAULT,
-        inputs=_ct_inputs(prog, symbolic_dim),
-    )
-    names = [feature.name for feature in model.get_spec().description.input]
-    result = model.predict({name: values[name] for name in names})
-    return np.array(next(iter(result.values())))
+    return predict(prog, ct_inputs=_ct_inputs(prog, symbolic_dim), **values)
 
 
 class TestBroadcastSelectOperands:
@@ -370,7 +340,7 @@ class TestBroadcastSelectOperandsEndToEnd:
         assert "select" in ops
         assert "fill_like" in ops
 
-        selects = _selects(cml_model._mil_program)
+        selects = ops_of_type(cml_model._mil_program, "select", recurse=True)
         assert len(selects) == 1
         for select in selects:
             out_shape = tuple(select.outputs[0].shape)

@@ -7,18 +7,16 @@ import numpy as np
 import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
-from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipelineManager
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 
 from stablehlo_coreml.passes.fuse_attention_to_sdpa import _Atom, _regroup
+from tests.passes.helpers import apply_pass, count_ops, predict
 from tests.utils import get_model_instruction_types, run_and_compare
 
 PASS_NAME = "common::fuse_attention_to_sdpa"
-DCE_PASS_NAME = "common::dead_code_elimination"
 
 # [B, H, L, S] scores from [B, H, L, E] queries and [B, H, S, E] keys.
 B, H, L, S, E = 2, 3, 5, 7, 4
@@ -30,15 +28,7 @@ TORCH_MIN_FILL = np.float32(np.finfo(np.float32).min)
 
 
 def _apply(prog, **options):
-    # The pass leaves the matched ops behind; DCE is what removes them.
-    if not options:
-        result = apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
-        apply_pass_and_basic_check(prog, DCE_PASS_NAME, skip_output_shape_check=True)
-        return result
-    pipeline = ct.PassPipeline([PASS_NAME, DCE_PASS_NAME], "fuse_attention")
-    pipeline.set_options(PASS_NAME, options)
-    PassPipelineManager.apply_pipeline(prog, pipeline)
-    return prog
+    return apply_pass(prog, PASS_NAME, skip_output_shape_check=True, **options)
 
 
 def _ops(prog):
@@ -46,7 +36,7 @@ def _ops(prog):
 
 
 def _sdpa_ops(prog, recurse: bool = True) -> int:
-    return get_op_types_in_program(prog, recurse=recurse).count("scaled_dot_product_attention")
+    return count_ops(prog, "scaled_dot_product_attention", recurse=recurse)
 
 
 def _all_neg_inf_rows(scores, shape=(B, H, L, S)):
@@ -67,22 +57,6 @@ def _qkv_specs():
         mb.TensorSpec(shape=(B, H, S, E)),
         mb.TensorSpec(shape=(B, H, S, E)),
     ]
-
-
-def _predict(prog, **inputs):
-    """Convert ``prog`` and run it; returns the single output as an ndarray."""
-    model = ct.convert(
-        prog,
-        source="milinternal",
-        minimum_deployment_target=ct.target.iOS18,
-        compute_units=ct.ComputeUnit.CPU_ONLY,
-        # Keep fp32 throughout; the default pipeline would otherwise downcast and
-        # leave only ~1e-3 of accuracy to compare against.
-        compute_precision=ct.precision.FLOAT32,
-    )
-    names = [feature.name for feature in model.get_spec().description.input]
-    result = model.predict({name: inputs[name] for name in names})
-    return np.array(next(iter(result.values())))
 
 
 def _reference_attention(q, k, v, mask=None, fill=-1e9, bias=None):
@@ -718,7 +692,7 @@ class TestAdditiveBiasAndSelectMask:
             q / math.sqrt(E), k, v, mask=mask, fill=-np.inf, bias=bias
         )
         # Core ML has no boolean model input; it exposes the mask as fp32.
-        got = _predict(prog, q=q, k=k, v=v, bias=bias, mask=mask.astype(np.float32))
+        got = predict(prog, q=q, k=k, v=v, bias=bias, mask=mask.astype(np.float32))
         np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
 
     def test_a_bias_applied_after_the_mask_is_not_fused(self):
@@ -963,7 +937,7 @@ class TestUnitQueryLength:
 
         expected = _reference_attention(q, k, v, mask.reshape(1, 1, keys), fill=float(FINITE_FILL))
         # Core ML has no boolean model input; it exposes the mask as fp32.
-        got = _predict(prog, q=q, k=k, v=v, mask=mask.astype(np.float32))
+        got = predict(prog, q=q, k=k, v=v, mask=mask.astype(np.float32))
         np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
 
     def test_not_fused_when_a_transpose_permutes_real_batch_axes(self):

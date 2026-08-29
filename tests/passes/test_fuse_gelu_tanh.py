@@ -10,12 +10,12 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 from flax import nnx
 
+from tests.passes.helpers import apply_pass, ops_of_type
 from tests.utils import (
     get_model_instruction_types,
     run_and_compare,
@@ -24,16 +24,13 @@ from tests.utils import (
 )
 
 PASS_NAME = "common::fuse_gelu_tanh"
-DCE_PASS_NAME = "common::dead_code_elimination"
 
 SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
 CUBE_COEFFICIENT = 0.044715
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME)
-    # The pass leaves the matched ops behind; DCE is what removes them.
-    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
+    apply_pass(prog, PASS_NAME)
 
 
 def _tanh_gelu(
@@ -58,10 +55,6 @@ def _tanh_gelu(
     return mb.mul(x=x, y=mb.mul(x=half, y=cdf))
 
 
-def _gelu_ops(prog):
-    return [op for op in prog.functions["main"].operations if op.op_type == "gelu"]
-
-
 class TestFuseGeluTanh:
     """Unit tests on hand-built MIL programs."""
 
@@ -75,7 +68,7 @@ class TestFuseGeluTanh:
         ]
         _apply(prog)
         assert get_op_types_in_program(prog) == ["gelu"]
-        assert _gelu_ops(prog)[0].mode.val == "TANH_APPROXIMATION"
+        assert ops_of_type(prog, "gelu")[0].mode.val == "TANH_APPROXIMATION"
         assert_model_is_valid(
             prog, {"x": (4, 8)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
         )
