@@ -37,6 +37,7 @@ from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 from .pattern_utils import (
     dtype_epsilon,
     peel_to_scaled_input,
+    shapes_equal,
     sole_consumer,
     uniform_const_operand,
     uniform_scalar_value,
@@ -161,6 +162,11 @@ def _match(mul_op, block):
 
             x = _match_tanh_argument(tanh_op.x, block, tolerance)
             if x is None:
+                continue
+            # A uniform constant of the pattern is accepted whatever its shape, so
+            # it may broadcast `x`; `gelu(x)` has `x`'s shape and cannot replace a
+            # wider result.
+            if not shapes_equal(mul_op.outputs[0].shape, x.shape):
                 continue
 
             # What is left of the product must be `0.5 * x`.
