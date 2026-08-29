@@ -223,6 +223,43 @@ class TestFuseAttentionToSdpa:
         sdpa = _ops(prog)[-1]
         assert sdpa.attn_mask is prog.functions["main"].inputs["bias"]
 
+    def test_additive_float_mask_is_cast_to_the_query_dtype(self):
+        """SDPA wants `attn_mask` in the operand dtype; a bias behind a cast is not.
+
+        Keeping the softmax in fp32 while Q/K/V stay fp16 is what torch and JAX
+        emit; the backward walk follows the bias across that cast.
+        """
+        bias = np.linspace(-2.0, 2.0, L * S, dtype=np.float32).reshape(1, 1, L, S)
+
+        @mb.program(
+            input_specs=[
+                mb.TensorSpec(shape=(B, H, L, E), dtype=types.fp16),
+                mb.TensorSpec(shape=(B, H, S, E), dtype=types.fp16),
+                mb.TensorSpec(shape=(B, H, S, E), dtype=types.fp16),
+            ],
+            opset_version=ct.target.iOS18,
+        )
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            scaled = mb.mul(x=scores, y=np.float16(1.0 / math.sqrt(E)))
+            biased = mb.add(x=mb.cast(x=scaled, dtype="fp32"), y=bias)
+            weights = mb.softmax(x=biased, axis=-1)
+            return mb.matmul(x=mb.cast(x=weights, dtype="fp16"), y=v, transpose_y=False)
+
+        _apply(prog)
+        sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
+        assert sdpa.query.dtype == types.fp16
+        assert sdpa.attn_mask.dtype == sdpa.query.dtype
+
+        rng = np.random.RandomState(0)
+        q = rng.randn(B, H, L, E).astype(np.float16)
+        k = rng.randn(B, H, S, E).astype(np.float16)
+        v = rng.randn(B, H, S, E).astype(np.float16)
+        expected = _reference_attention(
+            q.astype(np.float32) / math.sqrt(E), k.astype(np.float32), v.astype(np.float32), bias=bias
+        )
+        np.testing.assert_allclose(_predict(prog, q=q, k=k, v=v), expected, atol=2e-2, rtol=2e-2)
+
     def test_scale_applied_after_the_mask_scales_the_fill(self):
         @mb.program(
             input_specs=[*_qkv_specs(), mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool)],
@@ -1357,7 +1394,15 @@ class TestFuseAttentionToSdpaEndToEnd:
         self._assert_fused(cml_model, expected=2)
 
     def test_fully_masked_row_stays_finite(self):
-        """The additive mask keeps a fully masked row finite, as -1e9 did."""
+        """The additive mask keeps a fully masked row finite, as -1e9 did.
+
+        The *values* of that row only match because -1e9 swamps the scores: in
+        fp32 an ulp at 1e9 is 64, so `score + (-1e9) == -1e9` for the O(1)
+        scores below and softmax sees the uniform row the `select` produced. A
+        fill close to `_MASK_FILL_THRESHOLD` (-1e4) would not round the scores
+        away and the fused row would differ; see `finite_fill_mask` in the pass
+        docstring.
+        """
         from tests.utils import run_and_compare_specific_input  # noqa: PLC0415
 
         def attention(q, k, v, mask):
