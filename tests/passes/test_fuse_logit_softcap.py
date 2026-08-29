@@ -77,14 +77,9 @@ class TestFuseLogitSoftcap:
         assert get_op_types_in_program(prog) == ["scaled_tanh"]
 
     @pytest.mark.parametrize("cap", [30.0, 50.0])
-    def test_fp16_reciprocal_rounding_is_still_fused(self, cap):
-        """``1 / cap`` is rounded to fp16 long before MIL sees it.
-
-        ``fp16(1/30) * 30 == 0.99976``, which is 2.4e-4 away from unity -- more
-        than the fp32 tolerance allows, but well inside one fp16 ulp.
-        """
+    def test_fp16_softcap_is_fused(self, cap):
+        """The emitted constants take the element type of the fused input."""
         beta = np.float16(1.0) / np.float16(cap)
-        assert abs(float(beta) * cap - 1.0) > 1e-4
 
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8), dtype=types.fp16)])
         def prog(x):
@@ -99,34 +94,31 @@ class TestFuseLogitSoftcap:
         assert np.isclose(fused.alpha.val, cap)
         assert fused.beta.val == beta
 
-    def test_fp32_keeps_the_tight_tolerance(self):
-        """The widened tolerance is fp16-only; fp32 constants stay tightly checked."""
+    def test_arbitrary_scalings_are_fused(self):
+        """``scaled_tanh`` is the matched expression, so no softcap shape is required."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
         def prog(x):
-            scaled = mb.mul(x=x, y=np.float32(1.0 / 30.0))
-            # 5e-4 off unity: representable in fp32, so not a rounding artifact.
-            return mb.mul(x=mb.tanh(x=scaled), y=np.float32(30.0 * 1.0005))
+            scaled = mb.mul(x=x, y=2.0)
+            return mb.mul(x=mb.tanh(x=scaled), y=0.5)
 
         _apply(prog)
-        assert "scaled_tanh" not in get_op_types_in_program(prog)
+        assert get_op_types_in_program(prog) == ["scaled_tanh"]
 
-    def test_not_fused_in_fp16_when_the_product_is_far_from_one(self):
-        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8), dtype=types.fp16)])
-        def prog(x):
-            scaled = mb.mul(x=x, y=np.float16(1.0 / 30.0))
-            return mb.mul(x=mb.tanh(x=scaled), y=np.float16(20.0))
+        fused = _scaled_tanh_ops(prog)[0]
+        assert np.isclose(fused.alpha.val, 0.5)
+        assert np.isclose(fused.beta.val, 2.0)
 
-        _apply(prog)
-        assert "scaled_tanh" not in get_op_types_in_program(prog)
-
-    def test_not_fused_when_product_is_not_one(self):
+    def test_outer_scale_only_gives_beta_one(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
         def prog(x):
-            scaled = mb.real_div(x=x, y=30.0)
-            return mb.mul(x=mb.tanh(x=scaled), y=20.0)
+            return mb.mul(x=mb.tanh(x=x), y=20.0)
 
         _apply(prog)
-        assert get_op_types_in_program(prog) == ["real_div", "tanh", "mul"]
+        assert get_op_types_in_program(prog) == ["scaled_tanh"]
+
+        fused = _scaled_tanh_ops(prog)[0]
+        assert np.isclose(fused.alpha.val, 20.0)
+        assert np.isclose(fused.beta.val, 1.0)
 
     def test_not_fused_without_outer_scale(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8)), mb.TensorSpec(shape=(2, 8))])
@@ -157,15 +149,18 @@ class TestFuseLogitSoftcap:
         assert "scaled_tanh" not in get_op_types_in_program(prog)
 
     def test_inner_scale_shared_keeps_beta_one(self):
-        """When the scaled value escapes, only `a * tanh(v)` may be fused (a == 1)."""
+        """When the scaled value escapes, the division stays and only ``alpha`` is fused."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
         def prog(x):
             scaled = mb.real_div(x=x, y=30.0)
             return mb.mul(x=mb.tanh(x=scaled), y=30.0), scaled
 
         _apply(prog)
-        # beta would have to be 1 (the div cannot be peeled), and 30 * 1 != 1.
-        assert "scaled_tanh" not in get_op_types_in_program(prog)
+        assert get_op_types_in_program(prog) == ["real_div", "scaled_tanh"]
+
+        fused = _scaled_tanh_ops(prog)[0]
+        assert np.isclose(fused.alpha.val, 30.0)
+        assert np.isclose(fused.beta.val, 1.0)
 
     def test_fused_inside_nested_block(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8)), mb.TensorSpec(shape=(1,), dtype=types.bool)])
@@ -217,14 +212,28 @@ class TestFuseLogitSoftcapEndToEnd:
         assert ops.count("scaled_tanh") == 1
         assert "tanh" not in ops
 
-    def test_unbalanced_scaling_is_not_fused(self):
+    def test_unbalanced_scaling_is_fused(self):
+        """``alpha * beta != 1`` is still exactly ``scaled_tanh``."""
         def f(x):
             return jnp.tanh(x / 30.0) * 20.0
 
         cml_model = run_and_compare(f, [jax.ShapeDtypeStruct((4, 16), jnp.float32)])
         ops = get_model_instruction_types(cml_model)
-        assert "scaled_tanh" not in ops
-        assert ops.count("tanh") == 1
+        assert ops.count("scaled_tanh") == 1
+        assert "tanh" not in ops
+
+    @pytest.mark.parametrize(
+        "f",
+        [
+            pytest.param(lambda x: 0.5 * jnp.tanh(2.0 * x), id="half_tanh_of_double"),
+            pytest.param(lambda x: jnp.tanh(x) * 3.0, id="outer_scale_only"),
+        ],
+    )
+    def test_general_scalings_are_fused(self, f):
+        cml_model = run_and_compare(f, [jax.ShapeDtypeStruct((4, 16), jnp.float32)])
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("scaled_tanh") == 1
+        assert "tanh" not in ops
 
     @pytest.mark.parametrize("cap", [30.0, 50.0])
     @pytest.mark.parametrize(
@@ -241,11 +250,7 @@ class TestFuseLogitSoftcapEndToEnd:
     )
     @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
     def test_gemma_style_softcap_spellings(self, spelling, cap, dtype):
-        """Every way Gemma-2 writes ``cap * tanh(logits / cap)`` must fuse.
-
-        The fp16 cases matter: JAX folds ``1 / cap`` in the operand dtype, so
-        ``alpha * beta`` only reaches unity to within an fp16 ulp.
-        """
+        """Every way Gemma-2 writes ``cap * tanh(logits / cap)`` must fuse."""
         precision_loss = jnp.finfo(dtype).eps / jnp.finfo(jnp.float32).eps
         cml_model = run_and_compare(
             lambda x: spelling(x, cap),
