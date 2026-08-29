@@ -6,10 +6,16 @@ transpose_y=True) -> [reshape] -> [transpose]``, so an attention block looks
 like::
 
     matmul_0(Q, K, transpose_y=True) -> [reshape/transpose]* -> [scale] ->
-      [mask] -> [cast] -> softmax(axis=-1) -> [reshape/transpose]* ->
+      [bias] -> [mask] -> [cast] -> softmax(axis=-1) -> [reshape/transpose]* ->
       matmul_1(W, V, transpose_y=True)
 
 The pass matches that and emits a single ``scaled_dot_product_attention``.
+
+``bias`` is an additive float mask and ``mask`` a ``select`` against a large
+negative fill; either may be absent, and ``jax.nn.dot_product_attention`` (and
+therefore ``flax.nnx.MultiHeadAttention``) emits both when it is given a
+``bias`` as well as a ``mask``. The two collapse into SDPA's single
+``attn_mask``.
 
 Everything happens in "matmul space": the SDPA operands are exactly the matmul
 operands, so nothing is assumed about how the model laid out heads, groups or
@@ -45,6 +51,7 @@ as well, but only when the matched mask proves that no row can be entirely
 -inf; otherwise the wrapper is not an identity and the block is left alone.
 """
 
+import dataclasses
 import logging
 import math
 
@@ -380,20 +387,26 @@ def _match_safe_softmax(softmax_op) -> _SafeSoftmax | None:
 
 
 def _safe_softmax_is_redundant(pattern) -> bool:
-    """True when no score row can be entirely -inf, so the wrapper is an identity."""
-    if pattern.mask_kind is None:
-        return True
-    if pattern.mask_kind == "select":
+    """True when no score row can be entirely -inf, so the wrapper is an identity.
+
+    Every matched score modifier has to be harmless on its own; if any of them
+    can put a -inf into the scores, the wrapper may be doing real work.
+    """
+    if pattern.select_cond is not None and math.isinf(float(pattern.select_fill)):
         # A finite fill (`torch.finfo(dtype).min`) leaves a fully masked row
         # finite, so softmax produces a uniform row rather than NaN.
-        return not math.isinf(float(pattern.mask_fill))
-    mask_value = getattr(pattern.mask_var, "val", None)
-    if mask_value is None:
-        # A mask computed at runtime (Whisper builds one out of -inf and 0.0)
-        # may well have an all -inf row, and then the wrapper is *not* an
-        # identity: SDPA would return NaN where the original graph returns 0.
         return False
-    return not bool(np.isinf(np.asarray(mask_value)).any())
+    if pattern.add_var is not None:
+        mask_value = getattr(pattern.add_var, "val", None)
+        if mask_value is None:
+            # A mask computed at runtime (Whisper builds one out of -inf and
+            # 0.0) may well have an all -inf row, and then the wrapper is *not*
+            # an identity: SDPA would return NaN where the original graph
+            # returns 0.
+            return False
+        if bool(np.isinf(np.asarray(mask_value)).any()):
+            return False
+    return True
 
 
 def _swap_last_two(rank: int) -> list[int]:
@@ -431,14 +444,19 @@ class _Pattern:
         self.matmul_0 = None
         self.matmul_1 = None
         self.weights_var = None
-        self.back_layout_ops = []       # matmul_0 -> softmax, in execution order
-        self.fwd_layout_ops = []        # softmax -> matmul_1, in execution order
-        self.mask_kind = None           # None | "select" | "add"
-        self.mask_var = None            # the compact condition / additive mask
-        self.mask_fill = None           # the `select` fill value
-        self.mask_negated = False       # matched select(cond, fill, scores)
-        self.scale = None               # multiplicative factor applied to the scores
-        self.mask_before_scale = False  # forward order was mask -> scale
+        self.back_layout_ops = []        # matmul_0 -> softmax, in execution order
+        self.fwd_layout_ops = []         # softmax -> matmul_1, in execution order
+        self.add_var = None              # the additive (float) mask / attention bias
+        self.add_before_scale = False    # forward order was bias -> scale
+        self.select_cond = None          # the compact condition of a `select` mask
+        self.select_fill = None          # the `select` fill value
+        self.select_negated = False      # matched select(cond, fill, scores)
+        self.select_before_scale = False  # forward order was mask -> scale
+        self.scale = None                # multiplicative factor applied to the scores
+
+    @property
+    def has_mask(self) -> bool:
+        return self.add_var is not None or self.select_cond is not None
 
 
 class _Space:
@@ -519,19 +537,23 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
         elif op_type in _LAYOUT_OPS:
             back_ops.append(op)
             next_var = op.inputs["x"]
-        elif op_type == "select" and pattern.mask_kind is None:
+        elif op_type == "select" and pattern.select_cond is None:
+            if pattern.add_var is not None:
+                # Walking backwards, the additive mask was seen first, so it is
+                # applied *after* this `select`: the bias then also shifts the
+                # fill value, which a single `attn_mask` cannot express.
+                return False
             cond, a, b = op.inputs["cond"], op.inputs["a"], op.inputs["b"]
             fill_a, fill_b = uniform_scalar_value(a), uniform_scalar_value(b)
             if fill_b is not None and fill_b <= _MASK_FILL_THRESHOLD:
-                pattern.mask_fill, pattern.mask_negated, next_var = fill_b, False, a
+                pattern.select_fill, pattern.select_negated, next_var = fill_b, False, a
             elif fill_a is not None and fill_a <= _MASK_FILL_THRESHOLD:
-                pattern.mask_fill, pattern.mask_negated, next_var = fill_a, True, b
+                pattern.select_fill, pattern.select_negated, next_var = fill_a, True, b
             else:
                 return False
-            pattern.mask_kind = "select"
-            pattern.mask_var = cond
-            order.append("mask")
-        elif op_type == "add" and pattern.mask_kind is None:
+            pattern.select_cond = cond
+            order.append("select")
+        elif op_type == "add" and pattern.add_var is None:
             x, y = op.inputs["x"], op.inputs["y"]
             # A uniform constant shifts every score by the same amount, which
             # softmax cancels out; it carries no masking information, so there
@@ -541,13 +563,12 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
             if uniform_scalar_value(x) is not None or uniform_scalar_value(y) is not None:
                 return False
             if _leads_to_matmul(x):
-                next_var, pattern.mask_var = x, y
+                next_var, pattern.add_var = x, y
             elif _leads_to_matmul(y):
-                next_var, pattern.mask_var = y, x
+                next_var, pattern.add_var = y, x
             else:
                 return False
-            pattern.mask_kind = "add"
-            order.append("mask")
+            order.append("add")
         elif op_type in ("mul", "real_div") and pattern.scale is None:
             if op_type == "real_div":
                 divisor = uniform_scalar_value(op.inputs["y"])
@@ -573,8 +594,13 @@ def _match_backward(softmax_op, pattern, ignored=()) -> bool:
         var = next_var
 
     pattern.back_layout_ops = list(reversed(back_ops))
-    # The op encountered first walking backwards is the one applied last.
-    pattern.mask_before_scale = order[:2] == ["scale", "mask"]
+    # `order` is in reverse execution order, so a modifier that appears *after*
+    # the scale in it is applied *before* the scale, and its contribution to
+    # `attn_mask` has to be scaled along (SDPA applies `attn_mask` last).
+    if "scale" in order:
+        scale_index = order.index("scale")
+        pattern.select_before_scale = "select" in order and order.index("select") > scale_index
+        pattern.add_before_scale = "add" in order and order.index("add") > scale_index
     return True
 
 
@@ -807,37 +833,89 @@ def _mask_to_sdpa_space(mask_var, space, softmax_shape, seq_len, before_op, name
     )
 
 
-def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
-    """Build SDPA's ``attn_mask`` from the matched ``select`` / additive mask."""
-    softmax_op = pattern.softmax_op
-    mask_var = pattern.mask_var
-    # Peel the broadcast tile the converter emits for `select`; the compact
-    # condition is what we want to re-layout. A tile that replicates a dimension
-    # that is not 1 is a real tile, not a broadcast, and must be kept.
-    mask_var = _peel_broadcast_tile(mask_var)
+@dataclasses.dataclass(frozen=True)
+class _Options:
+    """The pass options, see :class:`fuse_attention_to_sdpa`."""
 
-    mask = _mask_to_sdpa_space(
-        mask_var, space, softmax_op.x.shape, seq_len, before_op, softmax_op.name + "_mask"
-    )
+    finite_fill_mask: str = "additive"
+    max_head_dim: int | None = None
+    max_key_len: int | None = None
+
+
+def _within_bound(dim, bound: int | None) -> bool:
+    """True when ``dim`` is known not to exceed ``bound`` (a symbolic ``dim`` is not)."""
+    if bound is None:
+        return True
+    if is_symbolic(dim):
+        return False
+    return int(dim) <= bound
+
+
+def _build_mask(pattern, space, before_op, seq_len, query, finite_fill_mask):
+    """Build SDPA's ``attn_mask`` from the matched additive / ``select`` masks.
+
+    Either may be absent; when both are present the additive one is applied
+    first (the backward walk rejects the other order), so the block computes
+    ``select(cond, scores + bias, fill)`` and the equivalent single mask is
+    ``select(cond, bias, fill)``.
+    """
+    softmax_op = pattern.softmax_op
+
+    def to_sdpa_space(var, name):
+        # Peel the broadcast tile the converter emits; the compact operand is
+        # what we want to re-layout. A tile that replicates a dimension that is
+        # not 1 is a real tile, not a broadcast, and must be kept.
+        return _mask_to_sdpa_space(
+            _peel_broadcast_tile(var), space, softmax_op.x.shape, seq_len, before_op, name
+        )
+
+    bias = None
+    if pattern.add_var is not None:
+        bias = to_sdpa_space(pattern.add_var, softmax_op.name + "_bias")
+        if bias is None:
+            return None
+        if pattern.add_before_scale and pattern.scale is not None:
+            bias = mb.mul(
+                x=bias,
+                y=_np_scalar(float(pattern.scale), bias.dtype),
+                before_op=before_op,
+                name=softmax_op.name + "_bias_scaled",
+            )
+
+    if pattern.select_cond is None:
+        return bias
+
+    mask = to_sdpa_space(pattern.select_cond, softmax_op.name + "_mask")
     if mask is None:
         return None
 
-    if pattern.mask_kind == "add":
-        if pattern.mask_before_scale and pattern.scale is not None:
-            mask = mb.mul(
-                x=mask,
-                y=_np_scalar(float(pattern.scale), query.dtype),
-                before_op=before_op,
-                name=softmax_op.name + "_mask_scaled",
-            )
-        return mask
-
-    if pattern.mask_negated:
+    if pattern.select_negated:
         mask = mb.logical_not(x=mask, before_op=before_op, name=softmax_op.name + "_mask_not")
 
-    fill = float(pattern.mask_fill)
-    if pattern.mask_before_scale and pattern.scale is not None:
+    fill = float(pattern.select_fill)
+    if pattern.select_before_scale and pattern.scale is not None:
         fill *= float(pattern.scale)
+
+    if bias is not None:
+        # A boolean `attn_mask` cannot carry the bias too, so the two collapse
+        # into one float mask. `bool` mode asks for the -inf semantics.
+        if not math.isinf(fill) and finite_fill_mask == "bool":
+            fill = -math.inf
+        combined = mb.select(
+            cond=mask,
+            a=bias,
+            b=_np_scalar(fill, bias.dtype),
+            before_op=before_op,
+            name=softmax_op.name + "_mask_bias",
+        )
+        if combined.dtype != query.dtype:
+            combined = mb.cast(
+                x=combined,
+                dtype=types.builtin_to_string(query.dtype),
+                before_op=before_op,
+                name=softmax_op.name + "_mask_bias_cast",
+            )
+        return combined
 
     if math.isinf(fill) or finite_fill_mask == "bool":
         # A -inf fill and SDPA's boolean mask have identical semantics.
@@ -882,7 +960,7 @@ def _validate_operands(query, key, value, n_batch: int) -> bool:
     return dims_equal(key.shape[-2], value.shape[-2])
 
 
-def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
+def _try_fuse(softmax_op, block, options: _Options) -> bool:
     out_rank = len(softmax_op.outputs[0].shape)
     if normalize_axis(softmax_op.axis.val, out_rank) != out_rank - 1:
         return False
@@ -947,9 +1025,12 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
     embedding = int(embedding)
     seq_len = key.shape[-2]
 
+    if not _within_bound(embedding, options.max_head_dim) or not _within_bound(seq_len, options.max_key_len):
+        return False
+
     attn_mask = None
-    if pattern.mask_kind is not None:
-        attn_mask = _build_mask(pattern, space, matmul_1, seq_len, query, finite_fill_mask)
+    if pattern.has_mask:
+        attn_mask = _build_mask(pattern, space, matmul_1, seq_len, query, options.finite_fill_mask)
         if attn_mask is None:
             return False
 
@@ -1013,14 +1094,14 @@ def _try_fuse(softmax_op, block, finite_fill_mask: str) -> bool:
 
 
 @block_context_manager
-def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
+def _fuse_attention_to_sdpa(block, options: _Options) -> int:
     fused = 0
     for op in list(block.operations):
         if op.enclosing_block is None:
             continue
 
         for nested_block in op.blocks:
-            fused += _fuse_attention_to_sdpa(nested_block, finite_fill_mask)
+            fused += _fuse_attention_to_sdpa(nested_block, options)
         if len(op.blocks) > 0:
             continue
 
@@ -1028,7 +1109,7 @@ def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
             continue
         # `_try_fuse` may build some replacement ops before a late check makes it
         # give up; those are left dead in the block for `dead_code_elimination`.
-        if _try_fuse(op, block, finite_fill_mask):
+        if _try_fuse(op, block, options):
             fused += 1
 
     return fused
@@ -1037,7 +1118,7 @@ def _fuse_attention_to_sdpa(block, finite_fill_mask: str) -> int:
 @register_pass(namespace="common")
 class fuse_attention_to_sdpa(AbstractGraphPass):
     """
-    Fuse ``matmul -> [scale] -> [mask] -> softmax -> matmul`` into
+    Fuse ``matmul -> [scale] -> [bias] -> [mask] -> softmax -> matmul`` into
     ``scaled_dot_product_attention``.
 
     Support options:
@@ -1048,6 +1129,21 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
       stays finite, exactly like the original graph; ``"bool"`` emits the
       boolean condition instead, which is cheaper but turns such rows into NaN.
       Only a fill of exactly ``-inf`` maps to a boolean mask unconditionally.
+    - ``max_head_dim`` / ``max_key_len``: leave an attention block unfused when
+      its head dimension ``E``, respectively its key length ``S``, is larger
+      than the bound (or symbolic, i.e. unknown). ``None`` (the default) fuses
+      everything. On macOS 26.x / coremltools 9.0 a fused SDPA with a large
+      head dimension and a long key length has been reported to break the ANE
+      partitioner (``ANECCompile`` fails, the model silently runs on CPU) and to
+      crash the BNNS fp16 kernel for query lengths >= 2; the decomposed form is
+      fine on every backend and costs nothing measurable on the GPU. Consumers
+      targeting the ANE or the CPU can keep the small, sliding-window sites
+      fused and opt the global ones out with these bounds.
+
+    Options are set on the pipeline::
+
+        pipeline = build_pass_pipeline()
+        pipeline.set_options("common::fuse_attention_to_sdpa", {"max_key_len": 4096})
 
     Given:
         %scores = matmul(x=%q, y=%k, transpose_y=True)
@@ -1061,6 +1157,8 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
     """
 
     _finite_fill_mask = "additive"
+    _max_head_dim = None
+    _max_key_len = None
 
     @property
     def finite_fill_mask(self) -> str:
@@ -1072,8 +1170,39 @@ class fuse_attention_to_sdpa(AbstractGraphPass):
             raise ValueError(f"finite_fill_mask must be 'additive' or 'bool', got `{mode}`")
         self._finite_fill_mask = mode
 
+    @staticmethod
+    def _parse_bound(name: str, value) -> int | None:
+        # `PassPipeline.set_options` is documented to take strings.
+        if value is None or (isinstance(value, str) and value.strip().lower() in ("", "none")):
+            return None
+        try:
+            bound = int(value)
+            integral = bound == value if not isinstance(value, str) else True
+        except (TypeError, ValueError):
+            integral = False
+        if not integral or bound < 1:
+            raise ValueError(f"{name} must be a positive integer or None, got `{value}`")
+        return bound
+
+    @property
+    def max_head_dim(self) -> int | None:
+        return self._max_head_dim
+
+    @max_head_dim.setter
+    def max_head_dim(self, value):
+        self._max_head_dim = self._parse_bound("max_head_dim", value)
+
+    @property
+    def max_key_len(self) -> int | None:
+        return self._max_key_len
+
+    @max_key_len.setter
+    def max_key_len(self, value):
+        self._max_key_len = self._parse_bound("max_key_len", value)
+
     def apply(self, prog):
+        options = _Options(self._finite_fill_mask, self._max_head_dim, self._max_key_len)
         for f in prog.functions.values():
-            fused = _fuse_attention_to_sdpa(f, self._finite_fill_mask)
+            fused = _fuse_attention_to_sdpa(f, options)
             if fused:
                 logger.debug("fuse_attention_to_sdpa: fused %d attention block(s)", fused)

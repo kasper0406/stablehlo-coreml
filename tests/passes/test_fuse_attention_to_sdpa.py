@@ -85,9 +85,11 @@ def _predict(prog, **inputs):
     return np.array(next(iter(result.values())))
 
 
-def _reference_attention(q, k, v, mask=None, fill=-1e9):
-    """``softmax(q @ k^T [+ mask]) @ v`` in numpy, over the last two axes."""
+def _reference_attention(q, k, v, mask=None, fill=-1e9, bias=None):
+    """``softmax(where(mask, q @ k^T [+ bias], fill)) @ v``, over the last two axes."""
     scores = np.matmul(q, np.swapaxes(k, -2, -1))
+    if bias is not None:
+        scores = scores + bias
     if mask is not None:
         scores = np.where(mask, scores, np.float32(fill))
     scores = scores - scores.max(axis=-1, keepdims=True)
@@ -579,6 +581,268 @@ class TestFuseAttentionToSdpa:
         ops_after_first = get_op_types_in_program(prog)
         _apply(prog)
         assert get_op_types_in_program(prog) == ops_after_first
+
+
+class TestAdditiveBiasAndSelectMask:
+    """``select(cond, scores + bias, fill)``: both masks at once.
+
+    ``jax.nn.dot_product_attention`` -- and therefore ``flax.nnx``, which calls
+    it -- adds the ``bias`` to the logits and *then* applies ``mask`` as a
+    ``where`` against a large negative fill. SDPA has a single ``attn_mask``, so
+    the two have to collapse into ``select(cond, bias, fill)``.
+    """
+
+    @staticmethod
+    def _prog(fill=NEG_INF, mask_shape=(B, 1, 1, S)):
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[
+                *_qkv_specs(),
+                mb.TensorSpec(shape=(B, 1, L, S)),
+                mb.TensorSpec(shape=mask_shape, dtype=types.bool),
+            ],
+        )
+        def prog(q, k, v, bias, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            scaled = mb.mul(x=scores, y=np.float32(1.0 / math.sqrt(E)))
+            biased = mb.add(x=scaled, y=bias)
+            masked = mb.select(cond=mask, a=biased, b=fill)
+            weights = mb.softmax(x=masked, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        return prog
+
+    def test_bias_and_neg_inf_mask_collapse_into_one_float_mask(self):
+        prog = self._prog()
+        _apply(prog)
+
+        assert get_op_types_in_program(prog) == ["select", "scaled_dot_product_attention"]
+        select = next(op for op in _ops(prog) if op.op_type == "select")
+        sdpa = next(op for op in _ops(prog) if op.op_type == "scaled_dot_product_attention")
+        assert select.cond is prog.functions["main"].inputs["mask"]
+        assert select.a is prog.functions["main"].inputs["bias"]
+        assert math.isinf(float(select.b.val)) and float(select.b.val) < 0
+        assert sdpa.attn_mask is select.outputs[0]
+        assert sdpa.attn_mask.dtype == types.fp32
+        assert_model_is_valid(
+            prog,
+            {"q": (B, H, L, E), "k": (B, H, S, E), "v": (B, H, S, E),
+             "bias": (B, 1, L, S), "mask": (B, 1, 1, S)},
+            minimum_deployment_target=ct.target.iOS18,
+            backend=("mlprogram", "fp32"),
+        )
+
+    def test_bias_and_finite_fill_keep_the_finite_fill(self):
+        """A finite fill leaves a fully masked row finite; do not turn it to -inf."""
+        prog = self._prog(fill=TORCH_MIN_FILL)
+        _apply(prog)
+
+        assert get_op_types_in_program(prog) == ["select", "scaled_dot_product_attention"]
+        select = next(op for op in _ops(prog) if op.op_type == "select")
+        np.testing.assert_allclose(select.b.val, TORCH_MIN_FILL, rtol=1e-6)
+
+    def test_bias_and_finite_fill_with_the_bool_option_masks_with_neg_inf(self):
+        """``finite_fill_mask='bool'`` asks for -inf semantics, float mask or not."""
+        prog = self._prog(fill=TORCH_MIN_FILL)
+        _apply(prog, finite_fill_mask="bool")
+
+        assert get_op_types_in_program(prog) == ["select", "scaled_dot_product_attention"]
+        select = next(op for op in _ops(prog) if op.op_type == "select")
+        assert math.isinf(float(select.b.val))
+
+    def test_negated_mask_with_a_bias(self):
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[
+                *_qkv_specs(),
+                mb.TensorSpec(shape=(B, 1, L, S)),
+                mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool),
+            ],
+        )
+        def prog(q, k, v, bias, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            scaled = mb.mul(x=scores, y=np.float32(1.0 / math.sqrt(E)))
+            biased = mb.add(x=scaled, y=bias)
+            masked = mb.select(cond=mask, a=NEG_INF, b=biased)
+            weights = mb.softmax(x=masked, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        ops = get_op_types_in_program(prog)
+        assert ops == ["logical_not", "select", "scaled_dot_product_attention"]
+
+    def test_a_scale_between_the_bias_and_the_mask_scales_only_the_bias(self):
+        """``(scores + bias) * c`` then mask: SDPA applies attn_mask after the scale."""
+        scale = np.float32(0.25)
+
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[
+                *_qkv_specs(),
+                mb.TensorSpec(shape=(B, 1, L, S)),
+                mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool),
+            ],
+        )
+        def prog(q, k, v, bias, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            biased = mb.add(x=scores, y=bias)
+            scaled = mb.mul(x=biased, y=scale)
+            masked = mb.select(cond=mask, a=scaled, b=FINITE_FILL)
+            weights = mb.softmax(x=masked, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        ops = _ops(prog)
+        assert get_op_types_in_program(prog).count("scaled_dot_product_attention") == 1
+        bias_scale = next(op for op in ops if op.op_type == "mul" and op.x.op is None)
+        np.testing.assert_allclose(bias_scale.y.val, scale, rtol=1e-6)
+        # The mask runs after the scale, so its fill stays as it is.
+        select = next(op for op in ops if op.op_type == "select")
+        np.testing.assert_allclose(select.b.val, FINITE_FILL, rtol=1e-6)
+
+    def test_keeps_the_original_numerics(self):
+        prog = self._prog(fill=NEG_INF, mask_shape=(B, 1, L, S))
+        _apply(prog)
+        assert get_op_types_in_program(prog).count("scaled_dot_product_attention") == 1
+
+        rng = np.random.RandomState(0)
+        q = rng.randn(B, H, L, E).astype(np.float32)
+        k = rng.randn(B, H, S, E).astype(np.float32)
+        v = rng.randn(B, H, S, E).astype(np.float32)
+        bias = rng.randn(B, 1, L, S).astype(np.float32)
+        # Every row keeps at least one key, so -inf never produces a NaN row.
+        mask = (np.arange(S) < S - 2).reshape(1, 1, 1, S) & np.ones((B, 1, L, S), dtype=bool)
+
+        # The program scales the scores before adding the bias.
+        expected = _reference_attention(
+            q / math.sqrt(E), k, v, mask=mask, fill=-np.inf, bias=bias
+        )
+        # Core ML has no boolean model input; it exposes the mask as fp32.
+        got = _predict(prog, q=q, k=k, v=v, bias=bias, mask=mask.astype(np.float32))
+        np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
+
+    def test_a_bias_applied_after_the_mask_is_not_fused(self):
+        """``where(cond, scores, fill) + bias`` also shifts the fill; stay away."""
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[
+                *_qkv_specs(),
+                mb.TensorSpec(shape=(B, 1, L, S)),
+                mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool),
+            ],
+        )
+        def prog(q, k, v, bias, mask):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            masked = mb.select(cond=mask, a=scores, b=FINITE_FILL)
+            biased = mb.add(x=masked, y=bias)
+            weights = mb.softmax(x=biased, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert _sdpa_ops(prog) == 0
+
+    def test_two_additive_masks_are_not_fused(self):
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[*_qkv_specs(), mb.TensorSpec(shape=(B, 1, L, S)),
+                         mb.TensorSpec(shape=(B, 1, L, S))],
+        )
+        def prog(q, k, v, bias_0, bias_1):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            biased = mb.add(x=mb.add(x=scores, y=bias_0), y=bias_1)
+            weights = mb.softmax(x=biased, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert _sdpa_ops(prog) == 0
+
+    def test_two_select_masks_are_not_fused(self):
+        @mb.program(
+            opset_version=ct.target.iOS18,
+            input_specs=[*_qkv_specs(),
+                         mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool),
+                         mb.TensorSpec(shape=(B, 1, 1, S), dtype=types.bool)],
+        )
+        def prog(q, k, v, mask_0, mask_1):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            masked = mb.select(cond=mask_0, a=scores, b=NEG_INF)
+            masked = mb.select(cond=mask_1, a=masked, b=NEG_INF)
+            weights = mb.softmax(x=masked, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        _apply(prog)
+        assert _sdpa_ops(prog) == 0
+
+
+class TestShapeBounds:
+    """``max_head_dim`` / ``max_key_len`` opt a block out of the fusion by size.
+
+    A fused SDPA over global attention (large ``E``, long ``S``) is known to
+    break the ANE partitioner and the BNNS fp16 kernel; consumers targeting
+    those backends leave such sites decomposed.
+    """
+
+    @staticmethod
+    def _prog(key_len=S):
+        @mb.program(opset_version=ct.target.iOS18, input_specs=[
+            mb.TensorSpec(shape=(B, H, L, E)),
+            mb.TensorSpec(shape=(B, H, key_len, E)),
+            mb.TensorSpec(shape=(B, H, key_len, E)),
+        ])
+        def prog(q, k, v):
+            scores = mb.matmul(x=q, y=k, transpose_y=True)
+            weights = mb.softmax(x=scores, axis=-1)
+            return mb.matmul(x=weights, y=v, transpose_y=False)
+
+        return prog
+
+    @pytest.mark.parametrize("option, fused_at, unfused_at", [
+        ("max_head_dim", E, E - 1),
+        ("max_key_len", S, S - 1),
+    ])
+    def test_bound_is_inclusive(self, option, fused_at, unfused_at):
+        prog = self._prog()
+        _apply(prog, **{option: fused_at})
+        assert _sdpa_ops(prog) == 1
+
+        prog = self._prog()
+        _apply(prog, **{option: unfused_at})
+        assert _sdpa_ops(prog) == 0
+        assert "softmax" in get_op_types_in_program(prog)
+
+    def test_bounds_accept_the_string_form_set_options_documents(self):
+        prog = self._prog()
+        _apply(prog, max_head_dim=str(E - 1))
+        assert _sdpa_ops(prog) == 0
+
+        prog = self._prog()
+        _apply(prog, max_head_dim="none", max_key_len="")
+        assert _sdpa_ops(prog) == 1
+
+    def test_symbolic_key_length_counts_as_too_long(self):
+        prog = self._prog(key_len=get_new_symbol())
+        _apply(prog, max_key_len=4096)
+        assert _sdpa_ops(prog) == 0
+
+        # ...but only when a bound is set; unbounded fuses as before.
+        prog = self._prog(key_len=get_new_symbol())
+        _apply(prog)
+        assert _sdpa_ops(prog) == 1
+
+    @pytest.mark.parametrize("value", [0, -1, "abc", 1.5])
+    def test_invalid_bound_is_rejected(self, value):
+        with pytest.raises(ValueError, match="max_key_len"):
+            _apply(self._prog(), max_key_len=value)
+
+    def test_options_do_not_leak_between_runs(self):
+        """The pass instance is a registry singleton; a bound set once must not stick."""
+        prog = self._prog()
+        _apply(prog, max_key_len=S - 1)
+        assert _sdpa_ops(prog) == 0
+
+        prog = self._prog()
+        _apply(prog)
+        assert _sdpa_ops(prog) == 1
 
 
 class TestUnitQueryLength:
@@ -1111,23 +1375,266 @@ class TestFuseAttentionToSdpaEndToEnd:
         cml_model = run_and_compare_specific_input(attention, [q, k, v, mask])
         self._assert_fused(cml_model)
 
+
+def _f32(*shape):
+    return jax.ShapeDtypeStruct(shape, jnp.float32)
+
+
+def _bool(*shape):
+    return jax.ShapeDtypeStruct(shape, jnp.bool_)
+
+
+class TestLibraryAttentionEndToEnd:
+    """The attention the real libraries write, not just the spelling we picked.
+
+    Every case goes through the converter and the full pass pipeline and has to
+    come out as a single ``scaled_dot_product_attention``; ``run_and_compare``
+    checks the numerics against JAX along the way.
+    """
+
+    @staticmethod
+    def _assert_fused(cml_model, expected: int = 1):
+        ops = get_model_instruction_types(cml_model)
+        assert ops.count("scaled_dot_product_attention") == expected
+        assert "softmax" not in ops
+        return ops
+
+    # -- jax.nn.dot_product_attention ---------------------------------------
+
+    def test_jax_dot_product_attention(self):
+        def attention(q, k, v):
+            return jax.nn.dot_product_attention(q, k, v, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4),
+        ]))
+
+    def test_jax_dot_product_attention_with_mask(self):
+        def attention(q, k, v, mask):
+            return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4), _bool(2, 1, 5, 7),
+        ]))
+
+    def test_jax_dot_product_attention_is_causal(self):
+        def attention(q, k, v):
+            return jax.nn.dot_product_attention(q, k, v, is_causal=True, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 5, 3, 4), _f32(2, 5, 3, 4),
+        ]))
+
+    def test_jax_dot_product_attention_grouped_query(self):
+        """Six query heads over three key/value heads.
+
+        ``_dot_product_attention_xla`` vmaps its core over the group axis, so the
+        scores gain an extra axis that the layout tracking has to see through.
+        """
+        def attention(q, k, v):
+            return jax.nn.dot_product_attention(q, k, v, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 6, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4),
+        ]))
+
+    def test_jax_dot_product_attention_decode_step(self):
+        def attention(q, k, v):
+            return jax.nn.dot_product_attention(q, k, v, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(1, 1, 3, 4), _f32(1, 7, 3, 4), _f32(1, 7, 3, 4),
+        ]))
+
+    def test_jax_dot_product_attention_with_bias(self):
+        def attention(q, k, v, bias):
+            return jax.nn.dot_product_attention(q, k, v, bias=bias, implementation="xla")
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4), _f32(2, 3, 5, 7),
+        ]))
+
+    def test_jax_dot_product_attention_with_bias_and_mask(self):
+        """``logits + bias`` and then ``where(mask, logits, big_neg)``: two masks."""
+        def attention(q, k, v, bias, mask):
+            return jax.nn.dot_product_attention(
+                q, k, v, bias=bias, mask=mask, implementation="xla"
+            )
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4),
+            _f32(2, 3, 5, 7), _bool(2, 1, 5, 7),
+        ]))
+
+    def test_jax_dot_product_attention_with_bias_and_causal_mask(self):
+        def attention(q, k, v, bias):
+            return jax.nn.dot_product_attention(
+                q, k, v, bias=bias, is_causal=True, implementation="xla"
+            )
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 5, 3, 4), _f32(2, 5, 3, 4), _f32(2, 3, 5, 5),
+        ]))
+
+    def test_jax_dot_product_attention_grouped_query_with_bias_and_mask(self):
+        def attention(q, k, v, bias, mask):
+            return jax.nn.dot_product_attention(
+                q, k, v, bias=bias, mask=mask, implementation="xla"
+            )
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 6, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4),
+            _f32(2, 6, 5, 7), _bool(2, 1, 5, 7),
+        ]))
+
+    # -- flax.nnx ------------------------------------------------------------
+
+    @staticmethod
+    def _flax_fn(layer, call):
+        """A plain JAX function around ``layer``, with its state at trace level."""
+        from flax import nnx  # noqa: PLC0415
+
+        graphdef, state = nnx.split(layer)
+
+        def fn(*args):
+            merged = nnx.merge(graphdef, jax.tree.map(lambda leaf: leaf, state))
+            return call(merged, *args)
+
+        return fn
+
     def test_flax_multi_head_attention(self):
         from flax import nnx  # noqa: PLC0415
 
-        class Attention(nnx.Module):
-            def __init__(self, rngs):
-                self.layer = nnx.MultiHeadAttention(
-                    num_heads=4, in_features=5, qkv_features=16, decode=False, rngs=rngs
-                )
-
-            def __call__(self, q, k, v):
-                return self.layer(q, k, v)
-
-        shape = (4, 3, 2, 5)
-        cml_model = run_and_compare(
-            nnx.jit(Attention(nnx.Rngs(0))),
-            (jnp.zeros(shape), jnp.zeros(shape), jnp.zeros(shape)),
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=False, rngs=nnx.Rngs(0)
         )
-        ops = get_model_instruction_types(cml_model)
-        assert ops.count("scaled_dot_product_attention") == 1
-        assert "softmax" not in ops
+        fn = self._flax_fn(layer, lambda m, q, k, v: m(q, k, v))
+        self._assert_fused(run_and_compare(fn, [
+            _f32(4, 3, 2, 5), _f32(4, 3, 2, 5), _f32(4, 3, 2, 5),
+        ]))
+
+    def test_flax_multi_head_attention_with_mask(self):
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=False, rngs=nnx.Rngs(0)
+        )
+        fn = self._flax_fn(layer, lambda m, q, k, v, mask: m(q, k, v, mask=mask))
+        self._assert_fused(run_and_compare(fn, [
+            _f32(2, 6, 5), _f32(2, 7, 5), _f32(2, 7, 5), _bool(2, 1, 6, 7),
+        ]))
+
+    def test_flax_multi_head_attention_is_causal(self):
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=False, rngs=nnx.Rngs(0)
+        )
+        fn = self._flax_fn(layer, lambda m, x: m(x, x, x, is_causal=True))
+        self._assert_fused(run_and_compare(fn, [_f32(2, 6, 5)]))
+
+    def test_flax_multi_head_attention_grouped_query(self):
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, num_kv_heads=2, in_features=8, qkv_features=16,
+            decode=False, rngs=nnx.Rngs(0),
+        )
+        fn = self._flax_fn(layer, lambda m, q, k, v: m(q, k, v))
+        self._assert_fused(run_and_compare(fn, [
+            _f32(2, 6, 8), _f32(2, 7, 8), _f32(2, 7, 8),
+        ]))
+
+    def test_flax_multi_head_attention_single_query(self):
+        """A ``(1, 1, D)`` query: the autoregressive decode shape."""
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=False, rngs=nnx.Rngs(0)
+        )
+        fn = self._flax_fn(layer, lambda m, q, k, v, mask: m(q, k, v, mask=mask))
+        self._assert_fused(run_and_compare(fn, [
+            _f32(1, 1, 5), _f32(1, 7, 5), _f32(1, 7, 5), _bool(1, 1, 1, 7),
+        ]))
+
+    def test_flax_multi_head_attention_decode_step(self):
+        """``decode=True``: one token against the KV cache, masked by the cache index."""
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=True, rngs=nnx.Rngs(0)
+        )
+        layer.init_cache((1, 1, 5))
+        fn = self._flax_fn(layer, lambda m, x: m(x, x, x))
+        self._assert_fused(run_and_compare(fn, [_f32(1, 1, 5)]))
+
+    def test_flax_multi_head_attention_with_dropout_configured(self):
+        """A non-zero ``dropout_rate`` takes flax's own attention implementation
+        instead of ``jax.nn.dot_product_attention``: it folds the ``1/sqrt(E)``
+        into the query and contracts with a different einsum."""
+        from flax import nnx  # noqa: PLC0415
+
+        layer = nnx.MultiHeadAttention(
+            num_heads=4, in_features=5, qkv_features=16, decode=False,
+            dropout_rate=0.1, deterministic=True, rngs=nnx.Rngs(0),
+        )
+        fn = self._flax_fn(layer, lambda m, q, k, v, mask: m(q, k, v, mask=mask))
+        self._assert_fused(run_and_compare(fn, [
+            _f32(2, 6, 5), _f32(2, 7, 5), _f32(2, 7, 5), _bool(2, 1, 6, 7),
+        ]))
+
+    def test_flax_dot_product_attention_with_bias_and_mask(self):
+        from flax import nnx  # noqa: PLC0415
+
+        def attention(q, k, v, bias, mask):
+            return nnx.dot_product_attention(q, k, v, bias=bias, mask=mask)
+
+        self._assert_fused(run_and_compare(attention, [
+            _f32(2, 5, 3, 4), _f32(2, 7, 3, 4), _f32(2, 7, 3, 4),
+            _f32(2, 3, 5, 7), _bool(2, 1, 5, 7),
+        ]))
+
+    # -- equinox -------------------------------------------------------------
+
+    @staticmethod
+    def _equinox_fn(model):
+        import equinox as eqx  # noqa: PLC0415
+        import equinox.internal as eqxi  # noqa: PLC0415
+
+        return eqxi.finalise_fn(eqx.nn.inference_mode(model))
+
+    def test_equinox_multihead_attention(self):
+        import equinox as eqx  # noqa: PLC0415
+
+        layer = eqx.nn.MultiheadAttention(
+            num_heads=4, query_size=24, key=jax.random.PRNGKey(0)
+        )
+        model = self._equinox_fn(jax.vmap(lambda q, k, v: layer(q, k, v)))
+        self._assert_fused(run_and_compare(model, [
+            _f32(2, 6, 24), _f32(2, 7, 24), _f32(2, 7, 24),
+        ]))
+
+    def test_equinox_multihead_attention_with_mask(self):
+        """Equinox masks with ``finfo(dtype).min``: a large but finite fill."""
+        import equinox as eqx  # noqa: PLC0415
+
+        layer = eqx.nn.MultiheadAttention(
+            num_heads=4, query_size=24, key=jax.random.PRNGKey(0)
+        )
+        model = self._equinox_fn(
+            jax.vmap(lambda q, k, v, mask: layer(q, k, v, mask=mask))
+        )
+        self._assert_fused(run_and_compare(model, [
+            _f32(2, 6, 24), _f32(2, 7, 24), _f32(2, 7, 24), _bool(2, 4, 6, 7),
+        ]))
+
+    def test_equinox_multihead_attention_single_query(self):
+        import equinox as eqx  # noqa: PLC0415
+
+        layer = eqx.nn.MultiheadAttention(
+            num_heads=4, query_size=24, key=jax.random.PRNGKey(0)
+        )
+        model = self._equinox_fn(jax.vmap(lambda q, k, v: layer(q, k, v)))
+        self._assert_fused(run_and_compare(model, [
+            _f32(1, 1, 24), _f32(1, 7, 24), _f32(1, 7, 24),
+        ]))
