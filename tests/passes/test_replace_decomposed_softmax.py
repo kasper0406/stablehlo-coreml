@@ -8,12 +8,12 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 from flax import nnx
 
+from tests.passes.helpers import apply_pass
 from tests.utils import (
     get_model_instruction_types,
     run_and_compare,
@@ -21,15 +21,12 @@ from tests.utils import (
 )
 
 PASS_NAME = "common::replace_decomposed_softmax"
-DCE_PASS_NAME = "common::dead_code_elimination"
 
 NEG_INF = np.float32(-np.inf)
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
-    # The pass leaves the matched ops behind; DCE is what removes them.
-    apply_pass_and_basic_check(prog, DCE_PASS_NAME, skip_output_shape_check=True)
+    apply_pass(prog, PASS_NAME, skip_output_shape_check=True)
 
 
 def _decomposed_softmax(x, axis, shape, *, clamps=1, keep_dims=False, tile=False):

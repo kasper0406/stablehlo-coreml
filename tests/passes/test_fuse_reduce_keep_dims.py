@@ -6,26 +6,19 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 
 from stablehlo_coreml.passes.fuse_reduce_keep_dims import _REDUCE_OPS
+from tests.passes.helpers import apply_pass, ops_of_type
 from tests.utils import get_model_instruction_types, run_and_compare
 
 PASS_NAME = "common::fuse_reduce_keep_dims"
-DCE_PASS_NAME = "common::dead_code_elimination"
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME)
-    # The pass leaves the matched ops behind; DCE is what removes them.
-    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
-
-
-def _ops_of_type(prog, op_type):
-    return [op for op in prog.functions["main"].operations if op.op_type == op_type]
+    apply_pass(prog, PASS_NAME)
 
 
 class TestFuseReduceKeepDims:
@@ -42,7 +35,7 @@ class TestFuseReduceKeepDims:
         _apply(prog)
         assert get_op_types_in_program(prog) == [reduce_op]
 
-        fused = _ops_of_type(prog, reduce_op)
+        fused = ops_of_type(prog, reduce_op)
         assert len(fused) == 1
         assert fused[0].keep_dims.val
         assert prog.functions["main"].outputs[0].shape == (2, 8, 1)
@@ -68,7 +61,7 @@ class TestFuseReduceKeepDims:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["reduce_mean"]
-        assert list(_ops_of_type(prog, "reduce_mean")[0].axes.val) == [2]
+        assert list(ops_of_type(prog, "reduce_mean")[0].axes.val) == [2]
 
     def test_reduce_over_all_axes_is_fused(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(2, 8))])
@@ -104,7 +97,7 @@ class TestFuseReduceKeepDims:
         _apply(prog)
         assert get_op_types_in_program(prog) == [reduce_op]
 
-        fused = _ops_of_type(prog, reduce_op)
+        fused = ops_of_type(prog, reduce_op)
         assert len(fused) == 1
         assert fused[0].keep_dims.val
         assert prog.functions["main"].outputs[0].shape == (2, 8, 1)

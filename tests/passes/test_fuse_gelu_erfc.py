@@ -8,22 +8,19 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 
+from tests.passes.helpers import apply_pass
 from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_jit_lowering
 
 PASS_NAME = "common::fuse_gelu_erfc"
-DCE_PASS_NAME = "common::dead_code_elimination"
 INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME)
-    # The pass leaves the matched ops behind; DCE is what removes them.
-    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
+    apply_pass(prog, PASS_NAME)
 
 
 def _erfc_gelu(x, negate_first=True, factor=INV_SQRT2, half=0.5, one=1.0):

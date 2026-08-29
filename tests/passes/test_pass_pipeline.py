@@ -9,8 +9,8 @@ from stablehlo_coreml.passes.utils import (
     FUSION_PASSES,
     LATE_FUSION_PASSES,
 )
+from tests.passes.helpers import DCE_PASS_NAME
 
-DCE_PASS_NAME = "common::dead_code_elimination"
 # The groups interleave coremltools' DCE with our own passes, so the same name
 # appears several times; only our own passes are expected in the pipeline exactly
 # once.

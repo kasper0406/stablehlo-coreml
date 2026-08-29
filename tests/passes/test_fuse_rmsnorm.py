@@ -10,16 +10,15 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 from flax import nnx
 
+from tests.passes.helpers import apply_pass, ops_of_type
 from tests.utils import get_model_instruction_types, run_and_compare
 
 PASS_NAME = "common::fuse_rmsnorm"
-DCE_PASS_NAME = "common::dead_code_elimination"
 # `mb.rsqrt`'s own epsilon, folded into the one the `add` contributes.
 RSQRT_EPSILON = 1e-12
 EPSILON = 1e-6
@@ -28,9 +27,8 @@ D = 16
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME)
-    # The pass removes the chain itself, but leaves its constants behind.
-    apply_pass_and_basic_check(prog, DCE_PASS_NAME)
+    # The pass removes the chain itself, but leaves its constants behind for DCE.
+    apply_pass(prog, PASS_NAME)
 
 
 def _rmsnorm(x, scale=None, axes=(-1,), keep_dims=True, epsilon=EPSILON):
@@ -40,10 +38,6 @@ def _rmsnorm(x, scale=None, axes=(-1,), keep_dims=True, epsilon=EPSILON):
     if scale is None:
         return normalized
     return mb.mul(x=normalized, y=scale)
-
-
-def _ops_of_type(prog, op_type):
-    return [op for op in prog.functions["main"].operations if op.op_type == op_type]
 
 
 def _expected_epsilon(d, epsilon=EPSILON):
@@ -65,10 +59,10 @@ class TestFuseRmsNorm:
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
 
-        l2_norm = _ops_of_type(prog, "l2_norm")[0]
+        l2_norm = ops_of_type(prog, "l2_norm")[0]
         assert np.isclose(l2_norm.epsilon.val, _expected_epsilon(16))
         # The `sqrt(d)` of the identity is folded into the scale constant.
-        factor = _ops_of_type(prog, "mul")[0].y.val
+        factor = ops_of_type(prog, "mul")[0].y.val
         np.testing.assert_allclose(factor, math.sqrt(16) * scale, rtol=1e-6)
         assert_model_is_valid(
             prog, {"x": (1, 1, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
@@ -81,7 +75,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        assert np.isclose(_ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
+        assert np.isclose(ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
 
     def test_batch_dimensions_are_fused(self):
         """`l2_norm` treats everything before the last three dims as batch."""
@@ -99,7 +93,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        assert np.isclose(_ops_of_type(prog, "mul")[0].y.val, 2.0 * math.sqrt(16))
+        assert np.isclose(ops_of_type(prog, "mul")[0].y.val, 2.0 * math.sqrt(16))
 
     @pytest.mark.parametrize("shape", [(1, 4, 8, 16), (1, 8, 16), (4, 16)])
     def test_off_canonical_shape_is_left_alone(self, shape):
@@ -228,7 +222,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul", "mul"]
-        assert np.isclose(_ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
+        assert np.isclose(ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
 
     def test_keep_dims_false_is_fused(self):
         """A squeezed `(1, 1)` statistic left-pads to the keep-dims `(1, 1, 1)`,
@@ -239,7 +233,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        assert np.isclose(_ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
+        assert np.isclose(ops_of_type(prog, "mul")[0].y.val, math.sqrt(16))
         assert_model_is_valid(
             prog, {"x": (1, 1, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
         )
@@ -257,7 +251,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        factor = _ops_of_type(prog, "mul")[0].y.val
+        factor = ops_of_type(prog, "mul")[0].y.val
         np.testing.assert_allclose(factor, math.sqrt(16) * scale, rtol=1e-6)
         assert_model_is_valid(
             prog, {"x": (1, 1, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
@@ -276,7 +270,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        factor = _ops_of_type(prog, "mul")[0].y.val
+        factor = ops_of_type(prog, "mul")[0].y.val
         np.testing.assert_allclose(factor, math.sqrt(16) * weight, rtol=1e-6)
         assert_model_is_valid(
             prog, {"x": (1, 1, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
@@ -294,7 +288,7 @@ class TestFuseRmsNorm:
 
         _apply(prog)
         assert get_op_types_in_program(prog) == ["l2_norm", "mul"]
-        factor = _ops_of_type(prog, "mul")[0].y.val
+        factor = ops_of_type(prog, "mul")[0].y.val
         np.testing.assert_allclose(factor, math.sqrt(16) * pre * post, rtol=1e-6)
         assert_model_is_valid(
             prog, {"x": (1, 1, 16)}, minimum_deployment_target=ct.target.iOS18, backend=("mlprogram", "fp32")
@@ -441,15 +435,6 @@ class TestFuseRmsNormEndToEnd:
 
 
 
-def _model_ops_of_type(cml_model, op_type):
-    return [
-        op
-        for func in cml_model._mil_program.functions.values()
-        for op in func.operations
-        if op.op_type == op_type
-    ]
-
-
 def _assert_norm_is_fused(cml_model):
     """The whole statistics chain is gone, replaced by a single `l2_norm`."""
     ops = get_model_instruction_types(cml_model)
@@ -514,7 +499,7 @@ class TestFuseRmsNormLibraryLayers:
         )
         _assert_norm_is_fused(cml_model)
         # The scale flax folded onto the rsqrt is part of the single constant.
-        factor = _model_ops_of_type(cml_model, "mul")[0].y.val
+        factor = ops_of_type(cml_model._mil_program, "mul")[0].y.val
         assert factor.shape == (1, 1, D)
 
     def test_flax_nnx_rmsnorm_without_a_scale_is_fused(self):
@@ -523,7 +508,7 @@ class TestFuseRmsNormLibraryLayers:
             [jax.ShapeDtypeStruct((1, 1, D), jnp.float32)],
         )
         _assert_norm_is_fused(cml_model)
-        assert np.isclose(_model_ops_of_type(cml_model, "mul")[0].y.val, math.sqrt(D))
+        assert np.isclose(ops_of_type(cml_model._mil_program, "mul")[0].y.val, math.sqrt(D))
 
     def test_equinox_rmsnorm_is_fused(self):
         cml_model = run_and_compare(
@@ -531,7 +516,7 @@ class TestFuseRmsNormLibraryLayers:
             [jax.ShapeDtypeStruct((1, 1, D), jnp.float32)],
         )
         _assert_norm_is_fused(cml_model)
-        factor = _model_ops_of_type(cml_model, "mul")[0].y.val
+        factor = ops_of_type(cml_model._mil_program, "mul")[0].y.val
         assert factor.shape == (1, 1, D)
 
     def test_equinox_rmsnorm_with_a_bias_is_fused(self):

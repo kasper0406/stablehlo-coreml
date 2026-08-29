@@ -6,22 +6,22 @@ import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol, types
 from coremltools.converters.mil.testing_utils import (
-    apply_pass_and_basic_check,
     assert_model_is_valid,
     get_op_types_in_program,
 )
 
-from tests.utils import get_model_instruction_types, run_and_compare
+from tests.passes.helpers import apply_pass, count_ops, ops_of_type
+from tests.utils import get_model_instruction_types, run_and_compare, run_and_compare_symbolic
 
 PASS_NAME = "common::remove_broadcast_tiles"
 
 
 def _apply(prog):
-    apply_pass_and_basic_check(prog, PASS_NAME, skip_output_shape_check=True)
+    apply_pass(prog, PASS_NAME, dce=False, skip_output_shape_check=True)
 
 
 def _count_tiles(prog, recurse: bool = True) -> int:
-    return get_op_types_in_program(prog, recurse=recurse).count("tile")
+    return count_ops(prog, "tile", recurse=recurse)
 
 
 class TestRemoveBroadcastTiles:
@@ -272,13 +272,10 @@ class TestRemoveBroadcastTilesEndToEnd:
     @staticmethod
     def _large_constants(cml_model, max_elements: int = 16):
         large = []
-        for func in cml_model._mil_program.functions.values():
-            for op in func.operations:
-                if op.op_type != "const":
-                    continue
-                val = op.outputs[0].val
-                if val is not None and np.asarray(val).size > max_elements:
-                    large.append((op.name, np.asarray(val).shape))
+        for op in ops_of_type(cml_model._mil_program, "const"):
+            val = op.outputs[0].val
+            if val is not None and np.asarray(val).size > max_elements:
+                large.append((op.name, np.asarray(val).shape))
         return large
 
     def test_scalar_broadcast_leaves_no_tile_and_no_large_const(self):
@@ -306,8 +303,6 @@ class TestRemoveBroadcastTilesEndToEnd:
 
         def f(x):
             return jnp.mean(x, axis=-1, keepdims=True) * x
-
-        from tests.utils import run_and_compare_symbolic  # noqa: PLC0415
 
         cml_model = run_and_compare_symbolic(
             f,
