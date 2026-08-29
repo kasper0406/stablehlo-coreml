@@ -17,22 +17,6 @@ import numpy as np
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
-__all__ = [
-    "aligned_dim",
-    "broadcast_shapes",
-    "const_int_list",
-    "const_scaled_operand",
-    "dims_equal",
-    "dtype_epsilon",
-    "is_broadcast_tile",
-    "normalize_axis",
-    "peel_to_scaled_input",
-    "shapes_equal",
-    "sole_consumer",
-    "uniform_const_operand",
-    "uniform_scalar_value",
-]
-
 # Upper bound on the number of scaling/negation ops `peel_to_scaled_input` walks
 # back over. The converter emits at most two or three; the bound just keeps the
 # search finite for hand-written graphs.
@@ -235,7 +219,7 @@ def is_broadcast_tile(op) -> bool:
     return all(rep == 1 or dims_equal(dim, 1) for dim, rep in zip(x_shape, reps))
 
 
-def const_scaled_operand(op):
+def _const_scaled_operand(op):
     """Split a ``mul``/``real_div``/``sub`` op into ``(input_var, factor)``.
 
     Recognises the ops that scale or negate a value by a compile-time constant:
@@ -283,7 +267,7 @@ def peel_to_scaled_input(var, block):
             break
         if sole_consumer(current) is None:
             break
-        split = const_scaled_operand(op)
+        split = _const_scaled_operand(op)
         if split is None:
             break
         current, step = split
