@@ -18,6 +18,7 @@ from . import fuse_logit_softcap as _fuse_logit_softcap  # noqa: F401
 from . import fuse_reduce_keep_dims as _fuse_reduce_keep_dims  # noqa: F401
 from . import fuse_rmsnorm as _fuse_rmsnorm  # noqa: F401
 from . import remove_broadcast_tiles as _remove_broadcast_tiles  # noqa: F401
+from . import remove_nonnegative_index_guard as _remove_nonnegative_index_guard  # noqa: F401
 from . import remove_noop_slice_update as _remove_noop_slice_update  # noqa: F401
 from . import replace_decomposed_softmax as _replace_decomposed_softmax  # noqa: F401
 
@@ -82,12 +83,24 @@ LATE_FUSION_PASSES: list[str] = [
     _DCE,
 ]
 
+# Passes that clean up after a coremltools pass, and therefore have to run right
+# behind it. `guard_negative_gather_indices` wraps the indices of every gather in
+# a `greater_equal`/`add`/`select` that is dead weight on the clamped indices the
+# converter emits, so `remove_nonnegative_index_guard` follows it to take the
+# ones it can prove redundant back out.
+POST_GUARD_PASSES: list[str] = [
+    "common::remove_nonnegative_index_guard",
+    _DCE,
+]
+
 # The pass the CLEANUP group is inserted before (fallback: the front of the pipeline).
 _CLEANUP_ANCHOR = "common::const_elimination"
 # The pass the FUSION group is inserted before (fallback: the end of the pipeline).
 _FUSION_ANCHOR = "common::fuse_matmul_weight_bias"
 # The pass the LATE_FUSION group is inserted after (fallback: the end of the pipeline).
 _LATE_FUSION_ANCHOR = "common::fuse_reduce_mean"
+# The pass the POST_GUARD group is inserted after (fallback: the end of the pipeline).
+_POST_GUARD_ANCHOR = "common::guard_negative_gather_indices"
 
 
 def _contains_group(passes: list[str], group: list[str]) -> bool:
@@ -144,5 +157,6 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
     _insert_passes(pipeline, CLEANUP_PASSES, _CLEANUP_ANCHOR, fallback_index=0)
     _insert_passes(pipeline, FUSION_PASSES, _FUSION_ANCHOR, fallback_index=None)
     _insert_passes(pipeline, LATE_FUSION_PASSES, _LATE_FUSION_ANCHOR, fallback_index=None, after=True)
+    _insert_passes(pipeline, POST_GUARD_PASSES, _POST_GUARD_ANCHOR, fallback_index=None, after=True)
 
     return pipeline
