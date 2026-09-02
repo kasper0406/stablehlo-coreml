@@ -20,6 +20,7 @@ from . import fuse_rmsnorm as _fuse_rmsnorm  # noqa: F401
 from . import remove_broadcast_tiles as _remove_broadcast_tiles  # noqa: F401
 from . import remove_noop_slice_update as _remove_noop_slice_update  # noqa: F401
 from . import replace_decomposed_softmax as _replace_decomposed_softmax  # noqa: F401
+from . import simplify_concat as _simplify_concat  # noqa: F401
 
 # The passes do not clean up after themselves; the ops they leave behind are
 # removed by coremltools' dead code elimination, interleaved between them (one
@@ -41,6 +42,12 @@ CLEANUP_PASSES: list[str] = [
     # was its sole consumer.
     _DCE,
     "common::remove_noop_slice_update",
+    # Structural cleanup: the no-op `concat`s and the binary `concat` chains
+    # go before `const_elimination`, so that a chain of constant operands is
+    # folded once, into the flattened concat, rather than at every link.
+    "common::simplify_concat",
+    # `simplify_concat` leaves the concats it folded away behind.
+    _DCE,
 ]
 
 # Fusion passes. They run just before `common::fuse_matmul_weight_bias`: by then
