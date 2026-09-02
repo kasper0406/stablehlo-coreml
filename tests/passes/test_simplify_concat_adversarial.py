@@ -201,7 +201,7 @@ class TestNestedBlocks:
                 grown = mb.concat(values=[acc, x], axis=0)
                 return mb.add(x=i, y=1), mb.concat(values=[grown, _empty()], axis=0)
 
-            i, acc = mb.while_loop(_cond=cond, _body=body, loop_vars=(np.int32(0), x))
+            _, acc = mb.while_loop(_cond=cond, _body=body, loop_vars=(np.int32(0), x))
             return acc
 
         _apply(prog, skip_output_shape_check=True)
