@@ -5,32 +5,26 @@ graph rather than for the sphere model: concats whose output is a block
 output, nested blocks, loop-carried values, non-float dtypes, concats that
 feed a ``reshape``'s shape vector, and symbolic non-axis dimensions.
 
-The ``xfail(strict=True)`` tests pin down confirmed defects: they start
-failing on purpose (and must have their marker removed) once the pass is
-fixed.
+The first two tests of :class:`TestBlockOutputs` used to be
+``xfail(strict=True)``: they pinned down a defect where bypassing a copy
+whose output is a function output merged two of the function's outputs into
+one. They pin the fix now.
 """
 
 import coremltools as ct
 import numpy as np
-import pytest
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol
-from coremltools.converters.mil.mil.passes.pass_pipeline import PassPipelineManager
 from coremltools.converters.mil.testing_utils import get_op_types_in_program
 
 import stablehlo_coreml.passes.utils  # noqa: F401  (registers the pass)
-from tests.passes.helpers import DCE_PASS_NAME, apply_pass, count_ops, predict
+from tests.passes.helpers import apply_pass, count_ops, predict
 
 PASS_NAME = "common::simplify_concat"
 
 
 def _apply(prog, **kwargs):
     return apply_pass(prog, PASS_NAME, **kwargs)
-
-
-def _apply_unchecked(prog):
-    """Apply the pass without coremltools' basic checks (which would already trip)."""
-    PassPipelineManager.apply_pipeline(prog, ct.PassPipeline([PASS_NAME, DCE_PASS_NAME], "adversarial"))
 
 
 def _convert(prog, **kwargs):
@@ -56,16 +50,8 @@ def _empty(rows: int = 0, cols: int = 4):
 class TestBlockOutputs:
     """Concats whose output leaves the function."""
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "simplify_concat bypasses a single-input concat that is a function output while its "
-            "operand is *also* a function output: Block.replace_block_output_var then renames the "
-            "operand to the concat's name, so the model ends up with two outputs both called 'c' and "
-            "the output 'y' silently disappears."
-        ),
-    )
     def test_copy_of_a_var_that_is_also_returned_directly_keeps_both_outputs(self):
+        """Bypassing the copy would rename `y` to `c` and leave `c` returned twice."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(3, 4))])
         def prog(x):
             y = mb.relu(x=x, name="y")
@@ -74,8 +60,9 @@ class TestBlockOutputs:
 
         names_before = _output_names(prog)
         assert names_before == ["y", "c"]
-        _apply_unchecked(prog)
+        _apply(prog)
         assert _output_names(prog) == names_before
+        assert get_op_types_in_program(prog) == ["relu", "concat"]
 
         model = _convert(prog)
         spec_outputs = [feature.name for feature in model.get_spec().description.output]
@@ -83,15 +70,8 @@ class TestBlockOutputs:
         result = model.predict({"x": np.ones((3, 4), dtype=np.float32)})
         assert set(result) == {"y", "c"}
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "two no-op concats of the same var, both returned by the function, collapse into one "
-            "var: the function then has two outputs that are the same Var with one name, and the "
-            "converted model exposes a single output."
-        ),
-    )
     def test_two_copies_of_one_var_stay_two_outputs(self):
+        """Only the first copy may be bypassed; `y` is an output afterwards, so the second stays."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(3, 4))])
         def prog(x):
             y = mb.relu(x=x)
@@ -99,7 +79,7 @@ class TestBlockOutputs:
             second = mb.concat(values=[y, _empty()], axis=0, name="second")
             return first, second
 
-        _apply_unchecked(prog)
+        _apply(prog)
         assert _output_names(prog) == ["first", "second"]
         outputs = prog.functions["main"].outputs
         assert outputs[0] is not outputs[1]
@@ -107,6 +87,26 @@ class TestBlockOutputs:
         model = _convert(prog)
         result = model.predict({"x": np.ones((3, 4), dtype=np.float32)})
         assert set(result) == {"first", "second"}
+
+    def test_rebuilt_concat_that_is_an_output_next_to_its_own_operand(self):
+        """The rebuilt-concat path replaces one output slot by a fresh var, never merging two."""
+        @mb.program(input_specs=[mb.TensorSpec(shape=(3, 4))])
+        def prog(x):
+            y = mb.relu(x=x, name="y")
+            return y, mb.concat(values=[y, y, _empty()], axis=0, name="c")
+
+        _apply(prog)
+        assert _output_names(prog) == ["y", "c"]
+        outputs = prog.functions["main"].outputs
+        assert outputs[0] is not outputs[1]
+        assert get_op_types_in_program(prog) == ["relu", "concat"]
+        concat = next(op for op in prog.functions["main"].operations if op.op_type == "concat")
+        assert len(concat.values) == 2
+
+        model = _convert(prog)
+        result = model.predict({"x": np.ones((3, 4), dtype=np.float32)})
+        assert set(result) == {"y", "c"}
+        np.testing.assert_array_equal(result["c"], np.ones((6, 4), dtype=np.float32))
 
     def test_copy_returned_next_to_an_unrelated_output_keeps_the_names(self):
         """The rename is harmless when the operand is not itself an output."""
