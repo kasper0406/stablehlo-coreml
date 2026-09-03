@@ -113,15 +113,26 @@ def _concat_shape(values, axis: int):
     return tuple(shape)
 
 
-def _renames_function_input(op, new_var) -> bool:
-    """True if replacing ``op``'s output by ``new_var`` would rename a function input.
+def _breaks_function_outputs(op, new_var) -> bool:
+    """True if bypassing ``op`` in favour of ``new_var`` would damage the function outputs.
 
     coremltools carries the name of a replaced block output over to its
-    replacement so that the model keeps its output names, and refuses to do that
-    to a function input (``Block.replace_block_output_var`` raises ``ValueError:
-    It is not allowed to modify function inputs name.``, aborting the whole
-    conversion). That happens for e.g. a single-input ``concat`` of an argument
-    returned as the function's result.
+    replacement so that the model keeps its output names
+    (``Block.replace_block_output_var``). When ``op``'s output is a function
+    output, that rename has two failure modes:
+
+    * ``new_var`` is a function input: the rename is refused outright
+      (``ValueError: It is not allowed to modify function inputs name.``), which
+      aborts the whole conversion. That is e.g. a single-input ``concat`` of an
+      argument returned as the function's result.
+    * ``new_var`` is already an output of the same function: the two output
+      slots collapse onto one ``Var``, which then takes ``op``'s output name --
+      so the converted model is left with one output where the program had two,
+      and the other output name silently disappears.
+
+    Neither applies to a nested block: ``replace_block_output_var`` only renames
+    on a ``Function``, and a ``cond``/``while_loop`` block may perfectly well
+    list the same var in two of its output slots.
     """
     block = op.enclosing_block
     if not isinstance(block, Function):
@@ -129,6 +140,8 @@ def _renames_function_input(op, new_var) -> bool:
     out_var = op.outputs[0]
     if out_var not in block.outputs:
         return False
+    if new_var in block.outputs:
+        return True
     return new_var in block.inputs.values() and new_var.name != out_var.name
 
 
@@ -153,6 +166,9 @@ class simplify_concat(RewritePass):
     ``interleave=True`` concats take part in neither rewrite: they round-robin
     their operands rather than append them, so they are neither associative nor
     indifferent to an empty operand.
+
+    A copy whose output is a *function* output is only bypassed when that does
+    not disturb the model interface; see :func:`_breaks_function_outputs`.
 
     Given:
         %2 = concat(values=(%0, %1), axis=0)   # %1: (0, 16)
@@ -209,9 +225,13 @@ class simplify_concat(RewritePass):
             new_var = new_values[0]
             if new_var.dtype != out_var.dtype:
                 return False
-            if _renames_function_input(op, new_var):
+            if _breaks_function_outputs(op, new_var):
                 return False
         else:
+            # No `_breaks_function_outputs` check here: this var is brand new, so
+            # it is neither a function input nor already an output, and the
+            # rename `replace_block_output_var` performs just moves `op`'s output
+            # name onto its replacement -- one output slot in, one out.
             new_var = mb.concat(values=new_values, axis=axis, interleave=False, before_op=op)
             built_op = new_var.op
 
