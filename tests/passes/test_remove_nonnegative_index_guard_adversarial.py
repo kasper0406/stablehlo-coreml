@@ -1,6 +1,8 @@
 """Adversarial cases for `remove_nonnegative_index_guard`: nested consumers,
 loops, stacked guards, constant and symbolic indices, and the full pipeline."""
 
+import time
+
 import coremltools as ct
 import numpy as np
 import pytest
@@ -254,3 +256,33 @@ class TestAdversarial:
 
         assert count_ops(theirs._mil_program, "select", recurse=True) == 2
         assert count_ops(ours._mil_program, "select", recurse=True) == selects_left
+
+    def test_a_fanned_out_proof_graph_is_not_walked_once_per_path(self):
+        """`concat(values=[v] * 8)` names the same var eight times, so a stack of
+        them has `8 ** levels` distinct paths back to the clamp underneath.
+
+        The proof walks a DAG, so it is linear in the number of ops once its
+        answers are memoized -- and exponential without, which at these numbers
+        (2M paths, and `MAX_PROOF_DEPTH` allows far worse) takes tens of seconds.
+        """
+        k, levels = 8, 7
+
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(6, 3)),
+            mb.TensorSpec(shape=(1,), dtype=types.int32),
+        ], opset_version=ct.target.iOS18)
+        def prog(data, indices):
+            fanned = mb.maximum(x=indices, y=np.int32(0))
+            for _ in range(levels):
+                fanned = mb.concat(values=[fanned] * k, axis=0)
+            return mb.gather(x=data, indices=_guard(fanned, 6), axis=0)
+
+        assert count_ops(prog, "concat") == levels
+        assert count_ops(prog, "select") == 1
+
+        start = time.perf_counter()
+        apply_pass(prog, PASS_NAME)
+        elapsed = time.perf_counter() - start
+
+        assert count_ops(prog, "select") == 0
+        assert elapsed < 2.0, f"the pass took {elapsed:.1f}s on {k ** levels} paths"

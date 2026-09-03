@@ -120,16 +120,37 @@ def _operands(op, names) -> list | None:
     return operands
 
 
-def _is_nonnegative(var, depth: int = 0) -> bool:
+def _is_nonnegative(var, memo: dict, depth: int = 0) -> bool:
     """Whether every element of ``var`` is provably ``>= 0``.
 
     Conservative: anything the walk does not recognise -- a block input, an op
     that is not in the tables above, a chain deeper than
     :data:`MAX_PROOF_DEPTH` -- answers "not provable" rather than "negative".
+
+    ``memo`` caches the answers, which is what keeps the walk out of exponential
+    territory: the proof graph is a DAG, and an op that names the same var more
+    than once (``concat(values=[v] * k)``, say) would otherwise have it walked
+    once per path -- ``k ** MAX_PROOF_DEPTH`` visits in the worst case. The key
+    carries ``depth`` alongside the var because the answer does too: a var the
+    walk gives up on right at :data:`MAX_PROOF_DEPTH` can be provable when it is
+    reached again with more budget left. Callers pass a dict that lives for one
+    :meth:`remove_nonnegative_index_guard.apply` and drop it afterwards, since
+    the answers only describe the graph as it stands.
     """
     if var is None:
         return False
 
+    key = (var, depth)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached
+    answer = _prove_nonnegative(var, memo, depth)
+    memo[key] = answer
+    return answer
+
+
+def _prove_nonnegative(var, memo: dict, depth: int) -> bool:
+    """The body of :func:`_is_nonnegative`, without the memo lookup."""
     val = getattr(var, "val", None)
     if val is not None:
         arr = np.asarray(val)
@@ -153,17 +174,19 @@ def _is_nonnegative(var, depth: int = 0) -> bool:
 
     if op.op_type == "cast":
         return _cast_preserves_nonnegativity(op.x.dtype, var.dtype) and \
-            _is_nonnegative(op.x, depth + 1)
+            _is_nonnegative(op.x, memo, depth + 1)
 
     names = _ALL_OPERANDS_NONNEGATIVE.get(op.op_type)
     if names is not None:
         operands = _operands(op, names)
-        return operands is not None and all(_is_nonnegative(x, depth + 1) for x in operands)
+        return operands is not None and \
+            all(_is_nonnegative(x, memo, depth + 1) for x in operands)
 
     names = _ANY_OPERAND_NONNEGATIVE.get(op.op_type)
     if names is not None:
         operands = _operands(op, names)
-        return operands is not None and any(_is_nonnegative(x, depth + 1) for x in operands)
+        return operands is not None and \
+            any(_is_nonnegative(x, memo, depth + 1) for x in operands)
 
     return False
 
@@ -240,9 +263,20 @@ class remove_nonnegative_index_guard(RewritePass):
 
     _REWRITES = "index guard(s)"
 
+    def apply(self, prog):
+        # One proof memo per run: the guards of a program share most of their
+        # chains, and within a single chain a var can be reached along many
+        # paths. The dict is dropped afterwards so that no answer outlives the
+        # graph it was proven against.
+        self._nonnegative = {}
+        try:
+            super().apply(prog)
+        finally:
+            self._nonnegative = None
+
     def visit(self, op, block) -> bool:
         guarded = _guarded_value(op)
-        if guarded is None or not _is_nonnegative(guarded):
+        if guarded is None or not _is_nonnegative(guarded, self._nonnegative):
             return False
 
         out = op.outputs[0]
@@ -258,4 +292,10 @@ class remove_nonnegative_index_guard(RewritePass):
         if not block.try_replace_uses_of_var_after_op(anchor_op=op, old_var=out, new_var=guarded):
             return False
         op.remove_from_block()
+        # The rewrite rewires the ops that consumed the select, so a var that
+        # was not provable through the select may well be provable through
+        # `guarded`. Start the next proof from scratch rather than from answers
+        # about the graph as it was; there is one drop per guard removed, and
+        # each proof is bounded by `MAX_PROOF_DEPTH` anyway.
+        self._nonnegative.clear()
         return True
