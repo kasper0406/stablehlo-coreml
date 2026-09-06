@@ -296,6 +296,27 @@ class TestShareTheLift:
 class TestCloseTheRoundTrip:
     """Collapsing a rank round trip made across shape-preserving ops."""
 
+    @pytest.mark.parametrize("axes", [[0, 0], [0, -2]])
+    @pytest.mark.parametrize("constant_source", [False, True])
+    def test_reverse_preserves_repeated_axes(self, axes, constant_source):
+        values = np.arange(20, dtype=np.float32).reshape(1, 1, 5, 4)
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=(1, 1, 5, 4))])
+        def prog(x):
+            flat = mb.reshape(x=values if constant_source else x, shape=[5, 4])
+            flipped = mb.reverse(x=flat, axes=axes)
+            lifted = mb.reshape(x=flipped, shape=[1, 1, 5, 4])
+            return mb.add(x=x, y=lifted)
+
+        # MIL value inference applies each axis in sequence; two reversals of
+        # the same dimension must remain the identity after remapping.
+        prev_prog = _apply(prog)
+        if constant_source:
+            np.testing.assert_array_equal(prog.functions["main"].outputs[0].op.y.val, values)
+        reverse = prog.functions["main"].find_ops(op_type="reverse")[0]
+        assert list(reverse.axes.val) == [2, 2]
+        _assert_same_prediction(prog, prev_prog, x=values)
+
     def test_reverse_between_two_convolutions(self):
         """conv -> reshape -> reverse -> reshape -> conv, the sphere model's Sobel pair."""
         @mb.program(input_specs=[mb.TensorSpec(shape=(1, 1, 6, 4))])

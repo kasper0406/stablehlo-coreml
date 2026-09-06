@@ -112,15 +112,17 @@ def map_axes(axes, from_shape, to_shape) -> list[int] | None:
     """
     from_core = [i for i, dim in enumerate(from_shape) if dim != 1]
     to_core = [i for i, dim in enumerate(to_shape) if dim != 1]
-    mapped = set()
+    mapped = []
     for axis in axes:
         axis = normalize_axis(axis, len(from_shape))
         if axis is None:
             return None
         if from_shape[axis] == 1:
             continue
-        mapped.add(to_core[from_core.index(axis)])
-    return sorted(mapped)
+        # MIL value inference applies each reverse axis in sequence, so repeated
+        # axes cancel in pairs. Preserve repetitions, including negative aliases.
+        mapped.append(to_core[from_core.index(axis)])
+    return mapped
 
 
 def _const_flags(var, length) -> list[bool] | None:
