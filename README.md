@@ -43,8 +43,8 @@ cml_model = ct.convert(
 `build_pass_pipeline()` returns a fresh `ct.PassPipeline` built from
 `ct.PassPipeline.DEFAULT` with the stablehlo-coreml graph passes inserted at the right
 places. Pass your own `base` pipeline to customise it, e.g.
-`build_pass_pipeline(my_pipeline)`. The pre-built `stablehlo_coreml.DEFAULT_HLO_PIPELINE`
-is the same thing, constructed once at import time — copy it before mutating it.
+`build_pass_pipeline(my_pipeline)`. Set options on the returned pipeline, e.g.
+`pipeline.set_options("common::const_elimination", {"skip_const_by_size": "1e2"})`.
 
 ### Obtaining a StableHLO Module from JAX
 
