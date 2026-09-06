@@ -8,19 +8,22 @@ from stablehlo_coreml.passes.utils import (
     CLEANUP_PASSES,
     FUSION_PASSES,
     LATE_FUSION_PASSES,
+    POST_GUARD_PASSES,
 )
 from tests.passes.helpers import DCE_PASS_NAME
 
 # The groups interleave coremltools' DCE with our own passes, so the same name
 # appears several times; only our own passes are expected in the pipeline exactly
 # once.
-ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES))
+ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES + POST_GUARD_PASSES))
 OUR_PASSES = [name for name in ALL_PASSES if name != DCE_PASS_NAME]
 # Most of our passes run once, but a pass may belong to more than one group:
 # `fuse_reduce_keep_dims` runs in the cleanup slot and again in the late-fusion
 # slot, where `fuse_reduce_mean` has just made new reduce/reshape pairs visible.
 EXPECTED_PASS_COUNTS = Counter(
-    name for name in CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES if name != DCE_PASS_NAME
+    name
+    for name in CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES + POST_GUARD_PASSES
+    if name != DCE_PASS_NAME
 )
 
 
@@ -62,6 +65,13 @@ def test_late_fusion_passes_run_after_fuse_reduce_mean():
     passes = build_pass_pipeline().passes
     anchor = passes.index("common::fuse_reduce_mean") + 1
     assert passes[anchor:anchor + len(LATE_FUSION_PASSES)] == LATE_FUSION_PASSES
+
+
+def test_post_guard_passes_run_after_guard_negative_gather_indices():
+    """The guard has to have been inserted before there is anything to remove."""
+    passes = build_pass_pipeline().passes
+    anchor = passes.index("common::guard_negative_gather_indices") + 1
+    assert passes[anchor:anchor + len(POST_GUARD_PASSES)] == POST_GUARD_PASSES
 
 
 def test_build_pass_pipeline_returns_distinct_objects():
@@ -111,6 +121,7 @@ def test_build_pass_pipeline_with_base_missing_the_anchors():
         + ["common::noop_elimination", DCE_PASS_NAME]
         + FUSION_PASSES
         + LATE_FUSION_PASSES
+        + POST_GUARD_PASSES
     )
 
 
