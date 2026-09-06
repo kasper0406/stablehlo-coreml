@@ -79,8 +79,8 @@ def _int_bits(dtype) -> int | None:
 def _cast_preserves_nonnegativity(src, dst) -> bool:
     """Whether a non-negative value of type ``src`` stays non-negative as ``dst``.
 
-    Widening never loses the sign, but a narrowing cast wraps: ``int32(70000)``
-    is ``int16(4464)`` at 32 bits but ``-15072`` at 16, and a float too large for
+    Widening never loses the sign, but a narrowing cast wraps: ``int32(50000)``
+    becomes ``int16(-15536)``, and a float too large for
     the destination integer type wraps just the same. Only casts that provably
     keep every non-negative value are accepted.
     """

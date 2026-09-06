@@ -1,8 +1,6 @@
 """Adversarial cases for `remove_nonnegative_index_guard`: nested consumers,
 loops, stacked guards, constant and symbolic indices, and the full pipeline."""
 
-import time
-
 import coremltools as ct
 import numpy as np
 import pytest
@@ -12,6 +10,7 @@ from coremltools.converters.mil.testing_utils import get_op_types_in_program
 
 # Importing the package registers the passes with coremltools' PASS_REGISTRY.
 import stablehlo_coreml  # noqa: F401
+from stablehlo_coreml.passes import remove_nonnegative_index_guard as guard_pass
 from stablehlo_coreml.passes.utils import build_pass_pipeline
 from tests.passes.helpers import apply_pass, count_ops, ops_of_type, predict
 
@@ -184,6 +183,20 @@ class TestAdversarial:
             predict(before, data=DATA, indices=idx),
         )
 
+    def test_guard_is_kept_after_overflowing_integer_arithmetic(self):
+        """Non-negative operands do not prove that their integer sum is positive."""
+        @mb.program(input_specs=[
+            mb.TensorSpec(shape=(4,), dtype=types.int32),
+        ], opset_version=ct.target.iOS18)
+        def prog(indices):
+            nonnegative = mb.maximum(x=indices, y=np.int32(0))
+            overflow = mb.add(x=nonnegative, y=np.int32(1))
+            return mb.identity(x=_guard(overflow, 6))
+
+        apply_pass(prog, PASS_NAME)
+
+        assert count_ops(prog, "select") == 1
+
     def test_pass_is_idempotent(self):
         @mb.program(input_specs=[
             mb.TensorSpec(shape=(6, 3)),
@@ -213,15 +226,15 @@ class TestAdversarial:
         x = np.array([np.nan, -2.0, 3.0, -np.inf], dtype=np.float32)
         np.testing.assert_array_equal(predict(prog, x=x), predict(before, x=x))
 
-    @pytest.mark.parametrize("precision, selects_left", [
+    @pytest.mark.parametrize("precision, baseline_selects, selects_left", [
         # fp32: `add_int16_cast` is off, both guards go.
-        (ct.precision.FLOAT32, 0),
-        # fp16: `add_int16_cast` runs *before* the guard and narrows every index
-        # vector to int16 first, so the guarded value is `cast(int32)(cast(int16)(..))`
-        # and the pass (rightly) cannot prove it; nothing is removed.
-        (ct.precision.FLOAT16, 2),
+        (ct.precision.FLOAT32, 2, 0),
+        # fp16: the clamped gather index is narrowed to signed int16, so its
+        # guard stays. The non_zero index uses uint16 instead, so coremltools
+        # does not guard it in either pipeline.
+        (ct.precision.FLOAT16, 1, 1),
     ])
-    def test_full_pipeline_matches_default_pipeline(self, precision, selects_left):
+    def test_full_pipeline_matches_default_pipeline(self, precision, baseline_selects, selects_left):
         """End to end through `build_pass_pipeline()`, next to coremltools' own
         `add_int16_cast`/`cast_optimization`, with negative and oversized indices.
 
@@ -254,10 +267,10 @@ class TestAdversarial:
         b = np.array(next(iter(theirs.predict(inputs).values())))
         np.testing.assert_allclose(a, b, rtol=1e-3)
 
-        assert count_ops(theirs._mil_program, "select", recurse=True) == 2
+        assert count_ops(theirs._mil_program, "select", recurse=True) == baseline_selects
         assert count_ops(ours._mil_program, "select", recurse=True) == selects_left
 
-    def test_a_fanned_out_proof_graph_is_not_walked_once_per_path(self):
+    def test_a_fanned_out_proof_graph_is_not_walked_once_per_path(self, monkeypatch):
         """`concat(values=[v] * 8)` names the same var eight times, so a stack of
         them has `8 ** levels` distinct paths back to the clamp underneath.
 
@@ -280,9 +293,20 @@ class TestAdversarial:
         assert count_ops(prog, "concat") == levels
         assert count_ops(prog, "select") == 1
 
-        start = time.perf_counter()
+        # Count actual proof work instead of timing graph copying and DCE in
+        # apply_pass, which depends on CI runner load. Fail early if memoization
+        # regresses, rather than walking all two million paths.
+        proof_calls = 0
+        prove = guard_pass._prove_nonnegative
+
+        def counted_proof(*args):
+            nonlocal proof_calls
+            proof_calls += 1
+            assert proof_calls <= 2 * (levels + 3), "proof revisited shared subgraphs"
+            return prove(*args)
+
+        monkeypatch.setattr(guard_pass, "_prove_nonnegative", counted_proof)
         apply_pass(prog, PASS_NAME)
-        elapsed = time.perf_counter() - start
 
         assert count_ops(prog, "select") == 0
-        assert elapsed < 2.0, f"the pass took {elapsed:.1f}s on {k ** levels} paths"
+        assert proof_calls >= levels
