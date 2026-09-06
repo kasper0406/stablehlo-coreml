@@ -11,6 +11,7 @@ import coremltools as ct
 
 # Importing the pass modules registers them in coremltools' PASS_REGISTRY.
 from . import broadcast_select_operands as _broadcast_select_operands  # noqa: F401
+from . import conv_pool_rank4 as _conv_pool_rank4  # noqa: F401
 from . import fuse_attention_to_sdpa as _fuse_attention_to_sdpa  # noqa: F401
 from . import fuse_gelu_erfc as _fuse_gelu_erfc  # noqa: F401
 from . import fuse_gelu_tanh as _fuse_gelu_tanh  # noqa: F401
@@ -60,6 +61,11 @@ FUSION_PASSES: list[str] = [
     "common::fuse_gelu_erfc",
     _DCE,
     "common::fuse_gelu_tanh",
+    _DCE,
+    # Last of the group. It reads the shape of every operand it touches, so it
+    # wants the folded constants and settled shapes this slot has, and the
+    # fusions above are free to keep matching the rank-2 spellings it replaces.
+    "common::conv_pool_rank4",
     _DCE,
 ]
 
