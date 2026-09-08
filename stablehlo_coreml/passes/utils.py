@@ -6,8 +6,11 @@ pipeline with the passes inserted at the right places.
 """
 
 import copy
+from functools import partial
 
 import coremltools as ct
+from coremltools.converters.mil.mil import types
+from coremltools.converters.mil.mil.types.symbolic import is_symbolic
 
 # Importing the pass modules registers them in coremltools' PASS_REGISTRY.
 from . import broadcast_select_operands as _broadcast_select_operands  # noqa: F401
@@ -131,6 +134,75 @@ def _insert_passes(
         pipeline.insert_pass(index=index + offset, pass_name=pass_name)
 
 
+def _int16_cast_is_safe(op) -> bool:
+    """Conservatively protect int32 data from upstream narrowing.
+
+    coremltools 9.0 common::add_int16_cast narrows dynamic DATA as well as
+    indices. Only constants (range-checked by that pass) and indices with a
+    statically bounded addressing domain are eligible; never dynamic int32 x.
+    """
+    if op.op_type == 'topk':
+        # output_indices_dtype is a string, so the input dtype loop misses it.
+        extent = op.x.shape[int(op.axis.val)]
+        if is_symbolic(extent) or extent > 32767:
+            return False
+    inputs = [(name, var) for name, value in op.inputs.items()
+              for var in (value if isinstance(value, (tuple, list)) else (value,))]
+    dynamic_indices = any(name == 'indices' and var.dtype == types.int32 and var.val is None
+                          for name, var in inputs)
+    if dynamic_indices and any(
+        var.dtype == types.int32 and var.rank > 0 and var.op is not None
+        and var.op.op_type == 'const' and var.val.size and (var.val >= 0).all()
+        for _, var in inputs
+    ):
+        # A nonnegative constant tensor can select uint16 for subsequent dynamic
+        # indices too. Before guard_negative_gather_indices, -1 must stay signed.
+        return False
+    for name, value in op.inputs.items():
+        for var in value if isinstance(value, (tuple, list)) else (value,):
+            if var.dtype != types.int32 or (var.op is not None and var.op.op_type == 'const'):
+                continue
+            if name != 'indices':
+                return False
+            if op.op_type in ('gather', 'gather_along_axis'):
+                if op.axis.val is None:
+                    return False
+                dims = (op.x.shape[int(op.axis.val)],)
+            elif op.op_type == 'gather_nd':
+                k = op.indices.shape[-1]
+                if is_symbolic(k):
+                    return False
+                batch = getattr(op, 'batch_dims', 0)
+                batch = batch.val if hasattr(batch, 'val') else batch
+                if batch is None:
+                    return False
+                dims = op.x.shape[int(batch):int(batch) + k]
+            else:
+                return False
+            if any(is_symbolic(d) or d > 32767 for d in dims):
+                return False
+    return True
+
+
+class _PassPipeline(ct.PassPipeline):
+    def remove_pass(self, index):
+        name = self.passes[index]
+        super().remove_pass(index)
+        if name not in self.passes:
+            self.get_all_options().pop(name, None)
+
+    def remove_passes(self, passes_names):
+        # coremltools 9.0 ct.convert(FLOAT32) removes the cast passes, but its
+        # PassPipeline.remove_passes leaves orphan options that fail validate().
+        super().remove_passes(passes_names)
+        for name in passes_names:
+            self.get_all_options().pop(name, None)
+
+
+def _with_int16_safety(op, caller):
+    return caller(op) and _int16_cast_is_safe(op)
+
+
 def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
     """Return a new pipeline: ``base`` with the stablehlo-coreml passes inserted.
 
@@ -139,10 +211,18 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
     no-op for those passes.
     """
     # `ct.PassPipeline.DEFAULT` already hands out a fresh object on every access.
-    pipeline = ct.PassPipeline.DEFAULT if base is None else copy.deepcopy(base)
+    base = ct.PassPipeline.DEFAULT if base is None else copy.deepcopy(base)
+    pipeline = _PassPipeline(list(base.passes), base.pipeline_name)
+    pipeline.set_options_by_another_pipeline(base)
 
     _insert_passes(pipeline, CLEANUP_PASSES, _CLEANUP_ANCHOR, fallback_index=0)
     _insert_passes(pipeline, FUSION_PASSES, _FUSION_ANCHOR, fallback_index=None)
     _insert_passes(pipeline, LATE_FUSION_PASSES, _LATE_FUSION_ANCHOR, fallback_index=None, after=True)
+
+    if 'common::add_int16_cast' in pipeline.passes:
+        caller = next((option.option_val for option in pipeline.get_options('common::add_int16_cast') or []
+                       if option.option_name == 'op_selector'), None)
+        selector = _int16_cast_is_safe if caller is None else partial(_with_int16_safety, caller=caller)
+        pipeline.set_options('common::add_int16_cast', {'op_selector': selector})
 
     return pipeline
