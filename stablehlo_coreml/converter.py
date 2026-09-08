@@ -86,6 +86,7 @@ from .function_interface import _FunctionInterface
 from .ops_register import StableHloOpsRegistry, register_composite_op, register_stablehlo_op
 from .padding import pad_with_cast
 from .reductions import compute_reduction, compute_windowed_reduction, match_computation, match_simple_reduce_window
+from .scatter import scatter_column, static_scatter, static_scatter_indices, static_scatter_sizes
 from .sort_utils import match_sort
 from .state import (
     FunctionStateMapping,
@@ -1593,12 +1594,22 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         #     updates must be the shape as `indices.shape[:-1] + data.shape[indices.shape[-1]:]`
         # [sic] via
         #     https://apple.github.io/coremltools/source/coremltools.converters.mil.mil.ops.defs.html#coremltools.converters.mil.mil.ops.defs.iOS15.scatter_gather.scatter_nd
-        if scatter_indices.shape != (1,) and \
-                updates.shape != scatter_indices.shape[:-1] + operand.shape[scatter_indices.shape[-1]:]:
-            raise ValueError("Scatter windows that only partially fill dimensions are not supported!")
-
-        # this can be done pre-emptively because of the constraint on scatter windows
-        scatter_indices = mb.gather(x=scatter_indices, indices=np.argsort(dim_mapping), axis=-1)
+        rest = operand.shape[len(dim_mapping):]
+        if scatter_indices.shape != (1,):
+            batch_rank = scatter_indices_rank - 1
+            if (
+                dim_numbers.index_vector_dim != batch_rank
+                or tuple(dim_numbers.update_window_dims) != tuple(range(batch_rank, batch_rank + len(rest)))
+                or tuple(dim_numbers.inserted_window_dims) != tuple(sorted(dim_mapping))
+                or updates.rank != batch_rank + len(rest)
+            ):
+                raise ValueError("Scatter requires trailing index vectors and canonical full-slice window dimensions")
+            # Distinct MIL Symbols do not prove equal extents, even if HLO inputs
+            # used the same dimension name. op_custom_call skips shape_assertion;
+            # preserving those equality facts is needed to support separate inputs.
+            if any(actual != expected for actual, expected in zip(updates.shape[batch_rank:], rest)):
+                raise ValueError("Scatter windows that only partially fill dimensions or have unproven symbolic extents "
+                                 "are not supported!")
 
         # StableHLO supports arbitrary scatter computations, but MIL has a fixed set
         # We try to match the update computation to a known binary operation
@@ -1607,22 +1618,41 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
         if mil_binary_op is None:
             raise ValueError("Unsupported update mode for scatter operation")
 
-        upper_bound = np.array(operand.shape[:len(dim_mapping)], dtype=np.int32)[(None,) * (scatter_indices_rank - 1)]
+        if any(d == 0 for d in rest):
+            context.add_result(op.results[0], operand)
+            return
+        if scatter_indices.shape == (1,) and is_symbolic(operand.shape[0]):
+            raise ValueError("Scatter partial-window operand front dimension must be static")
+
+        sizes = static_scatter_sizes(operand.shape, scatter_indices.shape, len(dim_mapping))
+        if scatter_indices.shape != (1,) and sizes is not None:
+            size, rows = sizes
+            if size == 0:
+                context.add_result(op.results[0], operand)
+                return
+            indices = static_scatter_indices(scatter_indices, operand.shape[:len(dim_mapping)], rows, tuple(dim_mapping))
+            result = static_scatter(operand, indices, updates, mode, size, rows)
+            context.add_result(op.results[0], result)
+            return
+
+        permutation = np.argsort(dim_mapping)
+        if not np.array_equal(permutation, np.arange(len(dim_mapping))):
+            scatter_indices = mb.concat(values=[scatter_column(scatter_indices, n) for n in permutation], axis=-1)
+
+        front = operand.shape[:len(dim_mapping)]
+        if any(is_symbolic(d) for d in front):
+            upper_bound = mb.slice_by_index(x=mb.shape(x=operand), begin=(0,), end=(len(dim_mapping),))
+        else:
+            upper_bound = np.array(front, dtype=np.int32)[(None,) * (scatter_indices_rank - 1)]
         valid = mb.logical_and(
             x=mb.greater_equal(x=scatter_indices, y=0),
             y=mb.less(x=scatter_indices, y=upper_bound)
         )
 
-        def along(n):
-            return mb.slice_by_index(
-                x=valid, begin=(0,) * (scatter_indices_rank - 1) + (n,),
-                end=scatter_indices.shape[:-1] + (n + 1,)
-            )
-
         # unrolling O(scatter_indices.rank)
-        reduction = along(0)
+        reduction = scatter_column(valid, 0)
         for i in range(1, scatter_indices.shape[-1]):
-            reduction = mb.logical_and(x=reduction, y=along(i))
+            reduction = mb.logical_and(x=reduction, y=scatter_column(valid, i))
         reduction = mb.squeeze(x=reduction, axes=(scatter_indices_rank - 1,))
 
         # Special handling for rank-0 reduction (single index update).
@@ -1692,6 +1722,9 @@ class StableHloConverter(metaclass=StableHloOpsRegistry):
             )
         else:
             where = mb.non_zero(x=reduction)
+            # The add_int16_cast op_selector from #107 (build_pass_pipeline) protects
+            # this index-data gather. Without that fix, upstream add_int16_cast
+            # can narrow valid coordinates >= 32768.
             scatter_indices = mb.gather_nd(x=scatter_indices, indices=where)
             updates = mb.gather_nd(x=updates, indices=where)
             result = mb.scatter_nd(data=operand, indices=scatter_indices, updates=updates, mode=mode)
