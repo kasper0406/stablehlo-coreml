@@ -1,6 +1,7 @@
 # Formal verification of optimization passes
 
-The repository has a small formal proof suite for two structural rewrites:
+The repository has a small formal proof suite for two structural rewrites,
+plus a conditional semantic check for `fuse_reduce_keep_dims`:
 
 - `remove_noop_slice_update`, which replaces a `slice_update` that covers the
   complete destination with its update value.
@@ -16,6 +17,15 @@ dimensions. The tests also build before and after graphs with concrete finite
 shapes using the production Core ML MIL pass implementations. Those fixtures
 check the graph mutation on representative cases; they do not turn a finite
 sample into a proof over every MIL graph.
+
+The keep-dims check has a universal singleton-insertion flat-index lemma and
+concrete MIL fixtures for supported reductions. Reduction slices are bounded
+to 64 elements per output and modeled with an uninterpreted reducer shared by
+the before and after routes. This establishes route and index preservation
+under the same reduction algorithm; it does not establish floating-point
+accumulation equivalence across different backends or algorithms.
+This assumption also covers canonicalizing negative or reordered reduction
+axes: the model uses a canonical ordered slice, not a backend execution trace.
 
 `tests/formal/proof.py` is an MIL-dependent model checker, not a second copy of
 the repository matchers. Registered-pass fixtures supply the before and after
@@ -76,8 +86,8 @@ mistaken for a proof of every optimization in the pipeline.
 | --- | --- | --- |
 | `remove_noop_slice_update` | Structural tensor rewrite | SMT lemmas and finite production MIL fixtures |
 | `remove_broadcast_tiles` | Structural shape/broadcast rewrite | SMT lemmas and finite production MIL fixtures |
-| `broadcast_select_operands` | Mixed; inserts `add(x, 0)` to widen an operand | No proof; floating-point details matter (`-0.0 + 0.0` changes sign, and NaN payload behavior is relevant) |
-| `fuse_reduce_keep_dims` | Mixed; reduction shape and backend reduction behavior | No proof; reduction ordering and backend behavior remain in scope |
+| `broadcast_select_operands` | Mixed; inserts `add(x, 0)` to widen an operand | Scalar int/bool exactness and relaxed float contracts only; no whole-pass proof (`-0.0 + 0.0` changes sign, and NaN payload behavior is relevant) |
+| `fuse_reduce_keep_dims` | Mixed; reduction shape and backend reduction behavior | Conditional modeled proof for concrete fixtures plus a universal singleton-indexing lemma; assumes the same reduction algorithm |
 | `replace_decomposed_softmax` | Numerical fusion | No proof |
 | `fuse_attention_to_sdpa` | Numerical fusion | No proof |
 | `fuse_logit_softcap` | Numerical fusion | No proof |
@@ -85,8 +95,25 @@ mistaken for a proof of every optimization in the pipeline.
 | `fuse_gelu_tanh` | Numerical approximation fusion | No proof |
 | `fuse_rmsnorm` | Numerical fusion | No proof |
 
-The inventory covers the custom optimization passes in this repository. Passes
-owned by Core ML Tools are outside this suite's proof boundary.
+The inventory covers the custom optimization passes in this repository. Core
+ML Tools passes are outside the broad proof boundary, but
+`tests/formal/test_upstream_passes.py` has two isolated
+`common::noop_elimination` smoke fixtures (rank-1 noop-reshape plus `add`, and
+rank-2 noop-reshape plus `mul`). Those fixtures exercise the shared checker;
+they are not a whole-pass proof or blanket coverage of upstream passes.
+
+### Next-pass contract findings: `broadcast_select_operands`
+
+Separate scalar lemmas show that IEEE fp16 and fp32 addition of `+0` preserves
+`fpEQ`, or produces NaN when the input is NaN, across all bit patterns; raw-bit
+identity is refuted by `-0`, and a reciprocal gives a downstream `-inf` versus
+`+inf` counterexample. A stronger exact-bit lemma holds after excluding NaNs
+and negative zero; positive zero remains in the domain. Int32 addition of zero
+and boolean OR with false are bit-exact. The relaxed float relation is
+therefore not contextual equivalence. These are numerical contracts for the
+inserted scalar operations, not a proof of the production matcher, graph
+mutation, backend behavior, or flush-to-zero modes, and they do not change the
+pass table's formal status.
 
 ## Coverage roadmap
 
@@ -97,10 +124,11 @@ are not yet translated.
 
 The next stages should proceed in this order:
 
-1. **Keep-dims reduction.** Prove the indexing identity for the reshape or
-   expand-dims spelling, with an explicit assumption that before and after use
-   the same reduction algorithm. Shape identity alone cannot establish equal
-   floating-point accumulation order or backend behavior.
+1. **Keep-dims reduction.** Extend the current bounded reduction fixtures and
+   singleton-indexing lemma across more real MIL graph families. Retain the
+   explicit assumption that before and after use the same reduction algorithm:
+   shape identity alone cannot establish equal floating-point accumulation
+   order or backend behavior.
 2. **Select operand widening.** Establish exact contracts for boolean and
    integer operands. For floating point, choose deliberately between an IEEE
    contract that specifies signed zero, NaNs, overflow, and underflow, and a

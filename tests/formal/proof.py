@@ -9,13 +9,18 @@ Tensor elements are represented by their raw bits.  Pointwise operations are
 uninterpreted functions of those bits, which is stronger than choosing one
 floating-point arithmetic model: a proof may only rely on the operation seeing
 the same operand bits at the same output index before and after a rewrite.
+Reductions similarly use an uninterpreted function over the canonical ordered
+input slice.  Their equivalence is conditional on coremltools using the same
+reduction kernel and element order when only ``keep_dims`` changes; it does not
+claim a real-number or IEEE-754 reduction identity.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from itertools import count
+from itertools import count, product
+from math import prod
 
 import numpy as np
 import z3
@@ -140,6 +145,33 @@ def prove_broadcast_tile_axis() -> None:
     )
 
 
+def prove_singleton_insertion_preserves_flat_index() -> None:
+    """Prove row-major flattening is unchanged by one inserted size-1 axis.
+
+    ``prefix`` and ``suffix`` stand for products of any number of positive
+    dimensions on either side of the inserted axis.  Repeated application
+    therefore covers any number of singleton insertions without bounding rank
+    or dimension size.
+    """
+    prefix, suffix, prefix_index, suffix_index = z3.Ints(
+        "reshape_prefix reshape_suffix reshape_prefix_index reshape_suffix_index"
+    )
+    original_flat = prefix_index * suffix + suffix_index
+    expanded_flat = (prefix_index * 1 + 0) * suffix + suffix_index
+    prove_for_all(
+        [
+            prefix > 0,
+            suffix > 0,
+            prefix_index >= 0,
+            prefix_index < prefix,
+            suffix_index >= 0,
+            suffix_index < suffix,
+        ],
+        original_flat == expanded_flat,
+        theorem="singleton insertion preserves row-major flat index",
+    )
+
+
 _DTYPE_BITS = {
     "bool": 1,
     "int8": 8,
@@ -173,8 +205,30 @@ _BINARY_OPS = frozenset(
         "mod",
     }
 )
-_SUPPORTED_OPS = _BINARY_OPS | {"const", "identity", "slice_update", "tile"}
+_REDUCE_OPS = frozenset(
+    {
+        "reduce_l1_norm",
+        "reduce_l2_norm",
+        "reduce_log_sum",
+        "reduce_log_sum_exp",
+        "reduce_max",
+        "reduce_mean",
+        "reduce_min",
+        "reduce_prod",
+        "reduce_sum",
+        "reduce_sum_square",
+    }
+)
+_SUPPORTED_OPS = _BINARY_OPS | _REDUCE_OPS | {
+    "const",
+    "expand_dims",
+    "identity",
+    "reshape",
+    "slice_update",
+    "tile",
+}
 _MAX_CONST_ELEMENTS = 4096
+_MAX_REDUCTION_ELEMENTS = 64
 
 
 def _dtype_name(var) -> str:
@@ -210,6 +264,11 @@ def _flat_index(coords: Sequence[z3.ArithRef], shape: Sequence[int]) -> z3.Arith
     for coord, dim in zip(coords, shape):
         flat = flat * dim + coord
     return flat
+
+
+def _unflatten_index(flat: z3.ArithRef, shape: Sequence[int]) -> tuple[z3.ArithRef, ...]:
+    strides = [prod(shape[axis + 1 :]) for axis in range(len(shape))]
+    return tuple((flat / stride) % dim for dim, stride in zip(shape, strides))
 
 
 def _broadcast_coords(
@@ -276,6 +335,7 @@ class _MILInterpreter:
         self._proof_id = next(_PROOF_IDS)
         self._input_functions: dict[tuple[str, tuple[int, ...], str], z3.FuncDeclRef] = {}
         self._op_functions: dict[tuple[str, str, str, str], z3.FuncDeclRef] = {}
+        self._reduce_functions: dict[tuple, z3.FuncDeclRef] = {}
         self._cache: dict[int, _TensorExpr] = {}
 
     def _validate_program(self, prog) -> None:
@@ -332,7 +392,7 @@ class _MILInterpreter:
         if value is None:
             raise UnsupportedMILGraph(f"non-constant value on const {var.name!r}")
         array = np.asarray(value)
-        size = int(np.prod(shape, dtype=np.int64)) if shape else 1
+        size = prod(shape)
         if array.size != size:
             raise UnsupportedMILGraph(f"const {var.name!r} value does not match its shape")
         if size > _MAX_CONST_ELEMENTS:
@@ -363,16 +423,159 @@ class _MILInterpreter:
             result = _TensorExpr(_concrete_shape(var), _dtype_name(var), source.at)
             if (result.shape, result.dtype) != (source.shape, source.dtype):
                 raise UnsupportedMILGraph("identity changed shape or dtype")
+        elif op.op_type == "reshape":
+            result = self._reshape(op, var)
+        elif op.op_type == "expand_dims":
+            result = self._expand_dims(op, var)
         elif op.op_type == "tile":
             result = self._tile(op, var)
         elif op.op_type == "slice_update":
             result = self._slice_update(op, var)
+        elif op.op_type in _REDUCE_OPS:
+            result = self._reduce(op, var)
         elif op.op_type in _BINARY_OPS:
             result = self._binary(op, var)
         else:  # pragma: no cover - _validate_program reports this first
             raise UnsupportedMILGraph(f"unsupported producer operation {op.op_type!r}")
         self._cache[id(var)] = result
         return result
+
+    def _reshape(self, op, output_var) -> _TensorExpr:
+        source = self.tensor(op.x)
+        output_shape, output_dtype = _concrete_shape(output_var), _dtype_name(output_var)
+        shape_value = getattr(op.shape, "val", None)
+        if shape_value is None:
+            raise UnsupportedMILGraph("reshape shape must be constant")
+        requested = tuple(int(dim) for dim in np.asarray(shape_value).reshape(-1))
+        if requested.count(-1) > 1:
+            raise UnsupportedMILGraph("reshape shape may contain at most one -1")
+        if any(dim < -1 for dim in requested):
+            raise UnsupportedMILGraph("reshape proof subset supports nonnegative dimensions and one optional -1")
+        if 0 in requested:
+            if len(requested) != len(source.shape):
+                raise UnsupportedMILGraph("reshape zero-copy dimensions require the input and output ranks to match")
+            requested = tuple(source.shape[axis] if dim == 0 else dim for axis, dim in enumerate(requested))
+        source_volume = prod(source.shape)
+        known_volume = prod(dim for dim in requested if dim != -1)
+        if -1 in requested:
+            if known_volume <= 0 or source_volume % known_volume:
+                raise UnsupportedMILGraph("reshape -1 cannot be inferred exactly")
+            inferred = source_volume // known_volume
+            resolved = tuple(inferred if dim == -1 else dim for dim in requested)
+        else:
+            resolved = requested
+        if resolved != output_shape or prod(resolved) != source_volume:
+            raise UnsupportedMILGraph("reshape shape operand disagrees with input/output volume")
+        if output_dtype != source.dtype:
+            raise UnsupportedMILGraph("reshape changed dtype")
+
+        def at(coords):
+            return source.at(_unflatten_index(_flat_index(coords, output_shape), source.shape))
+
+        return _TensorExpr(output_shape, output_dtype, at)
+
+    def _expand_dims(self, op, output_var) -> _TensorExpr:
+        source = self.tensor(op.x)
+        output_shape, output_dtype = _concrete_shape(output_var), _dtype_name(output_var)
+        axes_value = getattr(op.axes, "val", None)
+        if axes_value is None:
+            raise UnsupportedMILGraph("expand_dims axes must be constant")
+        raw_axes = tuple(int(axis) for axis in np.asarray(axes_value).reshape(-1))
+        output_rank = len(source.shape) + len(raw_axes)
+        if any(axis < -output_rank or axis >= output_rank for axis in raw_axes):
+            raise UnsupportedMILGraph("expand_dims axis is out of range")
+        axes = tuple(sorted(axis + output_rank if axis < 0 else axis for axis in raw_axes))
+        if len(set(axes)) != len(axes):
+            raise UnsupportedMILGraph("duplicate expand_dims axes are outside the proof subset")
+        expected_shape = list(source.shape)
+        for axis in axes:
+            expected_shape.insert(axis, 1)
+        if tuple(expected_shape) != output_shape:
+            raise UnsupportedMILGraph("expand_dims axes disagree with its output shape")
+        if output_dtype != source.dtype:
+            raise UnsupportedMILGraph("expand_dims changed dtype")
+        axes_set = set(axes)
+        return _TensorExpr(
+            output_shape,
+            output_dtype,
+            lambda coords: source.at(tuple(coord for axis, coord in enumerate(coords) if axis not in axes_set)),
+        )
+
+    @staticmethod
+    def _reduction_axes(op, rank: int) -> tuple[int, ...]:
+        axes_var = op.inputs.get("axes")
+        if axes_var is None:
+            return tuple(range(rank))
+        axes_value = getattr(axes_var, "val", None)
+        if axes_value is None:
+            raise UnsupportedMILGraph("reduction axes must be constant")
+        raw_axes = tuple(int(axis) for axis in np.asarray(axes_value).reshape(-1))
+        if rank == 0 and raw_axes:
+            raise UnsupportedMILGraph("a scalar reduction cannot name an axis")
+        if any(axis < -rank or axis >= rank for axis in raw_axes):
+            raise UnsupportedMILGraph("reduction axis is out of range")
+        axes = tuple(sorted(axis + rank if axis < 0 else axis for axis in raw_axes))
+        if len(set(axes)) != len(axes):
+            raise UnsupportedMILGraph("duplicate reduction axes are outside the proof subset")
+        return axes
+
+    def _reduce(self, op, output_var) -> _TensorExpr:
+        source = self.tensor(op.x)
+        output_shape, output_dtype = _concrete_shape(output_var), _dtype_name(output_var)
+        axes = self._reduction_axes(op, len(source.shape))
+        keep_dims_var = op.inputs.get("keep_dims")
+        if keep_dims_var is None:
+            keep_dims = False
+        else:
+            keep_dims_value = getattr(keep_dims_var, "val", None)
+            if keep_dims_value is None:
+                raise UnsupportedMILGraph("reduction keep_dims must be constant")
+            keep_dims = bool(np.asarray(keep_dims_value).reshape(()))
+        axes_set = set(axes)
+        if keep_dims:
+            expected_shape = tuple(1 if axis in axes_set else dim for axis, dim in enumerate(source.shape))
+        else:
+            expected_shape = tuple(dim for axis, dim in enumerate(source.shape) if axis not in axes_set)
+        if output_shape != expected_shape:
+            raise UnsupportedMILGraph("reduction axes/keep_dims disagree with its output shape")
+        if output_dtype != source.dtype:
+            raise UnsupportedMILGraph("reduction changed dtype")
+        reduced_shape = tuple(source.shape[axis] for axis in axes)
+        reduction_volume = prod(reduced_shape)
+        if reduction_volume > _MAX_REDUCTION_ELEMENTS:
+            raise UnsupportedMILGraph(f"reduction exceeds {_MAX_REDUCTION_ELEMENTS} proof elements per output")
+        key = (op.op_type, source.dtype, output_dtype, axes, source.shape)
+        function = self._reduce_functions.get(key)
+        if function is None:
+            bit_sort = z3.BitVecSort(_DTYPE_BITS[source.dtype])
+            function = z3.Function(
+                f"p{self._proof_id}_{op.op_type}_{source.dtype}"
+                f"_axes{'_'.join(map(str, axes)) or 'none'}_shape{'_'.join(map(str, source.shape)) or 'scalar'}",
+                *([bit_sort] * reduction_volume),
+                z3.BitVecSort(_DTYPE_BITS[output_dtype]),
+            )
+            self._reduce_functions[key] = function
+
+        def at(coords):
+            base_coords = []
+            output_position = 0
+            for axis in range(len(source.shape)):
+                if axis in axes_set:
+                    base_coords.append(None)
+                    if keep_dims:
+                        output_position += 1
+                else:
+                    base_coords.append(coords[output_position])
+                    output_position += 1
+            values = []
+            for reduced_coords in product(*(range(dim) for dim in reduced_shape)):
+                input_coords = list(base_coords)
+                for axis, reduced_coord in zip(axes, reduced_coords):
+                    input_coords[axis] = z3.IntVal(reduced_coord)
+                values.append(source.at(tuple(input_coords)))
+            return function(*values)
+
+        return _TensorExpr(output_shape, output_dtype, at)
 
     def _tile(self, op, output_var) -> _TensorExpr:
         source = self.tensor(op.x)
