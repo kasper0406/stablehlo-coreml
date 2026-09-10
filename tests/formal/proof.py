@@ -13,6 +13,10 @@ Reductions similarly use an uninterpreted function over the canonical ordered
 input slice.  Their equivalence is conditional on coremltools using the same
 reduction kernel and element order when only ``keep_dims`` changes; it does not
 claim a real-number or IEEE-754 reduction identity.
+``scaled_tanh`` is expanded into the operation order in coremltools' value
+inference, ``alpha * tanh(x * beta)``.  Its proof is conditional on the fused
+kernel using the same typed multiply rounding and tanh implementation; native
+backend precision is outside this model.
 """
 
 from __future__ import annotations
@@ -219,11 +223,13 @@ _REDUCE_OPS = frozenset(
         "reduce_sum_square",
     }
 )
-_SUPPORTED_OPS = _BINARY_OPS | _REDUCE_OPS | {
+_UNARY_OPS = frozenset({"tanh"})
+_SUPPORTED_OPS = _BINARY_OPS | _REDUCE_OPS | _UNARY_OPS | {
     "const",
     "expand_dims",
     "identity",
     "reshape",
+    "scaled_tanh",
     "slice_update",
     "tile",
 }
@@ -335,6 +341,7 @@ class _MILInterpreter:
         self._proof_id = next(_PROOF_IDS)
         self._input_functions: dict[tuple[str, tuple[int, ...], str], z3.FuncDeclRef] = {}
         self._op_functions: dict[tuple[str, str, str, str], z3.FuncDeclRef] = {}
+        self._unary_functions: dict[tuple[str, str, str], z3.FuncDeclRef] = {}
         self._reduce_functions: dict[tuple, z3.FuncDeclRef] = {}
         self._cache: dict[int, _TensorExpr] = {}
 
@@ -433,6 +440,10 @@ class _MILInterpreter:
             result = self._slice_update(op, var)
         elif op.op_type in _REDUCE_OPS:
             result = self._reduce(op, var)
+        elif op.op_type in _UNARY_OPS:
+            result = self._unary(op, var)
+        elif op.op_type == "scaled_tanh":
+            result = self._scaled_tanh(op, var)
         elif op.op_type in _BINARY_OPS:
             result = self._binary(op, var)
         else:  # pragma: no cover - _validate_program reports this first
@@ -471,6 +482,64 @@ class _MILInterpreter:
 
         def at(coords):
             return source.at(_unflatten_index(_flat_index(coords, output_shape), source.shape))
+
+        return _TensorExpr(output_shape, output_dtype, at)
+
+    def _unary_function(self, op_type: str, input_dtype: str, output_dtype: str):
+        key = (op_type, input_dtype, output_dtype)
+        function = self._unary_functions.get(key)
+        if function is None:
+            function = z3.Function(
+                f"p{self._proof_id}_op_{'_'.join(key)}",
+                z3.BitVecSort(_DTYPE_BITS[input_dtype]),
+                z3.BitVecSort(_DTYPE_BITS[output_dtype]),
+            )
+            self._unary_functions[key] = function
+        return function
+
+    def _binary_function(self, op_type: str, lhs_dtype: str, rhs_dtype: str, output_dtype: str):
+        key = (op_type, lhs_dtype, rhs_dtype, output_dtype)
+        function = self._op_functions.get(key)
+        if function is None:
+            function = z3.Function(
+                f"p{self._proof_id}_op_{'_'.join(key)}",
+                z3.BitVecSort(_DTYPE_BITS[lhs_dtype]),
+                z3.BitVecSort(_DTYPE_BITS[rhs_dtype]),
+                z3.BitVecSort(_DTYPE_BITS[output_dtype]),
+            )
+            self._op_functions[key] = function
+        return function
+
+    def _unary(self, op, output_var) -> _TensorExpr:
+        source = self.tensor(op.x)
+        output_shape, output_dtype = _concrete_shape(output_var), _dtype_name(output_var)
+        if output_shape != source.shape or output_dtype != source.dtype:
+            raise UnsupportedMILGraph(f"{op.op_type} changed shape or dtype")
+        function = self._unary_function(op.op_type, source.dtype, output_dtype)
+        return _TensorExpr(output_shape, output_dtype, lambda coords: function(source.at(coords)))
+
+    def _scaled_tanh(self, op, output_var) -> _TensorExpr:
+        source = self.tensor(op.x)
+        if getattr(op.alpha, "val", None) is None or getattr(op.beta, "val", None) is None:
+            raise UnsupportedMILGraph("scaled_tanh alpha and beta must be compile-time constants")
+        alpha, beta = self.tensor(op.alpha), self.tensor(op.beta)
+        output_shape, output_dtype = _concrete_shape(output_var), _dtype_name(output_var)
+        if output_shape != source.shape or output_dtype != source.dtype:
+            raise UnsupportedMILGraph("scaled_tanh changed shape or dtype")
+        if alpha.shape != () or beta.shape != ():
+            raise UnsupportedMILGraph("scaled_tanh alpha and beta must be rank-0 scalars")
+        if source.dtype not in {"fp16", "fp32"}:
+            raise UnsupportedMILGraph("scaled_tanh input must be fp16 or fp32")
+        if alpha.dtype != source.dtype or beta.dtype != source.dtype:
+            raise UnsupportedMILGraph("scaled_tanh parameter dtype differs from its input dtype")
+        multiply = self._binary_function("mul", source.dtype, source.dtype, source.dtype)
+        hyperbolic_tangent = self._unary_function("tanh", source.dtype, source.dtype)
+        alpha_bits = alpha.at(tuple(z3.IntVal(0) for _ in alpha.shape))
+        beta_bits = beta.at(tuple(z3.IntVal(0) for _ in beta.shape))
+
+        def at(coords):
+            inner = multiply(source.at(coords), beta_bits)
+            return multiply(alpha_bits, hyperbolic_tangent(inner))
 
         return _TensorExpr(output_shape, output_dtype, at)
 
@@ -660,16 +729,7 @@ class _MILInterpreter:
             raise UnsupportedMILGraph(
                 f"{op.op_type} output shape {output_shape} disagrees with broadcast shape {inferred_shape}"
             )
-        key = (op.op_type, lhs.dtype, rhs.dtype, output_dtype)
-        function = self._op_functions.get(key)
-        if function is None:
-            function = z3.Function(
-                f"p{self._proof_id}_op_{'_'.join(key)}",
-                z3.BitVecSort(_DTYPE_BITS[lhs.dtype]),
-                z3.BitVecSort(_DTYPE_BITS[rhs.dtype]),
-                z3.BitVecSort(_DTYPE_BITS[output_dtype]),
-            )
-            self._op_functions[key] = function
+        function = self._binary_function(op.op_type, lhs.dtype, rhs.dtype, output_dtype)
 
         def at(coords):
             lhs_coords = _broadcast_coords(coords, lhs.shape, output_shape)

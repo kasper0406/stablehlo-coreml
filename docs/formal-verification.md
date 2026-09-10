@@ -8,6 +8,12 @@ plus a conditional semantic check for `fuse_reduce_keep_dims`:
 - `remove_broadcast_tiles`, which removes a `tile` when the consumer's
   elementwise broadcast produces the same result shape without that tile.
 
+The suite also records conditional canonical softcap multiply coverage and
+scalar contracts or counterexamples for select widening, softcap reciprocal
+rounding, GELU coefficient tolerance, and RMSNorm underflow. These findings
+are deliberately scoped to their modeled or MIL-reference contracts; they do
+not establish whole-pass correctness or native-backend IEEE behavior.
+
 The proofs use [Z3's SMT solver](https://microsoft.github.io/z3guide/) to show
 that the modeled rewrite has no counterexample for arbitrary positive tensor
 dimensions. They encode the shape and index constraints that the matcher is
@@ -90,10 +96,10 @@ mistaken for a proof of every optimization in the pipeline.
 | `fuse_reduce_keep_dims` | Mixed; reduction shape and backend reduction behavior | Conditional modeled proof for concrete fixtures plus a universal singleton-indexing lemma; assumes the same reduction algorithm |
 | `replace_decomposed_softmax` | Numerical fusion | No proof |
 | `fuse_attention_to_sdpa` | Numerical fusion | No proof |
-| `fuse_logit_softcap` | Numerical fusion | No proof |
-| `fuse_gelu_erfc` | Numerical fusion | No proof |
-| `fuse_gelu_tanh` | Numerical approximation fusion | No proof |
-| `fuse_rmsnorm` | Numerical fusion | No proof |
+| `fuse_logit_softcap` | Numerical fusion | Conditional modeled proof for canonical `alpha * tanh(x * beta)` multiply fixtures plus scalar reciprocal facts; no unconditional backend IEEE proof |
+| `fuse_gelu_erfc` | Numerical fusion | MIL reference-evaluation counterexample to blanket exactness; no backend IEEE proof |
+| `fuse_gelu_tanh` | Numerical approximation fusion | MIL reference-evaluation counterexample to blanket exactness; no backend IEEE proof |
+| `fuse_rmsnorm` | Numerical fusion | Z3 IEEE/MIL reference-evaluation counterexample to blanket exactness; no native-backend or FTZ proof |
 
 The inventory covers the custom optimization passes in this repository. Core
 ML Tools passes are outside the broad proof boundary, but
@@ -114,6 +120,57 @@ therefore not contextual equivalence. These are numerical contracts for the
 inserted scalar operations, not a proof of the production matcher, graph
 mutation, backend behavior, or flush-to-zero modes, and they do not change the
 pass table's formal status.
+
+### Next-pass contract findings: softcap reciprocal scaling
+
+The scalar IEEE lemmas prove that division by `2` or `4` matches multiplication
+by the exactly representable reciprocal for every non-NaN fp16/fp32 input
+encoding, including infinities, signed zeros, and subnormals; the lemma proves
+both operation outputs are non-NaN before comparing raw bits. For the
+production `c = 30` spelling,
+fixed finite witnesses show that division and multiplication by the Python
+reciprocal cast to the input dtype can produce different input bits: fp16
+`x=0x1a25` yields `0x068e` versus `0x068d`, and fp32 `x=0x3a83126f` yields
+`0x380bcf65` versus `0x380bcf66`. Production MIL fixtures confirm the emitted
+`beta` uses that cast reciprocal. These are input-rounding counterexamples
+only; `tanh` may collapse the difference, so they do not establish a final
+softcap output mismatch or a backend claim.
+
+These are deliberately exact scalar subsets; the project does not make a
+global approximation claim for the softcap pass from them.
+
+The production softcap proof fixtures cover fp16/fp32 `alpha, beta` pairs
+`(0.5, 2.0)` and `(3.0, 0.5)` in coremltools' executable order,
+`alpha * tanh(x * beta)`. Their equivalence is conditional on the fused op
+using the same typed multiply rounding and tanh implementation as the three
+separate ops. Constant-left inner multiplication and a missing inner multiply
+remain outside this currently proved model subset: the uninterpreted model has
+no commutativity or identity axioms, so those SAT results are abstract model
+counterexamples, not claims about concrete arithmetic. The remaining softcap
+spellings require separate IEEE/backend evidence.
+
+### Next-pass contract findings: GELU coefficient tolerances
+
+The GELU matchers accept perturbed coefficients within their absolute or
+relative/ULP tolerances, then replace the symbolic pattern with native GELU.
+Fixed MIL reference-evaluation fixtures build both sides, explicitly cast both
+outputs to declared fp32, and record finite differences at `x = 20`: erfc
+half=`nextafter(0.5, +inf)` yields bits `1101004801` versus native EXACT
+`1101004800`, while tanh half=`0.50004` yields `1101005639` versus native
+TANH_APPROXIMATION `1101004800`. These are MIL reference-evaluation
+counterexamples to a blanket exact claim, not proofs of any backend IEEE
+behavior; the coefficient tolerances require a separately stated numerical
+contract.
+
+### Next-pass contract findings: RMSNorm underflow
+
+Under IEEE binary32 round-to-nearest-even with gradual underflow, the fixed
+input `x=[2^-74, 0, 0, 0]` and `epsilon=0` gives `x²=2^-148`, whose sum divided
+by four rounds to zero. The original route therefore produces `+inf` in its
+first lane, while the fused `l2_norm * 2` route produces `2.0`. Z3's fixed IEEE
+replay and MIL reference value inference agree on those bits. This is a
+counterexample to a blanket bit-exact identity, and it makes no claim about a
+native Core ML backend or flush-to-zero mode.
 
 ## Coverage roadmap
 
@@ -139,6 +196,11 @@ The next stages should proceed in this order:
    order, and backend elementary functions. A universal exact proof is not
    currently available for these passes; property tests are complementary
    evidence, not proofs, and useful error bounds require explicit assumptions.
+   Do not infer a bounded-error contract from these checks: any tolerance claim
+   must state its domain, error budget, and backend assumptions explicitly.
+   The current softcap result is limited to the canonical exact subset above;
+   the other spellings remain unresolved and need concrete IEEE/backend
+   evidence rather than an implicit approximation contract.
 4. **Broader integration.** Add translation-validation checks over more real
    MIL graph families, with an independent translator for operation semantics.
    Add semantic anchoring tests that compare the routing interpreter with MIL's

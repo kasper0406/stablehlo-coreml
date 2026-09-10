@@ -168,8 +168,9 @@ The [`tests/`](tests/) directory has end-to-end export and conversion examples:
 
 The repository includes a separate SMT proof suite for the structural
 `remove_noop_slice_update` and `remove_broadcast_tiles` passes, plus a
-conditional modeled check for `fuse_reduce_keep_dims`. Its Z3 lemmas prove
-index and shape identities over unbounded positive dimensions, while finite graph fixtures
+conditional modeled check for `fuse_reduce_keep_dims` and the canonical
+`fuse_logit_softcap` multiply subset. Its Z3 lemmas prove index and shape
+identities and selected scalar operation contracts, while finite graph fixtures
 exercise production MIL implementations and bounded reduction routes. Run it
 with:
 
@@ -180,5 +181,5 @@ hatch run proofs:check
 The proof environment runs on Linux with Python 3.12 and does not require the
 Apple Core ML runtime. It is a proof of modeled contracts and bounded fixtures;
 it does not verify every matcher, graph mutation, backend behavior, or the
-numerical fusion passes. See [`docs/formal-verification.md`](docs/formal-verification.md)
+remaining numerical fusion cases. See [`docs/formal-verification.md`](docs/formal-verification.md)
 for the pass inventory, trust boundary, and instructions for adding coverage.
