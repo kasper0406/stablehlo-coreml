@@ -1,0 +1,31 @@
+name: Check Formal Proofs
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    name: SMT proofs (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Hatch
+        uses: pypa/hatch@install
+
+      - name: Check formal proofs
+        run: hatch run proofs:check

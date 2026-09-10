@@ -163,3 +163,21 @@ The [`tests/`](tests/) directory has end-to-end export and conversion examples:
 * `coremltools` supports up to Python 3.13. Do not run hatch with a newer version.
   Can be controlled using e.g. `export HATCH_PYTHON=python3.13`
 * Run tests using `hatch run test:pytest tests`
+
+### Formal verification of optimization passes
+
+The repository includes a separate SMT proof suite for the structural
+`remove_noop_slice_update` and `remove_broadcast_tiles` passes. Its Z3 lemmas
+prove the modeled tensor semantics for unbounded symbolic positive dimensions,
+and concrete finite graph fixtures exercise the production MIL implementations.
+Run it with:
+
+```bash
+hatch run proofs:check
+```
+
+The proof environment runs on Linux with Python 3.12 and does not require the
+Apple Core ML runtime. It is a bounded proof of the modeled contracts and
+fixtures; it does not verify every matcher, graph mutation, backend behavior,
+or the numerical fusion passes. See [`docs/formal-verification.md`](docs/formal-verification.md)
+for the pass inventory, trust boundary, and instructions for adding coverage.
