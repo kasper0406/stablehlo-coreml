@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "rule": "remove_noop_slice_update",
+  "python_output": "stablehlo_coreml/passes/generated/remove_noop_slice_update_rule.py",
+  "lean_output": "formal/StableHLOCoreML/Generated/RemoveNoopSliceUpdateRule.lean",
+  "lean_namespace": "StableHLOCoreML.Generated.RemoveNoopSliceUpdateRule",
+  "match_fields": [
+    {"name": "x_dtype", "lean_name": "xDtype", "type": "id"},
+    {"name": "update_dtype", "lean_name": "updateDtype", "type": "id"},
+    {"name": "output_dtype", "lean_name": "outputDtype", "type": "id"}
+  ],
+  "axis_fields": [
+    {"name": "dim", "lean_name": "dim", "type": "dim"},
+    {"name": "update_dim", "lean_name": "updateDim", "type": "dim"},
+    {"name": "output_dim", "lean_name": "outputDim", "type": "dim"},
+    {"name": "begin", "lean_name": "begin", "type": "int"},
+    {"name": "stop", "lean_name": "stop", "type": "int"},
+    {"name": "stride", "lean_name": "stride", "type": "int"},
+    {"name": "begin_mask", "lean_name": "beginMask", "type": "bool"},
+    {"name": "end_mask", "lean_name": "endMask", "type": "bool"},
+    {"name": "squeeze_mask", "lean_name": "squeezeMask", "type": "bool"}
+  ],
+  "predicate": {
+    "op": "and",
+    "args": [
+      {
+        "op": "eq",
+        "left": {"op": "field", "scope": "match", "name": "x_dtype"},
+        "right": {"op": "field", "scope": "match", "name": "update_dtype"}
+      },
+      {
+        "op": "eq",
+        "left": {"op": "field", "scope": "match", "name": "x_dtype"},
+        "right": {"op": "field", "scope": "match", "name": "output_dtype"}
+      },
+      {
+        "op": "all_axes",
+        "body": {
+          "op": "and",
+          "args": [
+            {
+              "op": "eq",
+              "left": {"op": "field", "scope": "axis", "name": "dim"},
+              "right": {"op": "field", "scope": "axis", "name": "update_dim"}
+            },
+            {
+              "op": "eq",
+              "left": {"op": "field", "scope": "axis", "name": "dim"},
+              "right": {"op": "field", "scope": "axis", "name": "output_dim"}
+            },
+            {
+              "op": "eq",
+              "left": {"op": "field", "scope": "axis", "name": "begin"},
+              "right": {"op": "const", "type": "int", "value": 0}
+            },
+            {
+              "op": "eq",
+              "left": {"op": "field", "scope": "axis", "name": "stride"},
+              "right": {"op": "const", "type": "int", "value": 1}
+            },
+            {"op": "not", "arg": {"op": "field", "scope": "axis", "name": "begin_mask"}},
+            {"op": "not", "arg": {"op": "field", "scope": "axis", "name": "squeeze_mask"}},
+            {
+              "op": "or",
+              "args": [
+                {"op": "field", "scope": "axis", "name": "end_mask"},
+                {
+                  "op": "dim_eq_int",
+                  "dim": {"op": "field", "scope": "axis", "name": "dim"},
+                  "value": {"op": "field", "scope": "axis", "name": "stop"}
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -163,3 +163,30 @@ The [`tests/`](tests/) directory has end-to-end export and conversion examples:
 * `coremltools` supports up to Python 3.13. Do not run hatch with a newer version.
   Can be controlled using e.g. `export HATCH_PYTHON=python3.13`
 * Run tests using `hatch run test:pytest tests`
+
+### Formal verification of optimization passes
+
+The repository includes a separate SMT proof suite for the structural
+`remove_noop_slice_update` and `remove_broadcast_tiles` passes, plus a
+conditional modeled check for `fuse_reduce_keep_dims` and the canonical
+`fuse_logit_softcap` multiply subset. Its Z3 lemmas prove index and shape
+identities and selected scalar operation contracts, while finite graph fixtures
+exercise production MIL implementations and bounded reduction routes. Run it
+with:
+
+```bash
+hatch run proofs:check
+```
+
+The proof environment runs on Linux with Python 3.12 and does not require the
+Apple Core ML runtime. It is a proof of modeled contracts and bounded fixtures;
+it does not verify every graph mutation, backend behavior, or the
+remaining numerical fusion cases. See [`docs/formal-verification.md`](docs/formal-verification.md)
+for the pass inventory, trust boundary, and instructions for adding coverage.
+
+The `formal/` pilot adds a Lean kernel check for the abstract full-coverage
+`remove_noop_slice_update` rule. Run `(cd formal && lake build)` and
+`python scripts/generate_formal_rules.py --check` locally; this verifies the
+generated rule and its modeled theorem, while the MIL adapter, code generation,
+graph mutation, and backend correspondence remain explicit trust-boundary
+assumptions.

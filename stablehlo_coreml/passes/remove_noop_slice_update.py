@@ -8,115 +8,158 @@ directly.
 """
 
 import numpy as np
+import sympy as sm
 from coremltools.converters.mil.mil import Builder as mb
-from coremltools.converters.mil.mil import Function
+from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.passes.graph_pass import AbstractGraphPass
 from coremltools.converters.mil.mil.passes.helper import block_context_manager
 from coremltools.converters.mil.mil.passes.pass_registry import register_pass
 
-from .pattern_utils import const_int_list, dims_equal, shapes_equal
+from .generated import remove_noop_slice_update_rule as rule
 
 
-def _mask_values(var, rank) -> list[bool] | None:
-    """A ``slice_update`` boolean mask as a list of ``rank`` values.
-
-    An absent mask reads as all-``False``, which is what the op defaults to.
-    ``None`` when the mask is present but not a compile-time constant of the
-    expected length, so that callers give up on the match.
-    """
+def _const_vector(var, rank, *, kind, default=None):
+    """Strictly normalize a rank-length MIL constant vector."""
     if var is None:
-        return [False] * rank
+        return None if default is None else [default] * rank
     val = getattr(var, "val", None)
     if val is None:
         return None
-    values = [bool(v) for v in np.asarray(val).reshape(-1)]
-    return values if len(values) == rank else None
+    array = np.asarray(val)
+    if array.ndim != 1 or len(array) != rank:
+        return None
+    if kind == "int":
+        if not np.issubdtype(array.dtype, np.integer) or np.issubdtype(array.dtype, np.bool_):
+            return None
+        return [int(value) for value in array]
+    if kind == "bool":
+        if not np.issubdtype(array.dtype, np.bool_):
+            return None
+        return [bool(value) for value in array]
+    raise AssertionError(f"unknown constant vector kind {kind!r}")
 
 
-def _match_pattern(op):
-    if op.op_type != "slice_update":
-        return False
+class _SymbolInterner:
+    """Give structurally equal SymPy symbols the same opaque rule identifier."""
 
-    if op.x.shape is None:
-        return False
+    def __init__(self):
+        self._symbols = []
 
-    x_shape = tuple(op.x.shape)
-    x_rank = len(x_shape)
+    def dim(self, value):
+        if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+            value = int(value)
+            return rule.Dim("fixed", value) if value > 0 else None
+        # Composite SymPy expressions are outside this adapter's trusted input
+        # language. MIL's ordinary dynamic dimensions are single Symbols.
+        if not isinstance(value, sm.Symbol):
+            return None
+        for index, known in enumerate(self._symbols):
+            if bool(value == known):
+                return rule.Dim("symbol", f"s{index}")
+        self._symbols.append(value)
+        return rule.Dim("symbol", f"s{len(self._symbols) - 1}")
 
-    # `begin_mask[i]` neglects `begin[i]`, and `squeeze_mask[i]` turns the axis
-    # into a pure index that drops out of the result. Neither is the plain
-    # full-tensor write this pass rewrites. A squeeze also lowers the update's
-    # rank, so the shape check below rejects it anyway -- the explicit guard
-    # keeps that from being an accident.
-    begin_mask = _mask_values(op.begin_mask, x_rank)
-    squeeze_mask = _mask_values(op.squeeze_mask, x_rank)
-    if begin_mask is None or squeeze_mask is None or any(begin_mask) or any(squeeze_mask):
-        return False
 
-    # Symbolic dimensions compare structurally: the update has to be shaped by
-    # the very same symbols as the buffer it overwrites.
-    if not shapes_equal(x_shape, op.update.shape):
-        return False
+def _dtype_id(var):
+    try:
+        return types.builtin_to_string(var.dtype)
+    except Exception:
+        return None
 
-    if const_int_list(op.begin) != [0] * x_rank:
-        return False
 
-    if op.stride is not None and const_int_list(op.stride) != [1] * x_rank:
-        return False
+def _normalize_match(op):
+    """Translate a well-formed MIL candidate into the generated rule language.
 
-    end_mask = _mask_values(op.end_mask, x_rank)
-    end = const_int_list(op.end)
-    if end_mask is None or end is None or len(end) != x_rank:
-        return False
+    This adapter is intentionally strict and is part of the trusted boundary:
+    malformed attributes, non-constant vectors, empty ranks, and composite
+    symbolic shape expressions cause the optimization to be skipped.
+    """
+    if op.op_type != "slice_update" or len(op.outputs) != 1:
+        return None
+    variables = (op.x, op.update, op.outputs[0])
+    if any(var.shape is None for var in variables):
+        return None
+    shapes = tuple(tuple(var.shape) for var in variables)
+    rank = len(shapes[0])
+    if rank == 0 or any(len(shape) != rank for shape in shapes[1:]):
+        return None
 
-    # `end_mask[i] == True` *means* "up to the end of axis i", so it covers the
-    # axis whatever its size. Without it the axis has to be concrete for
-    # `end[i]` to provably cover it: `end` holds constant ints, and a symbolic
-    # dimension is never provably equal to one.
-    return all(
-        covers_axis or dims_equal(dim, stop)
-        for covers_axis, dim, stop in zip(end_mask, x_shape, end)
+    begin = _const_vector(op.begin, rank, kind="int")
+    stop = _const_vector(op.end, rank, kind="int")
+    stride = _const_vector(op.stride, rank, kind="int", default=1)
+    begin_mask = _const_vector(op.begin_mask, rank, kind="bool", default=False)
+    end_mask = _const_vector(op.end_mask, rank, kind="bool", default=False)
+    squeeze_mask = _const_vector(op.squeeze_mask, rank, kind="bool", default=False)
+    vectors = (begin, stop, stride, begin_mask, end_mask, squeeze_mask)
+    if any(vector is None for vector in vectors):
+        return None
+
+    interner = _SymbolInterner()
+    normalized_shapes = tuple(tuple(interner.dim(dim) for dim in shape) for shape in shapes)
+    if any(dim is None for shape in normalized_shapes for dim in shape):
+        return None
+    axes = tuple(
+        rule.Axis(
+            dim=normalized_shapes[0][axis],
+            update_dim=normalized_shapes[1][axis],
+            output_dim=normalized_shapes[2][axis],
+            begin=begin[axis],
+            stop=stop[axis],
+            stride=stride[axis],
+            begin_mask=begin_mask[axis],
+            end_mask=end_mask[axis],
+            squeeze_mask=squeeze_mask[axis],
+        )
+        for axis in range(rank)
+    )
+    dtype_ids = tuple(_dtype_id(var) for var in variables)
+    if any(dtype_id is None for dtype_id in dtype_ids):
+        return None
+    return rule.Match(
+        x_dtype=dtype_ids[0],
+        update_dtype=dtype_ids[1],
+        output_dtype=dtype_ids[2],
+        axes=axes,
     )
 
 
-def _renames_function_input(slice_update_op, new_var) -> bool:
-    """True if replacing the op's output by ``new_var`` would rename a function input.
-
-    When the replaced var is an output of the enclosing block, coremltools
-    carries the old name over to the replacement so that the model keeps its
-    output names (``Block.replace_block_output_var``). For a ``Function`` it
-    refuses to do that to an input var and raises ``ValueError: It is not
-    allowed to modify function inputs name.`` -- which aborts the whole
-    conversion. That happens for e.g. ``lax.dynamic_update_slice(buffer, x, 0)``
-    returned as-is, where ``update`` is a function argument.
-    """
+def _needs_output_name_bridge(slice_update_op, new_var) -> bool:
+    """Whether direct replacement would rename an existing value or input."""
     block = slice_update_op.enclosing_block
-    if not isinstance(block, Function):
-        return False
     out_var = slice_update_op.outputs[0]
-    if out_var not in block.outputs:
+    return out_var in block.outputs and new_var.name != out_var.name
+
+
+def _replace_if_rule_matches(slice_update_op):
+    """Check the generated rule immediately before performing its mutation."""
+    candidate = _normalize_match(slice_update_op)
+    if candidate is None or not rule.matches(candidate):
         return False
-    return new_var in block.inputs.values() and new_var.name != out_var.name
 
-
-def _try_to_transform(slice_update_op):
     block = slice_update_op.enclosing_block
     out_var = slice_update_op.outputs[0]
 
     new_var = slice_update_op.update
-    if _renames_function_input(slice_update_op, new_var):
-        # The function input cannot be renamed, so route the output through an
-        # `identity` that can take over the name instead. The `slice_update` --
-        # the op this pass is here to remove -- still goes away.
+    bridge_op = None
+    if _needs_output_name_bridge(slice_update_op, new_var):
+        # Block output replacement transfers the old public name to the new
+        # value. A bridge prevents that from renaming a function input or
+        # clobbering the name of another output that already uses `new_var`.
         new_var = mb.identity(x=new_var, before_op=slice_update_op)
+        bridge_op = new_var.op
 
-    # Replace occurences of the `slice_update_op` output with `new_var`.
-    # `try_...` rather than the unguarded variant: the update may descend from a
-    # var coremltools refuses to replace (a `constexpr_*` weight, say), in which
-    # case the rewrite is skipped instead of raising.
+    # `update` is an input of the matched op, so MIL SSA guarantees it is visible
+    # at the anchor. `try_...` also checks coremltools' replacement restrictions
+    # before mutating the block.
     if not block.try_replace_uses_of_var_after_op(
         anchor_op=slice_update_op, old_var=out_var, new_var=new_var
     ):
+        # A failed `try_replace` is pre-mutation. Remove the unused bridge we
+        # just inserted so a skipped optimization leaves the graph unchanged.
+        if bridge_op is not None and bridge_op.enclosing_block is block:
+            bridge_out = bridge_op.outputs[0]
+            if len(bridge_out.child_ops) == 0 and bridge_out not in block.outputs:
+                bridge_op.remove_from_block()
         return False
     slice_update_op.remove_from_block()
     return True
@@ -134,9 +177,8 @@ def _remove_noop_slice_update(block):
         if len(op.blocks) > 0:
             continue
 
-        if _match_pattern(op):
-            if _try_to_transform(op):
-                did_optimize = True
+        if _replace_if_rule_matches(op):
+            did_optimize = True
     return did_optimize
 
 

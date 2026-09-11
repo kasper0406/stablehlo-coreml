@@ -1,7 +1,11 @@
+import importlib
+
 import coremltools as ct
 import numpy as np
+import sympy as sm
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import get_new_symbol
+from coremltools.converters.mil.mil.passes.pass_registry import PASS_REGISTRY
 from coremltools.converters.mil.testing_utils import (
     apply_pass_and_basic_check,
     assert_model_is_valid,
@@ -11,8 +15,56 @@ from coremltools.converters.mil.testing_utils import (
 # Importing the package registers the passes with coremltools' PASS_REGISTRY.
 import stablehlo_coreml  # noqa: F401
 
+pass_module = importlib.import_module("stablehlo_coreml.passes.remove_noop_slice_update")
+
 
 class TestRemoveNoopSliceUpdate:
+
+    def test_generated_rule_is_the_only_mutation_gate(self, monkeypatch):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(update):
+            return mb.slice_update(
+                x=np.zeros((2, 3), dtype=np.float32),
+                update=update,
+                begin=[0, 0],
+                end=[2, 3],
+            )
+
+        monkeypatch.setattr(pass_module.rule, "matches", lambda candidate: False)
+        PASS_REGISTRY["common::remove_noop_slice_update"](prog)
+        assert get_op_types_in_program(prog) == ["slice_update"]
+
+    def test_failed_replacement_removes_temporary_name_bridge(self, monkeypatch):
+        @mb.program(input_specs=[mb.TensorSpec(shape=(2, 3))])
+        def prog(update):
+            return mb.slice_update(
+                x=np.zeros((2, 3), dtype=np.float32),
+                update=update,
+                begin=[0, 0],
+                end=[2, 3],
+                name="written",
+            )
+
+        block = prog.functions["main"]
+        monkeypatch.setattr(type(block), "try_replace_uses_of_var_after_op", lambda *args, **kwargs: False)
+        PASS_REGISTRY["common::remove_noop_slice_update"](prog)
+        assert get_op_types_in_program(prog) == ["slice_update"]
+        prog.validate(check_essential_scope=True)
+
+    def test_adapter_rejects_composite_symbolic_dimensions(self):
+        symbol = sm.Symbol("batch", positive=True, integer=True)
+        assert pass_module._SymbolInterner().dim(2 * symbol) is None
+
+    def test_adapter_interns_symbols_by_structural_identity(self):
+        positive = sm.Symbol("batch", positive=True)
+        integer = sm.Symbol("batch", integer=True)
+        assert str(positive) == str(integer)
+        assert positive != integer
+
+        interner = pass_module._SymbolInterner()
+        assert interner.dim(positive) == pass_module.rule.Dim("symbol", "s0")
+        assert interner.dim(positive) == pass_module.rule.Dim("symbol", "s0")
+        assert interner.dim(integer) == pass_module.rule.Dim("symbol", "s1")
 
     def test_is_removed(self):
         @mb.program(input_specs=[mb.TensorSpec(shape=(10, 20))])

@@ -91,6 +91,26 @@ extra-dependencies = [
 check = "ruff check ."
 fix = "ruff check --fix ."
 
+# Formal proofs use the normal project environment so the production pass
+# modules can import the project's coremltools/JAX dependencies. Pinning the
+# interpreter keeps this job independent of the runner's default Python.
+[tool.hatch.envs.proofs]
+python = "3.12"
+extra-dependencies = [
+    "pytest",
+    "z3-solver==4.15.4.0",
+]
+
+[tool.hatch.envs.proofs.scripts]
+check = "pytest -q tests/formal"
+
+[tool.pytest.ini_options]
+# The ordinary test environment does not install Z3.  Formal tests are run
+# explicitly by proofs:check, so do not collect them during a default pytest
+# scan (for example, hatch run test:pytest).
+testpaths = ["tests"]
+norecursedirs = ["formal"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 127

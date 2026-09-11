@@ -1,0 +1,59 @@
+name: Check Formal Proofs
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    name: SMT proofs (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Hatch
+        uses: pypa/hatch@install
+
+      - name: Check formal proofs
+        run: hatch run proofs:check
+
+  lean:
+    name: Lean kernel proof and generated rule
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check generated rule
+        run: python scripts/generate_formal_rules.py --check
+
+      - name: Build Lean proof
+        uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal
+          build: true
+          use-github-cache: false
+
+      - name: Audit theorem axioms
+        working-directory: formal
+        run: lake env lean -DwarningAsError=true StableHLOCoreML/AxiomAudit.lean

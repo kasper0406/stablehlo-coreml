@@ -1,0 +1,18 @@
+name = "stablehlo_formal"
+version = "0.1.0"
+defaultTargets = ["StableHloFormal"]
+
+[leanOptions]
+warningAsError = true
+
+[[lean_lib]]
+name = "StableHloFormal"
+srcDir = "."
+
+[[lean_lib]]
+name = "StableHLOCoreML"
+srcDir = "."
+roots = [
+  "StableHLOCoreML.Generated.RemoveNoopSliceUpdateRule",
+  "StableHLOCoreML.RemoveNoopSliceUpdate",
+]
