@@ -69,10 +69,55 @@ Core ML Tools' MIL implementation. The tests require an `unsat` result for
 each universal lemma; `sat`, `unknown`, solver exceptions, and configured
 timeouts fail the test and therefore fail CI. CI trusts Z3's reported result
 and does not independently replay or check a proof certificate. The suite does
-not prove the Python matcher for every graph, all graph mutation corner cases,
-Core ML backend behavior, or the numerical equivalence of the other
+not verify the MIL adapter and traversal for every graph, all graph mutation
+corner cases, Core ML backend behavior, or the numerical equivalence of the other
 optimization passes. It is therefore a proof-backed regression check for the
 covered contracts, not a complete verification of the optimizer.
+
+The first kernel-checked pilot is under `formal/`. The generated rule comes
+from `formal/rules/remove_noop_slice_update.json`; the generator emits both the
+Python rule data and the Lean predicate. The checked theorem layers are
+`ruleMatches_sound` (dtype, shape, and accepted-domain guards),
+`ruleMatches_slice_update_eq_update` (the full in-bounds tensor rewrite),
+`ruleMatches_context_preserves` (a pure context around one rewrite), and
+`checkedContextClosure_sound` (a finite sequence of checked contextual
+rewrites). Together they establish the shared modeled rule for arbitrary-rank
+lists of axes and symbolic dimension valuations. The Lean semantics cover the
+accepted plain-slice fragment: acceptance establishes begin zero, unit stride,
+false begin/squeeze masks, equal shapes and dtypes, and an effective full end
+(an end mask may intentionally ignore its stop value).
+
+These theorems do not by themselves verify the adapter's correspondence from
+every MIL graph to that rule, MIL graph serialization or typing, Python graph
+traversal/termination, graph mutation and scope/name contracts, or MIL/backend
+semantics. Those remain trusted interfaces covered by the Python fixtures and
+mutation tests. The finite closure theorem proves only the supplied checked
+rewrite tree; constructing that tree from Python traversal and proving
+termination remain outside the Lean result. The generated source, generator
+behavior, Lean kernel, and the standard logical axioms are also part of the
+trust boundary.
+
+Run the kernel proof locally with `(cd formal && lake build)`, and verify that the
+generated files are current with `python scripts/generate_formal_rules.py
+--check`. CI runs both checks and audits the theorem axioms; only Lean's
+standard `propext`, `Classical.choice`, and `Quot.sound` are allowed. A kernel
+build alone is not treated as an independent certificate checker, and no
+literal end-to-end verification of the production Python pass is claimed.
+
+The current trust boundary is explicit:
+
+| Boundary | Current status |
+| --- | --- |
+| JSON guards to generated Python and Lean predicates | CI checks synchronization of generated outputs; generator behavior and correspondence remain trusted. |
+| MIL to the rule model | `_normalize_match` enforces vector lengths, integer/boolean types, defaults, positive dimensions, and opaque symbolic interning; it deliberately skips composite symbolic expressions and nonpositive concrete dimensions. That adapter and MIL serialization/typing remain trusted. |
+| Rule to graph mutation | `_replace_if_rule_matches` gates only replacement by the visible `update` operand, adds the identity naming bridge, and relies on well-formed SSA plus MIL's replacement API; mutation, scope, and metadata behavior remain trusted and are covered by regression tests. |
+| Abstract tensor semantics | The four audited Lean theorem layers prove the accepted plain-slice mask/stride domain for arbitrary-rank in-bounds tensors, pure contexts, and finite checked closures. Accepted end masks correctly ignore their stop value; other non-matching guards are rejected. |
+| MIL/backend behavior | Correspondence between the pure model and plain full-slice MIL/backend execution remains trusted. |
+
+The output-alias case is covered explicitly: when the update value is already
+another function output, the mutation inserts a bridge so both public output
+names survive. This regression caught and fixed a concrete graph mutation bug;
+it is evidence for the boundary contract, not part of the Lean theorem.
 
 For pointwise MIL operations, the checker represents tensor elements as raw
 bits and uses uninterpreted functions keyed by operation, dtype, and operand
@@ -90,7 +135,7 @@ mistaken for a proof of every optimization in the pipeline.
 
 | Pass | Kind | Formal status |
 | --- | --- | --- |
-| `remove_noop_slice_update` | Structural tensor rewrite | SMT lemmas and finite production MIL fixtures |
+| `remove_noop_slice_update` | Structural tensor rewrite | Lean kernel theorem for the shared generated rule, plus SMT lemmas and finite production MIL fixtures |
 | `remove_broadcast_tiles` | Structural shape/broadcast rewrite | SMT lemmas and finite production MIL fixtures |
 | `broadcast_select_operands` | Mixed; inserts `add(x, 0)` to widen an operand | Scalar int/bool exactness and relaxed float contracts only; no whole-pass proof (`-0.0 + 0.0` changes sign, and NaN payload behavior is relevant) |
 | `fuse_reduce_keep_dims` | Mixed; reduction shape and backend reduction behavior | Conditional modeled proof for concrete fixtures plus a universal singleton-indexing lemma; assumes the same reduction algorithm |
@@ -241,4 +286,5 @@ scope paragraph when coverage expands.
 
 The authoritative references for the two layers are the [Z3 guide](https://microsoft.github.io/z3guide/),
 Apple's [Model Intermediate Language guide](https://apple.github.io/coremltools/docs-guides/source/model-intermediate-language.html),
-and the [Core ML Tools MIL graph-pass documentation](https://apple.github.io/coremltools/docs-guides/source/graph-passes-intro.html).
+the [Core ML Tools MIL graph-pass documentation](https://apple.github.io/coremltools/docs-guides/source/graph-passes-intro.html),
+and Lean's [proof validation guide](https://lean-lang.org/doc/reference/latest/ValidatingProofs/).

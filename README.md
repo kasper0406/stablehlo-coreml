@@ -180,6 +180,13 @@ hatch run proofs:check
 
 The proof environment runs on Linux with Python 3.12 and does not require the
 Apple Core ML runtime. It is a proof of modeled contracts and bounded fixtures;
-it does not verify every matcher, graph mutation, backend behavior, or the
+it does not verify every graph mutation, backend behavior, or the
 remaining numerical fusion cases. See [`docs/formal-verification.md`](docs/formal-verification.md)
 for the pass inventory, trust boundary, and instructions for adding coverage.
+
+The `formal/` pilot adds a Lean kernel check for the abstract full-coverage
+`remove_noop_slice_update` rule. Run `(cd formal && lake build)` and
+`python scripts/generate_formal_rules.py --check` locally; this verifies the
+generated rule and its modeled theorem, while the MIL adapter, code generation,
+graph mutation, and backend correspondence remain explicit trust-boundary
+assumptions.
