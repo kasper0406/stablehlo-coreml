@@ -10,6 +10,7 @@ import copy
 import coremltools as ct
 
 # Importing the pass modules registers them in coremltools' PASS_REGISTRY.
+from . import avoid_ane_dma_notch as _avoid_ane_dma_notch  # noqa: F401
 from . import broadcast_select_operands as _broadcast_select_operands  # noqa: F401
 from . import fuse_attention_to_sdpa as _fuse_attention_to_sdpa  # noqa: F401
 from . import fuse_gelu_erfc as _fuse_gelu_erfc  # noqa: F401
@@ -82,12 +83,29 @@ LATE_FUSION_PASSES: list[str] = [
     _DCE,
 ]
 
+# Apple Neural Engine workarounds. Opt-in (see `build_pass_pipeline`): the DMA
+# notch they avoid only exists on the ANE, and the extra slices/adds are a small
+# loss on the GPU and the CPU.
+#
+# The group runs late, after `common::add_fp16_cast` and the `const_elimination`
+# that follows it: `avoid_ane_dma_notch` only matches plain fp16 `const` weights,
+# which is what the graph holds at that point, and its payload model is about the
+# fp16 bytes that actually reach the hardware.
+ANE_PASSES: list[str] = [
+    "common::avoid_ane_dma_notch",
+    _DCE,
+]
+
 # The pass the CLEANUP group is inserted before (fallback: the front of the pipeline).
 _CLEANUP_ANCHOR = "common::const_elimination"
 # The pass the FUSION group is inserted before (fallback: the end of the pipeline).
 _FUSION_ANCHOR = "common::fuse_matmul_weight_bias"
 # The pass the LATE_FUSION group is inserted after (fallback: the end of the pipeline).
 _LATE_FUSION_ANCHOR = "common::fuse_reduce_mean"
+# The pass the ANE group is inserted before (fallback: the end of the pipeline).
+# By then the weights are fp16 constants, and the split ops still get to run
+# through the trailing `fuse_transpose_matmul` / DCE / `topological_reorder`.
+_ANE_ANCHOR = "common::merge_affine_dequantize_with_consecutive_ops"
 
 
 def _contains_group(passes: list[str], group: list[str]) -> bool:
@@ -131,12 +149,23 @@ def _insert_passes(
         pipeline.insert_pass(index=index + offset, pass_name=pass_name)
 
 
-def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
+def build_pass_pipeline(
+    base: ct.PassPipeline | None = None,
+    *,
+    avoid_ane_dma_notch: bool = False,
+) -> ct.PassPipeline:
     """Return a new pipeline: ``base`` with the stablehlo-coreml passes inserted.
 
     ``base`` defaults to ``ct.PassPipeline.DEFAULT``. The input pipeline is never
     mutated, and inserting into a pipeline that already contains our passes is a
     no-op for those passes.
+
+    ``avoid_ane_dma_notch`` additionally inserts :data:`ANE_PASSES`, which splits
+    weight-streaming ops whose per-core fp16 weight payload is a multiple of 1 MiB
+    (see :mod:`stablehlo_coreml.passes.avoid_ane_dma_notch`). Only turn it on for
+    models that run on the Apple Neural Engine: the erratum it works around does
+    not exist on the GPU or the CPU, where the extra slices and adds are a small
+    loss.
     """
     # `ct.PassPipeline.DEFAULT` already hands out a fresh object on every access.
     pipeline = ct.PassPipeline.DEFAULT if base is None else copy.deepcopy(base)
@@ -144,5 +173,7 @@ def build_pass_pipeline(base: ct.PassPipeline | None = None) -> ct.PassPipeline:
     _insert_passes(pipeline, CLEANUP_PASSES, _CLEANUP_ANCHOR, fallback_index=0)
     _insert_passes(pipeline, FUSION_PASSES, _FUSION_ANCHOR, fallback_index=None)
     _insert_passes(pipeline, LATE_FUSION_PASSES, _LATE_FUSION_ANCHOR, fallback_index=None, after=True)
+    if avoid_ane_dma_notch:
+        _insert_passes(pipeline, ANE_PASSES, _ANE_ANCHOR, fallback_index=None)
 
     return pipeline
