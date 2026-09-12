@@ -67,6 +67,73 @@ hlo_module = ir.Module.parse(jax_exported.mlir_module(), context=context)
 
 For the JAX example to work, you will additionally need to install `absl-py` and `flatbuffers` as dependencies.
 
+## Apple Neural Engine: avoiding the 1 MiB DMA notch
+
+The Apple Neural Engine has an erratum in its kernel-DMA prefetch ring
+([writeup](https://eiln.github.io/posts/ane-dma.html)): whenever the fp16 weight
+payload a single core has to stream is an integer multiple of 1 MiB, DRAM
+throughput collapses from ~40-60 GB/s to ~17-25 GB/s. The payload of a
+weight-streaming op is
+
+```
+ceil(N / 16) * D * prod(kernel) * 2 bytes
+```
+
+with `N` the output units (output channels / weight rows), `D` the contracting
+(input-channel) dimension and 16 the number of ANE cores — so an innocuous
+2048x4096 fp16 projection lands on exactly 1 MiB per core.
+
+`common::avoid_ane_dma_notch` rewrites the affected `conv`, `linear` and `matmul`
+ops into partial products over chunks of the contracting dimension whose payloads
+are *not* near a multiple of 1 MiB, and sums the partials. Enable it with:
+
+```python
+pass_pipeline=build_pass_pipeline(avoid_ane_dma_notch=True)
+```
+
+Measured on a Mac mini M4 (fp16 1x1 `conv` forced onto the ANE, single token,
+medians of 3 rounds x 200 predicts):
+
+| Weight (Cout x Cin) | Per core  | Unsplit | Split          |
+| ------------------- | --------- | ------- | -------------- |
+| 2048 x 4096         | 1 MiB     | 840 us  | 430 us (2-way) |
+| 4096 x 4096         | 2 MiB     | 1142 us | 697 us (4-way) |
+| 2048 x 8192         | 2 MiB     | 1350 us | 698 us (4-way) |
+| 4096 x 14336        | 7 MiB     | 3522 us | 1989 us (2-way)|
+| 2016 x 4096         | 0.98 MiB  | 426 us  | 426 us (control) |
+
+The split column reports the chunk count each measurement used. The pass picks
+the *fewest* chunks that take every partial out of the notch, which for a 2 MiB
+payload is three near-equal chunks of ~0.67 MiB rather than the four equal
+0.5 MiB chunks measured above. The two are not equally far from a multiple of
+1 MiB (0.33 MiB against 0.5 MiB), but both are far outside the 16 KiB window
+and both stay inside the very first lap of the prefetch ring, where the stall
+cannot happen at all — and they measure the same: across three separate runs
+the 3-way split the pass emits took 684-730 us on 4096 x 4096 and 685-730 us on
+2048 x 8192, against 685-698 us and 695-753 us for the hand-written 4-way one,
+with every slice, partial and add staying on the ANE.
+
+On a whole model the effect compounds. A synthetic Llama-3.2-1B-shaped decode
+step (16 layers, dim 2048, MLP 8192, 1.95 GB of fp16 weights, every projection
+a 1x1 NCHW convolution, single token, everything on the ANE) goes from 76.1 ms
+to 31.6 ms per step — 13.1 to 31.6 tokens/s, a 2.4x speedup, at an effective
+weight-streaming rate of 25.6 against 61.5 GB/s. The pass split the 48 MLP
+projections (2 MiB per core) and correctly left the attention projections
+(0.5 and 0.125 MiB per core) alone.
+
+It is opt-in because it is an ANE-only win: on the GPU there is no notch to
+avoid in the first place (2048 x 4096 runs in 158 us against 156 us for the
+control shape), so the extra slices and adds are pure overhead there, and the
+CPU shows no notch either. It also adds ops — a slice per partial and an add
+per extra partial, so a k-way split costs k slices and k-1 adds — and changes
+fp16 rounding a little, because the accumulation is regrouped into partial
+sums.
+
+Only plain fp16 `const` weights with static shapes are split — `constexpr_*`
+(palettized/quantized) weights stream different bytes than this model counts,
+and grouped convolutions have a per-group contracting dimension the model does
+not describe.
+
 ## Stateful models
 
 Core ML can keep tensors across model invocations as *state* instead of passing

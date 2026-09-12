@@ -5,6 +5,7 @@ import pytest
 
 from stablehlo_coreml import build_pass_pipeline
 from stablehlo_coreml.passes.utils import (
+    ANE_PASSES,
     CLEANUP_PASSES,
     FUSION_PASSES,
     LATE_FUSION_PASSES,
@@ -16,6 +17,8 @@ from tests.passes.helpers import DCE_PASS_NAME
 # once.
 ALL_PASSES = list(dict.fromkeys(CLEANUP_PASSES + FUSION_PASSES + LATE_FUSION_PASSES))
 OUR_PASSES = [name for name in ALL_PASSES if name != DCE_PASS_NAME]
+# `ANE_PASSES` is opt-in, so it is registered but not part of the default pipeline.
+REGISTERED_PASSES = list(dict.fromkeys(ALL_PASSES + ANE_PASSES))
 # Most of our passes run once, but a pass may belong to more than one group:
 # `fuse_reduce_keep_dims` runs in the cleanup slot and again in the late-fusion
 # slot, where `fuse_reduce_mean` has just made new reduce/reshape pairs visible.
@@ -24,7 +27,7 @@ EXPECTED_PASS_COUNTS = Counter(
 )
 
 
-@pytest.mark.parametrize("pass_name", ALL_PASSES)
+@pytest.mark.parametrize("pass_name", REGISTERED_PASSES)
 def test_pass_is_registered(pass_name):
     from coremltools.converters.mil.mil.passes.pass_pipeline import PASS_REGISTRY  # noqa: PLC0415
     assert pass_name in PASS_REGISTRY
@@ -138,3 +141,41 @@ def test_group_is_inserted_even_when_the_base_already_has_one_of_its_passes():
     passes = build_pass_pipeline(base).passes
     assert passes[: len(CLEANUP_PASSES) + 1] == ["common::fuse_reduce_keep_dims"] + CLEANUP_PASSES
     assert passes.count("common::fuse_reduce_keep_dims") == 3
+
+
+def test_ane_passes_are_absent_unless_asked_for():
+    """The DMA notch only exists on the ANE, so the group has to be opted into."""
+    passes = build_pass_pipeline().passes
+    assert "common::avoid_ane_dma_notch" not in passes
+
+
+def test_ane_passes_run_before_merge_affine_dequantize():
+    passes = build_pass_pipeline(avoid_ane_dma_notch=True).passes
+    anchor = passes.index("common::merge_affine_dequantize_with_consecutive_ops")
+    assert passes[anchor - len(ANE_PASSES):anchor] == ANE_PASSES
+    assert passes.count("common::avoid_ane_dma_notch") == 1
+
+
+def test_ane_group_adds_nothing_but_itself():
+    without = build_pass_pipeline().passes
+    with_ane = build_pass_pipeline(avoid_ane_dma_notch=True).passes
+    index = with_ane.index("common::avoid_ane_dma_notch")
+    assert with_ane[:index] + with_ane[index + len(ANE_PASSES):] == without
+
+
+def test_ane_group_can_be_added_to_a_pipeline_built_without_it():
+    upgraded = build_pass_pipeline(build_pass_pipeline(), avoid_ane_dma_notch=True)
+    assert upgraded.passes == build_pass_pipeline(avoid_ane_dma_notch=True).passes
+
+
+def test_build_pass_pipeline_with_the_ane_group_is_idempotent():
+    once = build_pass_pipeline(avoid_ane_dma_notch=True)
+    assert build_pass_pipeline(once, avoid_ane_dma_notch=True).passes == once.passes
+
+
+def test_ane_group_falls_back_to_the_end_without_its_anchor():
+    base = ct.PassPipeline.EMPTY
+    base.passes = ["common::noop_elimination", DCE_PASS_NAME]
+
+    passes = build_pass_pipeline(base, avoid_ane_dma_notch=True).passes
+    assert passes[-len(ANE_PASSES):] == ANE_PASSES
